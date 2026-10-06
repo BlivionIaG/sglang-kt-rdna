@@ -226,6 +226,16 @@ def _lora_delta(
     return F.linear(F.linear(hidden_states, lora_a), lora_b) * scale
 
 
+def _checkpoint_declares_fp8(quant_config) -> bool:
+    """True when a MIXED_PRECISION checkpoint declares any FP8 layer.
+
+    Such a checkpoint keeps some attention projections as plain FP8, so their
+    config must not be stripped the way a uniform NVFP4 checkpoint's is.
+    """
+    schemes = getattr(quant_config, "_mixed_precision_scheme_by_prefix", None)
+    return bool(schemes) and any(str(v).startswith("FP8") for v in schemes.values())
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -536,9 +546,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
+        # A MIXED_PRECISION checkpoint keeps some of these layers as plain FP8;
+        # stripping the config would leave their weight_scale / input_scale with
+        # no parameter to load into, so only strip when no FP8 layer is declared.
+        _keep_quantised_attn = _checkpoint_declares_fp8(quant_config)
         linear_attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if (
+                quant_config
+                and quant_config.get_name() == "modelopt_fp4"
+                and not _keep_quantised_attn
+            )
             else quant_config
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(
@@ -696,7 +714,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if (
+                quant_config
+                and quant_config.get_name() == "modelopt_fp4"
+                and not _keep_quantised_attn
+            )
             else quant_config
         )
 
@@ -1218,6 +1240,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            _kt_orig_name = name
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1225,7 +1249,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                name = _kt_orig_name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1339,6 +1363,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            _kt_orig_name = name
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
@@ -1356,7 +1382,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = _kt_orig_name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -1507,6 +1533,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            _kt_orig_name = name
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1514,7 +1542,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if "visual" in name or "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                name = _kt_orig_name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1667,6 +1695,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            _kt_orig_name = name
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(
                     "experts.down_proj"
@@ -1688,7 +1718,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = _kt_orig_name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue

@@ -689,8 +689,9 @@ class SharedFullContext:
 
         # Override expert counts for full GPU execution
         self.gpu_layer.num_experts = global_num_experts
-        self.gpu_layer.num_local_experts = global_num_experts
-        self.gpu_layer.num_gpu_experts = global_num_experts
+        # Sizes the GPU-resident subset, not the global count; see create_weights.
+        self.gpu_layer.num_local_experts = self.num_gpu_experts
+        self.gpu_layer.num_gpu_experts = self.num_gpu_experts
 
         # Create quant_method for gpu_layer
         if self.gpu_layer.quant_config is not None:
@@ -5251,6 +5252,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 1. Create weights for GPU experts using the wrapped method
         # GPU weights are indexed by gpu_index (0 to num_gpu_experts-1), not logical expert ID
         # The mapping logical_to_gpu_index is used to remap IDs during weight loading and inference
+        #
+        # ModelOptFp4Config.create_weights sizes every tensor from
+        # layer.num_local_experts and ignores its num_experts argument, so this
+        # layer must carry the GPU-resident count.
+        layer.num_local_experts = self.num_gpu_experts
         self.gpu_method.create_weights(
             layer=layer,
             num_experts=self.num_gpu_experts,
@@ -5380,7 +5386,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        # `apply()` short-circuits to zeros when no expert is GPU-resident, so
+        # this method must not read the GPU-side scales either: they are
+        # allocated by create_weights but only the CPU path ever fills them.
+        _skip_gpu_moe = self.num_gpu_experts == 0 or os.environ.get(
+            "SGLANG_KT_BYPASS_GPU_MOE"
+        ) == "1"
+        if not _skip_gpu_moe and hasattr(
+            self.gpu_method, "process_weights_after_loading"
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
