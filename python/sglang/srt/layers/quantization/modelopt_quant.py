@@ -296,6 +296,29 @@ class ModelOptQuantConfig(QuantizationConfig):
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
+            # Per-layer override for MIXED_PRECISION checkpoints: a prefix the
+            # checkpoint declares FP8 must use the FP8 method even though this
+            # config is the NVFP4 one. Without this the FP8 e4m3 bytes are read
+            # as packed FP4 nibbles and every attention layer's output explodes.
+            if getattr(self, "_mixed_precision_scheme_by_prefix", None):
+                _scheme = self._resolve_mixed_precision_scheme(prefix)
+                if _scheme is not None and str(_scheme).startswith("FP8"):
+                    if self._mixed_precision_fp8_method is None:
+                        self._mixed_precision_fp8_method = ModelOptFp8LinearMethod(
+                            ModelOptFp8Config(
+                                is_checkpoint_fp8_serialized=True,
+                                kv_cache_quant_method=None,
+                                exclude_modules=self.exclude_modules,
+                                packed_modules_mapping=self.packed_modules_mapping,
+                            )
+                        )
+                    return self._mixed_precision_fp8_method
+                if _scheme is None:
+                    # Absent from the enumeration above means the producer
+                    # left this layer at full precision (linear_attn.in_proj_a/b
+                    # are stored BF16), so it must stay unquantised rather than
+                    # take this config's NVFP4 default.
+                    return UnquantizedLinearMethod()
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -555,6 +578,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                         weight_loader=weight_loader,
                     ),
                 )
+            # One stored scalar can serve a parameter holding one entry per
+            # shard, so select the branch that slices it per shard.
+            for scale_name in ["weight_scale", "input_scale"]:
+                scale_param = getattr(layer, scale_name, None)
+                if scale_param is not None:
+                    scale_param.needs_scalar_to_array = True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
@@ -1112,13 +1141,72 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "NVFP4 quantization requires group_size and exclude_modules "
                 "specified in the quantization config"
             )
-        return cls(
+        _instance = cls(
             is_checkpoint_nvfp4_serialized,
             kv_cache_quant_algo,
             group_size,
             exclude_modules,
             config.get("packed_modules_mapping"),
         )
+        _instance._mixed_precision_scheme_by_prefix = scheme_by_prefix
+        return _instance
+
+    def _resolve_mixed_precision_scheme(self, prefix: str):
+        """Look up the checkpoint-declared scheme for a module prefix.
+
+        Checkpoint keys carry a `language_model.` infix (ModelOpt writes
+        `model.language_model.layers.N...`) while the model constructs prefixes
+        as `model.layers.N...`. Normalise BOTH sides before comparing: matching
+        only one direction silently misses every lookup, and the FP8 layers
+        keep their NVFP4 handling with no error raised.
+        """
+        table = getattr(self, "_mixed_precision_scheme_by_prefix", None)
+        if not table:
+            return None
+
+        def normalise(name):
+            for infix in ("model.language_model.", "language_model."):
+                if infix in name:
+                    return name.replace(infix, "model.", 1)
+            return name
+
+        wanted = normalise(prefix)
+        normalised = {normalise(k): v for k, v in table.items()}
+        if wanted in normalised:
+            return normalised[wanted]
+
+        # Longest-prefix match, so a fused child resolves through its parent
+        # (e.g. "...mlp.experts.17.gate_proj" -> "...mlp.experts").
+        best = None
+        best_len = -1
+        for key, scheme in normalised.items():
+            if (wanted == key or wanted.startswith(key + ".")) and len(key) > best_len:
+                best, best_len = scheme, len(key)
+        if best is not None:
+            return best
+
+        # The checkpoint declares UNFUSED leaves (q/k/v_proj, gate/up_proj)
+        # while the model builds fused modules (qkv_proj, gate_up_proj), so a
+        # fused name matches no key and would silently take the default scheme.
+        # Resolve it through its leaves; disagreeing leaves mean no single
+        # scheme represents the module, so keep the default.
+        FUSED_LEAVES = {
+            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+            "gate_up_proj": ("gate_proj", "up_proj"),
+            "q_a_proj": ("q_a_proj",),
+        }
+        for fused, leaves in FUSED_LEAVES.items():
+            if not wanted.endswith("." + fused):
+                continue
+            parent = wanted[: -len(fused)]
+            schemes = {
+                normalised[parent + leaf]
+                for leaf in leaves
+                if parent + leaf in normalised
+            }
+            if len(schemes) == 1:
+                return schemes.pop()
+        return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         return self._get_quant_method(
