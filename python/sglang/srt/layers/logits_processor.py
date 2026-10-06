@@ -62,6 +62,64 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+def _kt_is_packed_nvfp4_head(lm_head) -> bool:
+    """True when lm_head holds a nibble-packed (uint8) NVFP4 weight."""
+    import torch as _t
+
+    w = getattr(lm_head, "weight", None)
+    return w is not None and getattr(w, "dtype", None) == _t.uint8
+
+
+def _host_head_tensors(lm_head):
+    """Packed head weight, float scales, and the global scale, on the host.
+
+    The GEMM runs on the host, so every pointer handed to it must be a host
+    pointer: a CUDA `.data_ptr()` dereferenced from user space segfaults the
+    process. The tensors are constant after loading, so they are staged once and
+    cached rather than copied per token -- the packed weight alone is 242 MB.
+    """
+    import torch as _t
+
+    cached = getattr(lm_head, "_kt_host_head", None)
+    if cached is not None:
+        return cached
+    weight = lm_head.weight
+    scale = lm_head.weight_scale
+    n, khalf = weight.shape
+    cached = (
+        n,
+        khalf * 2,
+        weight.detach().to(device="cpu", dtype=_t.uint8).contiguous(),
+        scale.detach().to(device="cpu", dtype=_t.float32).contiguous(),
+        float(lm_head.weight_scale_2),
+    )
+    lm_head._kt_host_head = cached
+    return cached
+
+
+def _kt_nvfp4_head_forward(hidden_states, lm_head):
+    """Dense NVFP4 head matmul through the kt-kernel CPU GEMM."""
+    import torch as _t
+    from kt_kernel import kt_kernel_ext as _ext
+
+    n, k, weight, scale, ws2 = _host_head_tensors(lm_head)
+    x = hidden_states.to(device="cpu", dtype=_t.float32).contiguous()
+    m = x.shape[0]
+    out = _t.empty((m, n), dtype=_t.float32, device="cpu")
+    _ext.linear.dense_nvfp4_head_forward(
+        weight.data_ptr(),
+        scale.data_ptr(),
+        ws2,
+        x.data_ptr(),
+        out.data_ptr(),
+        m,
+        n,
+        k,
+        4096,
+    )
+    return out.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -859,6 +917,12 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
+        elif _kt_is_packed_nvfp4_head(lm_head):
+            # A ModelOpt NVFP4 head holds a packed U8 weight (N, K/2) that no
+            # matmul can consume and that the GPU fp4 path cannot execute off
+            # Blackwell. Run it on the dense CPU NVFP4 GEMM instead, reading the
+            # packed weight and group scales in place.
+            logits = _kt_nvfp4_head_forward(hidden_states, lm_head)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:

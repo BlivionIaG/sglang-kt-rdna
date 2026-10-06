@@ -7,6 +7,19 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import regex as re
 import torch
+
+
+def _kt_is_lm_head(layer) -> bool:
+    """True for a vocab-parallel LM head (never a plain embedding table).
+
+    `lm_head` reaches dispatch through `VocabParallelEmbedding.__init__`, which
+    passes `self`; only the ParallelLMHead subclass should take the quantised
+    path, because a checkpoint that quantises the head does not quantise the
+    token embedding.
+    """
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+    return isinstance(layer, ParallelLMHead)
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
@@ -329,6 +342,16 @@ class ModelOptQuantConfig(QuantizationConfig):
                 # Falls back to default unquantized MoE
                 return None
             return Moe(self)
+        elif _kt_is_lm_head(layer):
+            # A quantised checkpoint stores the head nibble-packed
+            # (U8 [vocab, hidden/2]) with its own scales; without an arm here
+            # the embedding base substitutes UnquantizedEmbeddingMethod and
+            # allocates it at full width, which the packed tensor cannot fill.
+            # Only when the checkpoint declares the head -- one that leaves
+            # lm_head unquantised must stay unquantised.
+            if self._resolve_mixed_precision_scheme(prefix) is not None:
+                return Linear(self)
+            return None
         return None
 
     @classmethod
