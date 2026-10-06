@@ -274,6 +274,10 @@ class ModelOptQuantConfig(QuantizationConfig):
         super().__init__()
         self.packed_modules_mapping = packed_modules_mapping
         self.exclude_modules = exclude_modules or []
+        # Populated by ModelOptFp4Config.from_config for MIXED_PRECISION
+        # checkpoints; empty for homogeneous ones.
+        self._mixed_precision_scheme_by_prefix = {}
+        self._mixed_precision_fp8_method = None
         self.kv_cache_quant_algo = kv_cache_quant_algo
 
     def _get_quant_method(
@@ -1050,13 +1054,53 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if not quant_method in ["FP8", "NVFP4"]:
+        if quant_method not in ["FP8", "NVFP4", "MIXED_PRECISION"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
+                f"ModelOpt currently only supports: FP8, NVFP4, MIXED_PRECISION"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
-        is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
+        # MIXED_PRECISION checkpoints carry NVFP4 layers, so they serialize
+        # the packed form even though the top-level algo does not say NVFP4.
+        is_checkpoint_nvfp4_serialized = (
+            "NVFP4" in quant_method or "MIXED_PRECISION" in quant_method
+        )
+
+        # A ModelOpt MIXED_PRECISION checkpoint declares a different scheme per
+        # layer: some prefixes are plain FP8 (e8m3 + scalar per-tensor scale),
+        # others are NVFP4 (packed 4-bit + per-16 block scale). Keep that map so
+        # _get_quant_method can route each LinearBase to the right method; the
+        # top-level quant_algo alone cannot express it.
+        scheme_by_prefix: Dict[str, str] = {}
+        _quant_section = config if isinstance(config, dict) else {}
+        for _prefix, _spec in (_quant_section.get("quantized_layers") or {}).items():
+            _algo = (_spec or {}).get("quant_algo")
+            if _algo:
+                scheme_by_prefix[_prefix] = _algo
+        for _group in (_quant_section.get("config_groups") or {}).values():
+            _algo = ((_group or {}).get("weights") or {}).get("type")
+            _bits = ((_group or {}).get("weights") or {}).get("num_bits")
+            if _algo:
+                _name = (
+                    "FP8" if _bits == 8
+                    else "W4A16_NVFP4" if _bits == 4
+                    else str(_algo)
+                )
+                for _target in (_group or {}).get("targets") or []:
+                    scheme_by_prefix.setdefault(_target, _name)
+
+        # A flat MIXED_PRECISION config carries group_size only inside its
+        # config_groups entries, and lists the unquantised modules under
+        # "ignore" rather than "exclude_modules". Derive both so the NVFP4
+        # methods get the block size the checkpoint was built with.
+        if group_size is None and isinstance(config, dict):
+            for _g in (config.get("config_groups") or {}).values():
+                _gs = ((_g or {}).get("weights") or {}).get("group_size")
+                if _gs:
+                    group_size = _gs
+                    break
+        if not exclude_modules and isinstance(config, dict):
+            exclude_modules = config.get("ignore") or []
 
         if group_size is None or exclude_modules is None:
             logger.warning(
