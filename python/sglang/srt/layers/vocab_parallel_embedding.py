@@ -25,7 +25,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_allocation_symmetric,
 )
-from sglang.srt.layers.parameter import BasevLLMParameter
+from sglang.srt.layers.parameter import (
+    BasevLLMParameter,
+    copy_scalar_per_tensor_scale,
+)
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -435,6 +438,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
+            if copy_scalar_per_tensor_scale(param.data, loaded_weight):
+                return
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
             return
