@@ -712,6 +712,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        # Same rule as the linear layers: a MIXED_PRECISION checkpoint keeps some
+        # attention projections as plain FP8, and stripping their config would leave
+        # weight_scale / input_scale with no parameter to load into.
+        _keep_quantised_attn = _checkpoint_declares_fp8(quant_config)
         attn_quant_config = (
             None
             if (
