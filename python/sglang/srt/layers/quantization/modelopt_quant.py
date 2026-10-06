@@ -971,6 +971,19 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
+def _normalise_prefix_scheme(name: str) -> str:
+    """Strip the `language_model.` infix ModelOpt writes into checkpoint keys.
+
+    Checkpoint keys carry `model.language_model.layers.N...` while the model
+    constructs prefixes as `model.layers.N...`; both sides must be normalised or
+    every lookup silently misses and FP8 layers keep NVFP4 handling.
+    """
+    for infix in ("model.language_model.", "language_model."):
+        if infix in name:
+            return name.replace(infix, "model.", 1)
+    return name
+
+
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Config class for FP4."""
 
@@ -1172,6 +1185,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             config.get("packed_modules_mapping"),
         )
         _instance._mixed_precision_scheme_by_prefix = scheme_by_prefix
+        # Normalised once here rather than per lookup: the resolver is called per
+        # layer per forward, and rebuilding a {{normalised}} copy of every
+        # declared prefix each time is pure repeated work on a table that cannot
+        # change after construction. _mixed_precision_scheme_normalised holds the cache.
+        _instance._mixed_precision_scheme_normalised = {
+            _normalise_prefix_scheme(k): v for k, v in scheme_by_prefix.items()
+        }
         return _instance
 
     def _resolve_mixed_precision_scheme(self, prefix: str):
@@ -1183,18 +1203,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         only one direction silently misses every lookup, and the FP8 layers
         keep their NVFP4 handling with no error raised.
         """
-        table = getattr(self, "_mixed_precision_scheme_by_prefix", None)
-        if not table:
+        normalised = getattr(self, "_mixed_precision_scheme_normalised", None)
+        if not normalised:
             return None
 
-        def normalise(name):
-            for infix in ("model.language_model.", "language_model."):
-                if infix in name:
-                    return name.replace(infix, "model.", 1)
-            return name
-
-        wanted = normalise(prefix)
-        normalised = {normalise(k): v for k, v in table.items()}
+        wanted = _normalise_prefix_scheme(prefix)
         if wanted in normalised:
             return normalised[wanted]
 
