@@ -22,6 +22,8 @@ import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+from rdna_targets import RdnaArchError, rocm_compile_profile
+
 root = Path(__file__).parent.resolve()
 arch = platform.machine().lower()
 
@@ -41,9 +43,6 @@ include_dirs = [
 ]
 
 sources = [
-    "csrc/allreduce/custom_all_reduce.hip",
-    "csrc/allreduce/deterministic_all_reduce.hip",
-    "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/topk.cu",
@@ -64,7 +63,12 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-lin
 default_target = "gfx942"
 amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
 
-if torch.cuda.is_available():
+# Honor AMDGPU_TARGET when it names an RDNA arch even if a CDNA GPU is visible.
+# Otherwise a gfx942 box cannot cross-compile the gfx1030/gfx1100 modules.
+env_target = os.environ.get("AMDGPU_TARGET", "").split(":")[0].strip()
+if env_target in ("gfx1030", "gfx1100"):
+    amdgpu_target = env_target
+elif torch.cuda.is_available():
     try:
         amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     except Exception as e:
@@ -72,21 +76,43 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
-    print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
-    )
+try:
+    profile = rocm_compile_profile(amdgpu_target)
+except RdnaArchError as exc:
+    print(exc)
     sys.exit(1)
 
-fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
+amdgpu_target = profile["arch"]
+topk_dynamic_smem_bytes = profile["topk_dynamic_smem_bytes"]
 
-# Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
-#   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+if profile["custom_allreduce"]:
+    sources = [
+        "csrc/allreduce/custom_all_reduce.hip",
+        "csrc/allreduce/deterministic_all_reduce.hip",
+        "csrc/allreduce/quick_all_reduce.cu",
+        *sources,
+    ]
+else:
+    print(
+        f"{amdgpu_target}: custom/quick/deterministic all-reduce left out of this module. "
+        "Tensor-parallel reductions use RCCL."
+    )
+
+rdna_flags = []
+if profile["wave32"]:
+    # Host launch config and device code must agree. Without this, host
+    # compilation of HIP sees WARP_SIZE 64 while the gfx10/gfx11 device
+    # compilation sees 32.
+    rdna_flags.append("-DSGL_RDNA_WAVE32")
+if not profile["enable_fp8"]:
+    rdna_flags.append("-DSGL_RDNA_NO_FP8")
+    rdna_flags.append("-DSGL_RDNA_NO_CUSTOM_AR")
+    if profile["arch"] == "gfx1100":
+        rdna_flags.append("-DSGL_ARCH_GFX1100")
+    if profile["arch"] == "gfx1030":
+        rdna_flags.append("-DSGL_ARCH_GFX1030")
+
+cxx_flags = cxx_flags + rdna_flags
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -97,10 +123,11 @@ hipcc_flags = [
     "-std=c++17",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
-    "-DENABLE_FP8",
-    fp8_macro,
+    *rdna_flags,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+if profile["enable_fp8"]:
+    hipcc_flags.extend(["-DENABLE_FP8", profile["fp8_macro"]])
 
 ext_modules = [
     CUDAExtension(

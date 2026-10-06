@@ -29,7 +29,7 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -42,6 +42,17 @@ if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update_triton,
     )
+elif is_hip():
+    # The CUDA causal_conv1d in sgl_kernel is not in the RDNA ROCm module.
+    # The Triton conv updates the same conv state the hybrid cache stores.
+    # On gfx1030 that Triton file needs the vllm-rdna toolchain pin.
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn,
+        causal_conv1d_update,
+    )
+
+    causal_conv1d_fn_triton = causal_conv1d_fn
+    causal_conv1d_update_triton = causal_conv1d_update
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu as causal_conv1d_fn,

@@ -55,10 +55,12 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1030,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
+    is_rdna,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
@@ -67,6 +69,7 @@ from sglang.srt.utils.common import (
     is_valid_ipv6_address,
     json_list_type,
     mxfp8_block_convert_required,
+    rdna_default_attention_backend,
     nullable_str,
     parse_connector_type,
     torch_release,
@@ -2589,7 +2592,7 @@ class ServerArgs:
                 ):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
-                    self.attention_backend = "aiter"
+                    self.attention_backend = rdna_default_attention_backend() or "aiter"
                 else:
                     self.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -2600,6 +2603,10 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 elif is_sm100_supported():
                     self.attention_backend = "flashinfer"
+                elif is_hip() and rdna_default_attention_backend() is not None:
+                    # DeepSeek-class MLA is not this port's kernel. Phase 0
+                    # still has to pick a backend that does not load AITER.
+                    self.attention_backend = rdna_default_attention_backend()
                 elif is_hip():
                     head_num = model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -2844,6 +2851,39 @@ class ServerArgs:
     def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+        if not is_rdna():
+            return
+        # gfx9 custom / quick all-reduce uses CDNA buffer intrinsics and a
+        # wave64 assumption. RDNA tensor-parallel reductions go through RCCL
+        # (PyTorch's NCCL backend on ROCm).
+        self.disable_custom_all_reduce = True
+        os.environ["SGLANG_USE_AITER"] = "0"
+        logger.info(
+            "RDNA: SGLANG_USE_AITER=0 and custom all-reduce disabled. "
+            "gfx1100 WMMA kernels stay in https://github.com/BlivionIaG/ktransformers-rdna "
+            "and are not loaded from this sgl-kernel module."
+        )
+        if self.attention_backend == "aiter":
+            replacement = rdna_default_attention_backend()
+            logger.warning(
+                "AITER is CDNA-only. Replacing attention backend 'aiter' with '%s' on RDNA.",
+                replacement,
+            )
+            self.attention_backend = replacement
+            if replacement == "torch_native":
+                self.disable_cuda_graph = True
+        if is_gfx1030() and self.attention_backend == "triton":
+            logger.warning(
+                "gfx1030 standard Triton attention needs the vllm-rdna Triton/ROCm pin "
+                "(upstream Triton dropped RDNA2 on 2026-09-30). "
+                "The phase-0 smoke command uses --attention-backend torch_native."
+            )
+        if is_gfx1030() and self.linear_attn_backend == "triton":
+            logger.info(
+                "gfx1030 GatedDeltaNet and QSA split-K Triton kernels are not blockers. "
+                "They need the vllm-rdna Triton/ROCm toolchain pin. "
+                "Hybrid recurrent state stays on the GPU next to attention."
+            )
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:

@@ -89,9 +89,18 @@ if _is_cuda:
     except ImportError as e:
         pass
 
+_has_sgl_topk = False
+topk_softmax = None
+topk_sigmoid = None
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import topk_softmax
+    try:
+        from sgl_kernel import topk_softmax
 
+        _has_sgl_topk = True
+    except ImportError:
+        logger.warning(
+            "sgl_kernel.topk_softmax is not importable. MoE routing will use the torch top-k path."
+        )
     try:
         from sgl_kernel import topk_sigmoid
     except ImportError:
@@ -464,6 +473,15 @@ def fused_topk(
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
+    if not _has_sgl_topk:
+        return fused_topk_torch_native(
+            hidden_states,
+            gating_output,
+            topk,
+            renormalize,
+            correction_bias,
+            scoring_func,
+        )
     if scoring_func == "softmax":
         topk_softmax(
             topk_weights,

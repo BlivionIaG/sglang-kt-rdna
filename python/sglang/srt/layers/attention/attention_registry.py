@@ -111,6 +111,15 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("fa_rdna2")
+def create_fa_rdna2_backend(runner):
+    """gfx1030 GQA attention. The kernel is not vendored in this repo."""
+
+    from sglang.srt.hardware_backend.rdna.hooks import load_fa_rdna2_backend
+
+    return load_fa_rdna2_backend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

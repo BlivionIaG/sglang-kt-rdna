@@ -11,8 +11,63 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
+_has_sgl_moe_align = False
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    try:
+        from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+        _has_sgl_moe_align = True
+    except ImportError:
+        sgl_moe_align_block_size = None
+
+
+def moe_align_block_size_torch(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch reference for ``moe_align_block_size``.
+
+    ``num_experts`` is the kernel argument, one larger than the logical expert
+    count, so id ``-1`` lands in slot 0. Within an expert, token ids are in
+    increasing order. The CUDA/HIP kernel does not promise that order; compare
+    per-expert sets, the padded block count, and ``expert_ids``.
+    """
+
+    flat = topk_ids.reshape(-1).to(torch.int64)
+    numel = flat.numel()
+    slot = flat + 1
+    counts = torch.bincount(slot, minlength=num_experts)
+    padded = ((counts + block_size - 1) // block_size) * block_size
+    cumsum = torch.zeros(num_experts + 1, dtype=torch.int64)
+    cumsum[1:] = torch.cumsum(padded.cpu(), dim=0)
+    total = int(cumsum[-1].item())
+    if numel < num_experts:
+        max_num_tokens_padded = max(numel * block_size, total)
+    else:
+        max_num_tokens_padded = max(
+            numel + num_experts * (block_size - 1),
+            total,
+        )
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), numel, dtype=torch.int32, device=topk_ids.device
+    )
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    expert_ids = torch.full(
+        (max(max_num_m_blocks, 1),), -1, dtype=torch.int32, device=topk_ids.device
+    )
+    order = torch.argsort(slot, stable=True)
+    for expert in range(num_experts):
+        start = int(cumsum[expert].item())
+        end = int(cumsum[expert + 1].item())
+        if end == start:
+            continue
+        ids = order[slot[order] == expert]
+        sorted_ids[start : start + ids.numel()] = ids.to(sorted_ids.dtype)
+        for block in range(start, end, block_size):
+            expert_ids[block // block_size] = expert - 1
+    num_tokens_post_pad = torch.tensor(
+        [total], dtype=torch.int32, device=topk_ids.device
+    )
+    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def moe_align_block_size(
@@ -73,6 +128,8 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
+    if not _has_sgl_moe_align:
+        return moe_align_block_size_torch(topk_ids, block_size, num_experts + 1)
     sgl_moe_align_block_size(
         topk_ids,
         num_experts + 1,

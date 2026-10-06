@@ -49,15 +49,29 @@ _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
+_has_sgl_kernel_activation = False
 if _is_cuda or _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+
+    _has_sgl_kernel_activation = True
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+    try:
+        from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+
+        _has_sgl_kernel_activation = True
+    except ImportError:
+        gelu_and_mul = gelu_quick = gelu_tanh_and_mul = silu_and_mul = None
 
 if is_npu():
     import torch_npu
 
 logger = logging.getLogger(__name__)
+
+if _is_hip and not _has_sgl_kernel_activation:
+    logger.warning(
+        "sgl_kernel activation ops are not importable. "
+        "silu_and_mul and gelu_and_mul will use the torch implementation."
+    )
 
 
 class SiluAndMul(MultiPlatformOp):
@@ -76,6 +90,11 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if not _has_sgl_kernel_activation:
+            return self.forward_native(x)
+        return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
@@ -128,6 +147,11 @@ class GeluAndMul(MultiPlatformOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if not _has_sgl_kernel_activation:
+            return self.forward_native(x)
+        return self._forward_impl(x)
+
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
@@ -172,6 +196,8 @@ class QuickGELU(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if not _has_sgl_kernel_activation:
+            return self.forward_native(x)
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         gelu_quick(x, out)
         return out

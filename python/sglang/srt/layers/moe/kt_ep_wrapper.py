@@ -58,10 +58,18 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
-from sglang.srt.utils import get_compiler_backend, is_cuda
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 if is_cuda():
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+else:
+
+    def gptq_marlin_repack(*_args, **_kwargs):
+        raise RuntimeError(
+            "gptq_marlin_repack is CUDA-only. On RDNA, GPU INT4 experts are "
+            "moe_q_gemm_rdna2 from https://github.com/BlivionIaG/ktransformers-rdna. "
+            "Phase 0 uses --kt-num-gpu-experts 0, so this repack is not on the smoke path."
+        )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -80,6 +88,65 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _hip_host_register(ptr: int, nbytes: int) -> bool:
+    """Pin a host buffer with hipHostRegister when torch's cudart wrapper fails."""
+
+    for soname in ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"):
+        try:
+            lib = ctypes.CDLL(soname)
+        except OSError:
+            continue
+        fn = lib.hipHostRegister
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        # hipHostRegisterDefault == 0
+        status = int(fn(ctypes.c_void_p(ptr), ctypes.c_size_t(nbytes), 0))
+        return status == 0
+    return False
+
+
+def _pin_host_memory(ptr: int, nbytes: int, name: str) -> None:
+    """Register a shared-memory expert buffer for DMA.
+
+    NVIDIA still raises if cudaHostRegister fails. On ROCm, try the cudart
+    shim, then hipHostRegister, and keep going unpinned if both fail so a
+    missing pin does not block the CPU-expert path.
+    """
+
+    if not torch.cuda.is_available():
+        return
+    if is_hip():
+        try:
+            result = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+            if int(result) == 0:
+                return
+            logger.warning(
+                "cudaHostRegister returned %s for %s on ROCm; trying hipHostRegister.",
+                int(result),
+                name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "torch.cuda.cudart().cudaHostRegister failed on ROCm for %s: %s",
+                name,
+                exc,
+            )
+        if _hip_host_register(ptr, nbytes):
+            return
+        logger.warning(
+            "Host buffer %s is not pinned. CPU expert copies still run.",
+            name,
+        )
+        return
+
+    register_result = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+    if int(register_result) != 0:
+        raise RuntimeError(
+            "cudaHostRegister failed for "
+            f"{name} with error code {int(register_result)}"
+        )
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
@@ -1188,16 +1255,8 @@ class SharedFullContext:
                 )
 
                 # Register as pinned memory for fast DMA
-                if torch.cuda.is_available():
-                    register_result = torch.cuda.cudart().cudaHostRegister(
-                        cpu_buffer.data_ptr(), double_buf_nbytes, 0
-                    )
-                    if int(register_result) != 0:
-                        raise RuntimeError(
-                            "cudaHostRegister failed for "
-                            f"{name} with error code {int(register_result)}"
-                        )
-                    self._registered_host_buffers.append(cpu_buffer)
+                _pin_host_memory(cpu_buffer.data_ptr(), double_buf_nbytes, name)
+                self._registered_host_buffers.append(cpu_buffer)
 
                 self.cpu_buffers[name] = cpu_buffer
         except Exception as exc:
