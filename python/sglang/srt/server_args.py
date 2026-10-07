@@ -448,7 +448,7 @@ class ServerArgs:
             "--kt-numa-nodes",
             type=int,
             nargs="+",
-            default=ServerArgs.kt_numa_nodes,
+            default=_declared_default("kt_numa_nodes"),
             help="[ktransformers parameter] Explicit NUMA node ids for each KT threadpool. "
                  "Length must equal --kt-threadpool-count.",
         )
@@ -469,25 +469,25 @@ class ServerArgs:
         parser.add_argument(
             "--kt-max-deferred-experts-per-token",
             type=int,
-            default=ServerArgs.kt_max_deferred_experts_per_token,
+            default=_declared_default("kt_max_deferred_experts_per_token"),
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
         parser.add_argument(
             "--kt-gpu-prefill-token-threshold",
             type=int,
-            default=ServerArgs.kt_gpu_prefill_token_threshold,
+            default=_declared_default("kt_gpu_prefill_token_threshold"),
             help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
         )
         parser.add_argument(
             "--kt-enable-dynamic-expert-update",
             action="store_true",
-            default=ServerArgs.kt_enable_dynamic_expert_update,
+            default=_declared_default("kt_enable_dynamic_expert_update"),
             help="[ktransformers parameter] Enable dynamic GPU expert updates based on runtime statistics. After full GPU fallback computation, updates original layer's GPU experts to match the most frequently activated experts in the current batch.",
         )
         parser.add_argument(
             "--kt-expert-placement-strategy",
             type=str,
-            default=ServerArgs.kt_expert_placement_strategy,
+            default=_declared_default("kt_expert_placement_strategy"),
             choices=["frequency", "front-loading", "uniform", "random"],
             help="[ktransformers parameter] GPU expert placement strategy. "
                  "frequency: Select top-k by activation frequency (default). "
@@ -498,7 +498,7 @@ class ServerArgs:
         parser.add_argument(
             "--kt-lora-path",
             type=str,
-            default=ServerArgs.kt_lora_path,
+            default=_declared_default("kt_lora_path"),
             help="[experimental ktransformers parameter] Single PEFT adapter directory "
                  "for static full KT LoRA. Expert tensors are served by the KT CPU "
                  "SFT path and Qwen3.5 non-expert tensors are applied statically in "
@@ -507,7 +507,7 @@ class ServerArgs:
         parser.add_argument(
             "--kt-expert-lora-path",
             type=str,
-            default=ServerArgs.kt_expert_lora_path,
+            default=_declared_default("kt_expert_lora_path"),
             help="[experimental ktransformers parameter] Single PEFT adapter directory "
                  "for KT CPU expert LoRA. This bypasses SGLang's normal LoRA manager "
                  "for expert weights and runs the KT CPU expert path through forward_sft.",
