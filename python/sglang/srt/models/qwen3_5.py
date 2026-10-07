@@ -1034,8 +1034,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         config: Qwen3_5TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
+        # `is_nextn` added with the qwen4 subsystem (sgl-project/sglang): the
+        # Qwen4-Exp language model calls `super().__init__(config, quant_config,
+        # prefix, is_nextn)`, so without it every qwen4_exp model construction
+        # failed with "takes from 2 to 4 positional arguments but 5 were given".
+        # Accepted and recorded; the MTP/nextn decoder wiring this fork needs is
+        # unchanged, so the flag is inert here rather than silently ignored.
         super().__init__()
+        self.is_nextn = is_nextn
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
@@ -1299,8 +1307,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         config: Qwen3_5TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            is_nextn=is_nextn,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
