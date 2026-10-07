@@ -181,3 +181,44 @@ with the swap allowance raised too. If it still dies, the lever is `--kt-gpu-exp
 The PLE file is 48 G of disk and `/home` is now at **7.6 G free (99%)**. The file is reused
 across restarts (deterministic name), so it should NOT be deleted -- but there is no longer room
 for another 48 G if anything repopulates it. Watch this.
+
+## DISK: WHAT EXISTS, AND WHAT MoE-TO-DISK WOULD COST
+
+**One device only.** `nvme0n1` 465.8 G -> LUKS -> btrfs, mounted at both `/` and `/home`.
+No ZFS, no spare disk, no unallocated space. 449 G used, **7.5 G free**.
+
+Where it went:
+
+    /home/kletorch/models        170 G
+      qwen38-stage               124 G   the model under test
+      Qwen3.6-...NVFP4-fixed      24 G
+      Qwen3.6-...NVFP4-deqhead    23 G
+    /home/chenco_adm              60 G   2 MORE Qwen3.6 copies (FP8 36 G, NVFP4 22 G)
+    /home/kletorch/Projects       60 G
+    /home/kletorch/.cache/sglang  48 G   THE PLE FILE -- in use, must not be deleted
+    /var + /usr + /opt            32 G
+
+**FOUR Qwen3.6 copies exist, 105 G in total**, and the serve recipe at
+`~/serve-backups/serve-stock.sh` points at `/home/chenco_adm/Qwen3.6-35B-A3B-NVFP4` -- i.e.
+**neither** of the two under `kletorch/models`. Those two are the obvious reclaim candidates
+(47 G), but deleting model directories is the operator's call, not mine, so this is recorded
+rather than acted on.
+
+### Would MoE-to-disk help?
+
+    experts, in-kernel (measured)   83.16 GiB
+    RAM available                   90.06 GiB
+    headroom if ALL experts in RAM   6.90 GiB
+
+That headroom is thin but it is not zero, **and the run that failed died at the 70 G CAP, not
+at the machine** -- the kernel said `constraint=CONSTRAINT_MEMCG` and the host stayed up.
+Attempt 2 runs at `MEMCAP=88G` precisely to find where it actually lands. So expert-to-disk is
+NOT yet justified by the numbers.
+
+If it does become necessary, two things bound it:
+- it needs its own store, and `/home` has 7.5 G free while the PLE file already holds 48 G;
+- the same 1.31x in-kernel overhead that applies to RAM would apply to whatever form a disk
+  store takes, so the budget would be ~83 GiB of *store*, not the 63 GiB the checkpoint holds.
+
+**Cheapest lever first:** `--kt-gpu-experts-ratio` moves experts to the 16 GB card (10.17 GiB
+is already used of 15.48, so there is little room) or fewer `--kt-cpuinfer` threads.
