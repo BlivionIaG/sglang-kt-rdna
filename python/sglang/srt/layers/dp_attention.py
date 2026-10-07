@@ -575,3 +575,77 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -----------------
+# `dsa/utils.py` (and the upstream lora / forward-batch paths) call
+# `dp_slot_in`, which upstream implements on top of its elastic-scale-up
+# gather helpers (`dp_gather_width` / `dp_gather_slot`, reading `get_flags()`
+# and `get_parallel()`). This fork predates that machinery, so the same
+# contract is expressed with the attention-DP accessors it already has:
+# the gather width is the attention-DP replica count, and this process's slot
+# is its attention-DP rank. On a single-GPU or non-DP deployment both reduce
+# to the length-1 fast path, which is the case this port actually runs.
+
+
+def dp_gather_width() -> int:
+    """Number of entries a per-DP-replica sequence carries (the gather width)."""
+    return get_attention_dp_size()
+
+
+def dp_gather_slot() -> int:
+    """This process's index in the DP gather."""
+    return get_attention_dp_rank()
+
+
+def dp_slot_in(per_rank) -> int:
+    """Return this process's slot in a per-DP-replica sequence.
+
+    The sequence carries one entry per replica of the gather this process
+    takes part in, so its length is the gather width. Length one is the
+    all-gather-skipped batch, which carries this process's entry alone.
+    """
+    if len(per_rank) == 1:
+        return 0
+    width = dp_gather_width()
+    if len(per_rank) != width:
+        raise ValueError(
+            f"a per-replica sequence of {len(per_rank)} entries does not "
+            f"belong to a DP gather of width {width}"
+        )
+    return dp_gather_slot()
+
+
+def get_moe_cp_size() -> int:
+    """MoE data-parallel group width.
+
+    Upstream reads this from its parallel-context object
+    (``get_parallel().moe_dp_group.world_size``). This fork keeps the group on
+    ``parallel_state`` instead, so the same value comes from
+    ``get_moe_data_parallel_world_size()``. A group that was never initialized
+    (a non-MoE or single-rank run) is width 1, which is the answer upstream
+    gives too when no MoE CP group exists -- and the case this port runs.
+    """
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_moe_data_parallel_world_size,
+        )
+
+        return get_moe_data_parallel_world_size()
+    except Exception:
+        return 1
+
+
+def get_moe_cp_rank() -> int:
+    """This process's rank in the MoE data-parallel group (see above)."""
+    try:
+        from sglang.srt.distributed.parallel_state import get_moe_data_parallel_rank
+
+        return get_moe_data_parallel_rank()
+    except Exception:
+        return 0
+
+
+def is_enable_moe_cp_allgather() -> bool:
+    """Whether the MoE CP all-gather path is active (single rank: no)."""
+    return get_moe_cp_size() > 1

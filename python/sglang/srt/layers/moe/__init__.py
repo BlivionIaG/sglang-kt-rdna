@@ -1,17 +1,22 @@
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
-    DeepEPMode,
-    MoeA2ABackend,
-    MoeRunnerBackend,
-    get_deepep_config,
-    get_deepep_mode,
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-    get_tbo_token_distribution_threshold,
-    initialize_moe_config,
-    is_tbo_enabled,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-)
+        DeepEPMode,
+        MoeA2ABackend,
+        MoeRunnerBackend,
+        can_merge_post_experts_all_reduce,
+        get_deepep_config,
+        get_deepep_mode,
+        get_moe_a2a_backend,
+        get_moe_runner_backend,
+        get_tbo_token_distribution_threshold,
+        initialize_moe_config,
+        is_moe_input_scattered_across_dp_ranks,
+        is_tbo_enabled,
+        post_experts_reduction_group,
+        post_experts_sum_is_one_all_reduce,
+        should_use_dp_reduce_scatterv,
+        should_use_flashinfer_cutlass_moe_fp4_allgather,
+    )
 
 __all__ = [
     "DeepEPMode",
@@ -27,4 +32,9 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "is_moe_input_scattered_across_dp_ranks",
+    "can_merge_post_experts_all_reduce",
+    "post_experts_reduction_group",
+    "post_experts_sum_is_one_all_reduce",
+    "should_use_dp_reduce_scatterv",
 ]

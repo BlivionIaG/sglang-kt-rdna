@@ -2498,3 +2498,68 @@ class MiniMaxSparseKVPool(KVCache):
 
     def get_v_head_dim(self):
         return self.main_pool.get_value_buffer(0).shape[-1]
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -----------------
+# `layers/cp/zigzag.py` imports this at module level and calls the two
+# classmethods when it writes reorganized KV rows. Upstream's version carries
+# `physical` / `swa_loc` / `full_loc` because upstream's pool is the "unified"
+# one with sub-pools and a write door that requires a physical mark; this fork's
+# pool predates that, and its `ForwardBatch` has no
+# `out_cache_loc_is_physical`, so those extras are omitted here rather than
+# guessed. What remains is the part the CP path actually uses: the write loc for
+# a batch or for one layer, plus the per-token slice alignment.
+
+
+@dataclass
+class KVWriteLoc:
+    """Write target for ``KVCache.set_kv_buffer``.
+
+    ``loc`` is the generic per-token write location (``out_cache_loc``);
+    ``swa_loc`` / ``full_loc`` are optional pre-resolved locations into a
+    sliding-window or full-attention sub-pool for hybrid pools, ``None``
+    otherwise. Bundling them lets a backend issue one ``set_kv_buffer`` call
+    regardless of pool type.
+    """
+
+    loc: torch.Tensor
+    swa_loc: Optional[torch.Tensor] = None
+    full_loc: Optional[torch.Tensor] = None
+
+    @classmethod
+    def for_batch(
+        cls,
+        forward_batch,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> "KVWriteLoc":
+        """The batch's ``out_cache_loc`` as a write loc."""
+        return cls(forward_batch.out_cache_loc, swa_loc, full_loc)
+
+    @classmethod
+    def for_layer(
+        cls,
+        forward_batch,
+        layer,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> "KVWriteLoc":
+        """``layer``'s write loc: the batch's, or for a cross-attention layer
+        ``encoder_out_cache_loc``."""
+        if getattr(layer, "is_cross_attention", False):
+            return cls(forward_batch.encoder_out_cache_loc, swa_loc, full_loc)
+        return cls.for_batch(forward_batch, swa_loc=swa_loc, full_loc=full_loc)
+
+    def __post_init__(self):
+        # swa_loc / full_loc are resolved once at metadata-init from the full
+        # (padded) out_cache_loc; padded paths later narrow loc per layer, so
+        # slice these pre-resolved locs to match (same per-token order).
+        if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
+            self.swa_loc = self.swa_loc[: self.loc.shape[0]]
+        if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
+            self.full_loc = self.full_loc[: self.loc.shape[0]]
+
+    def as_loc(self) -> torch.Tensor:
+        """This fork's ``set_kv_buffer`` takes the loc tensor directly."""
+        return self.loc

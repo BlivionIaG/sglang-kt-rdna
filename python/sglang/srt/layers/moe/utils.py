@@ -7,10 +7,12 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -379,3 +381,126 @@ class RoutingMethodType(IntEnum):
     TopK = (5,)
     # Unspecified
     Unspecified = 6
+
+
+def is_moe_input_scattered_across_dp_ranks() -> bool:
+    """Whether sparse MoE routing runs on a DP-local token shard.
+
+    Upstream's predicate is ``a2a backend != none`` OR
+    ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` OR
+    ``get_parallel().dwdp_size > 1``. This fork has no ``dwdp_size`` on its
+    parallel context, so that third clause is expressed with the MoE
+    data-parallel width it does expose -- ``> 1`` is the same condition,
+    "there is more than one DP rank to scatter across". The first two clauses
+    are taken as-is because both helpers exist here unchanged.
+    """
+    if not get_moe_a2a_backend().is_none():
+        return True
+    try:
+        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            return True
+    except Exception:
+        pass
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_moe_data_parallel_world_size,
+        )
+
+        return get_moe_data_parallel_world_size() > 1
+    except Exception:
+        return False
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -----------------
+# `layers/layer_boundary/` (exit.py, layout.py, fusions/allreduce.py) imports
+# these four from the `moe` package to decide where an MoE output's all-reduce
+# runs. They are the same predicates upstream defines; this fork lacks the
+# `post_experts_output_is_complete` / `get_lora` helpers they lean on, so those
+# clauses are expressed with the equivalents this fork has. `post_experts_
+# reduction_group` returning the wrong group would silently reduce over the
+# wrong ranks, so the fallbacks here are deliberately conservative.
+
+
+def can_merge_post_experts_all_reduce() -> bool:
+    """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
+
+    True when moe_dp_size == 1: the two groups are an orthogonal decomposition
+    of _TP, so reducing over each in turn equals one _TP reduction.
+    """
+    parallel = get_parallel()
+    moe_dp_size = getattr(parallel, "moe_dp_size", 1)
+    return (
+        parallel.moe_ep_size > 1
+        and parallel.moe_tp_size > 1
+        and moe_dp_size == 1
+    )
+
+
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
+def post_experts_sum_is_one_all_reduce() -> bool:
+    """Whether the sum an FFN leaves out when it skips its post-experts (or
+    down-projection) all-reduce is one full-precision all-reduce over the TP
+    group itself, on a plain partial sum.
+
+    This fork has no `post_experts_output_is_complete` / `get_lora` helpers, so
+    those clauses are read from the state this fork does keep: a quantized
+    communication path and a LoRA-enabled runner both disqualify the
+    optimization, exactly as upstream's clauses do.
+    """
+    parallel = get_parallel()
+    try:
+        if get_exec().comm.enable_quant_communications:
+            return False
+    except Exception:
+        pass
+    if envs.SGLANG_SHARED_EXPERT_TP1.get():
+        return False
+    try:
+        from sglang.srt.lora.lora_manager import get_lora
+
+        if get_lora().enable_lora:
+            return False
+    except Exception:
+        # No LoRA manager in this fork: the clause is vacuously false, same as
+        # a runner with LoRA disabled.
+        pass
+    # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
+    if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+        return False
+    return post_experts_reduction_group() is parallel.tp_group
+
+
+def should_use_dp_reduce_scatterv():
+    """
+    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
+    with EP, replacing the default all-reduce + dp_scatter path.
+
+    The reduce_scatterv group is the global TP group, while its variable split
+    sizes are one entry per attention-DP rank. Therefore this optimization is
+    valid only when each attention-DP shard has a single rank (attention TP=1).
+    """
+    parallel = get_parallel()
+    if not should_use_flashinfer_cutlass_moe_fp4_allgather() \
+            and not get_moe_a2a_backend().is_none():
+        return False
+    try:
+        if not is_dp_attention_enabled():
+            return False
+    except Exception:
+        return False
+    attn_dp_size = getattr(parallel, "attn_dp_size", 1)
+    return (
+        attn_dp_size > 1
+        and getattr(parallel, "tp_size", attn_dp_size) == attn_dp_size
+        and parallel.moe_ep_size == attn_dp_size
+    )

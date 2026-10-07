@@ -1,5 +1,6 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
+from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
@@ -9,6 +10,13 @@ from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.inkling import (
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+)
+from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -19,7 +27,11 @@ from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
+from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+from sglang.srt.configs.mamba2 import Mamba2Config
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
 from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
@@ -31,6 +43,7 @@ from sglang.srt.configs.step3_vl import (
     Step3VLConfig,
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
+from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
     "AfmoeConfig",
@@ -65,4 +78,16 @@ __all__ = [
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",
+    "FalconMambaConfig",
+    "InklingAudioConfig",
+    "InklingMMConfig",
+    "InklingModelConfig",
+    "InklingVisionConfig",
+    "InternS2PreviewConfig",
+    "Lfm2VlConfig",
+    "Mamba2Config",
+    "MambaConfig",
+    "MiniCPMHybridConfig",
+    "ZayaConfig",
+    "BailingMM2Config",
 ]
