@@ -64,7 +64,11 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
-from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+# ^ adapted for this fork: upstream moved this flag to
+#   sglang.srt.model_executor.runner_utils.capture_mode, which does not exist
+#   in kvcache-ai/sglang. cuda_graph_runner owns the same process-global
+#   `is_capture_mode` flag here, so the semantics are unchanged.
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
