@@ -138,3 +138,27 @@ adversarial ids (in-range, below the shard, above it, both bounds) -- 7/7 rows i
 NOT verified on hardware: par1-llm1 is wedged, so the torch tensor ops (indexing an fp8 cpu
 table with a long tensor, then `.to(bfloat16)`) have not been exercised against real weights.
 Test that first when the host returns.
+
+## HOST RELIABILITY (2026-10-07) -- read before scheduling any long run
+
+par1-llm1 flaps. Three wedges in one afternoon, and the recovery windows are SHORT:
+
+    1. ~13:10 wedged  ->  ~13:34 recovered on its own (uptime unchanged: 41 days, no reboot)
+    2. ~13:36 wedged  ->  briefly answered again
+    3. moments later  ->  wedged again and stayed down
+
+Signature, confirmed from TWO vantages (this workstation and `chenco_adm@par1-cssec1`, which
+now trusts llm1's host key):
+
+    ICMP            -> 0% loss, normal RTT        kernel + NIC healthy
+    ARP / ip neigh  -> REACHABLE, MAC unchanged   no reboot happened
+    TCP :22         -> OPEN                       sshd is listening
+    SSH banner      -> NEVER ARRIVES              the forked child cannot run
+    all service ports (8208-8214, 9100, 11434) -> closed
+
+So: nothing on the box can fork, while the network stack and kernel are fine. **Practical
+consequences:**
+- Do NOT hold a long foreground SSH call -- it will be cut off mid-run.
+- Launch work under `tmux` on the host and read the log later; that survived the wedge before.
+- A recovery window is short: the first command issued must be the one you actually want.
+- The `file` PLE route's cost matters more now, because a wedging host is the real constraint.
