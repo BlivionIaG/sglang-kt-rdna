@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
+from typing import Optional
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput

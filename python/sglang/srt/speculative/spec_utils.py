@@ -26,6 +26,19 @@ from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2, is_xpu
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+import contextlib
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.speculative.row_argmax import row_argmax
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.utils import _async_d2h
+from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.nvtx_utils import profile_range
 _is_xpu = is_xpu()
 
 _is_cuda = is_cuda()

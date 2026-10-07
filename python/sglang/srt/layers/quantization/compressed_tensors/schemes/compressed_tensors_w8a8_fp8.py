@@ -27,6 +27,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 

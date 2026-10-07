@@ -41,6 +41,9 @@ from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingPar
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
+from aiohttp import web
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))

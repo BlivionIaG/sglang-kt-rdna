@@ -7,6 +7,8 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
+from sglang.srt.server_args import ServerArgs
 
 
 @dataclass

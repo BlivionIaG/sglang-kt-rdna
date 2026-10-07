@@ -29,6 +29,9 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm

@@ -5,6 +5,7 @@ from typing import Callable, Generic, Optional, Tuple, TypeVar
 
 import torch
 from pydantic import BaseModel, ConfigDict
+from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar
 
 _T = TypeVar("_T")
 _U = TypeVar("_U")

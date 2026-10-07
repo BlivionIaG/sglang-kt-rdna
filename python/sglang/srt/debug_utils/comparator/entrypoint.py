@@ -30,6 +30,8 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.srt.debug_utils.dump_loader import read_meta
+from typing import Any, Iterator, Optional, Union
+from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
 
 def main() -> None:

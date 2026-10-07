@@ -5,6 +5,8 @@ import torch
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from typing import TYPE_CHECKING, List, Optional, Tuple
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig

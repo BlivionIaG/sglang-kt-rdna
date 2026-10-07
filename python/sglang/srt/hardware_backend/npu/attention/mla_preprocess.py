@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35, npu_format_cast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig

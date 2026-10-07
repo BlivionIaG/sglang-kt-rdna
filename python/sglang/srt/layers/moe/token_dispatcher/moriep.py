@@ -34,6 +34,8 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+import functools
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip

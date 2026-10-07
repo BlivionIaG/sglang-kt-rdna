@@ -49,6 +49,8 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from typing import TYPE_CHECKING, List, Optional, Tuple
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter

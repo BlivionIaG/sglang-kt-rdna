@@ -48,6 +48,8 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 
 logger = logging.getLogger(__name__)
 

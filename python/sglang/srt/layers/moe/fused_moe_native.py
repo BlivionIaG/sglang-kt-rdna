@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.activation import GeluAndMul, SiluAndMul, SituAndMul
 
 
 def fused_moe_forward_native(

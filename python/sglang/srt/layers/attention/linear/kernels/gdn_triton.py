@@ -4,6 +4,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule

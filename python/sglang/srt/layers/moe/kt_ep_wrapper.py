@@ -61,6 +61,9 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
 import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+from sglang.srt.utils import get_compiler_backend
 
 if is_cuda():
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack

@@ -13,6 +13,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
+from typing import List, NamedTuple, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

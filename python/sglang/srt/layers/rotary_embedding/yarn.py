@@ -8,6 +8,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from typing import Callable, Optional, Tuple
 
 
 # Inverse dim formula to find dim based on number of rotations

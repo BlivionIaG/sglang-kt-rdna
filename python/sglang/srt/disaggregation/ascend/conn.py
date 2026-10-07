@@ -16,6 +16,9 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.utils import get_local_ip_auto
 import enum
+from typing import List, Optional, Tuple
+from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 

@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from compressed_tensors.quantization import QuantizationStrategy
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 

@@ -35,6 +35,8 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 
 from .granitemoe import GraniteMoeMoE
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
 
 # in vLLM this is in a separate file, but keeping it here for decoupling

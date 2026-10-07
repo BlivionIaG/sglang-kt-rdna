@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.srt.utils.common import is_npu
+from abc import ABC
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata

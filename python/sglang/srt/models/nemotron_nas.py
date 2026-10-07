@@ -41,6 +41,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import logger
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:

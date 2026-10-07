@@ -51,6 +51,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_sm90_supported = is_cuda() and is_sm90_supported()

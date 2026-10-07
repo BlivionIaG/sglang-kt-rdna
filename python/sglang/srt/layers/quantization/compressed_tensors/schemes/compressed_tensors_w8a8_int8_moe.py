@@ -14,6 +14,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.utils import set_weight_attrs
+from compressed_tensors.quantization import QuantizationStrategy
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

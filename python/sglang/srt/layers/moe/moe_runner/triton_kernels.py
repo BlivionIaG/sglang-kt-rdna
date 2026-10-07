@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from triton_kernels.matmul_ogs import PrecisionConfig

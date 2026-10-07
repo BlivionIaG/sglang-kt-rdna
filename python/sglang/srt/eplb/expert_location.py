@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
+from typing import TYPE_CHECKING, Iterable, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

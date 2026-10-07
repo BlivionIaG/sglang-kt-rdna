@@ -11,6 +11,8 @@ from typing import Callable, Optional
 import psutil
 
 from sglang.srt.utils.common import pyspy_dump_schedulers
+from typing import Callable, List, Optional
+from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
 

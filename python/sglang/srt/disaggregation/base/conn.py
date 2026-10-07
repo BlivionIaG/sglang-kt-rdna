@@ -9,6 +9,7 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 import enum
 import dataclasses
+from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode

@@ -24,6 +24,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cpu
+from typing import TYPE_CHECKING, Optional, Union
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (

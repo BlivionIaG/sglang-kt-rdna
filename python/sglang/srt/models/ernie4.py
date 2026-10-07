@@ -44,6 +44,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cpu, is_npu, make_layers
 
 
 class MoEGate(nn.Module):

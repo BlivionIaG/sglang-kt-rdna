@@ -24,6 +24,8 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from compressed_tensors.quantization import QuantizationStrategy
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

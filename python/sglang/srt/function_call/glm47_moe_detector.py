@@ -15,6 +15,7 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import infer_type_from_json_schema
 from functools import lru_cache
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 

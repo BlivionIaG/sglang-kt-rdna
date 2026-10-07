@@ -48,6 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from typing import Iterable, List, Optional, Set, Tuple
 
 
 class Lfm2MoeMLP(nn.Module):

@@ -28,6 +28,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
 from typing import Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

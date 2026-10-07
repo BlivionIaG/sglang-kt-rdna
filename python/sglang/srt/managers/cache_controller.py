@@ -43,6 +43,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
 from dataclasses import dataclass
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 

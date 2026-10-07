@@ -46,6 +46,9 @@ from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 import time
 import types
+from typing import Dict, Iterable, List, Optional, Sequence
+from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
+from sglang.srt.utils import get_available_gpu_memory, replace_submodule
 
 logger = logging.getLogger(__name__)
 

@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 
 if is_flashinfer_available():
     import flashinfer

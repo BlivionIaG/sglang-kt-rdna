@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import warnings
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 logger = logging.getLogger(__name__)
 

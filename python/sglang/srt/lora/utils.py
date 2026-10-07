@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 
 @dataclass

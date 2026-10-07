@@ -50,6 +50,9 @@ from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.model_executor.runner import get_is_capture_mode
 
 
 class KimiMoE(nn.Module):

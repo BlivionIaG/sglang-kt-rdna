@@ -11,6 +11,9 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import _StrictBase
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
+from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
+from sglang.srt.debug_utils.comparator.utils import Pair, _StrictBase
 
 
 class ReplicatedMismatchWarning(_StrictBase):

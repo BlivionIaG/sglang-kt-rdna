@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.utils.common import set_weight_attrs
+from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 
 
 class Mixer2RMSNormGated(MultiPlatformOp):

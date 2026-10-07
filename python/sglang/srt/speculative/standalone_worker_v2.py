@@ -17,6 +17,8 @@ from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
+from typing import Optional
+from sglang.srt.utils import get_bool_env_var
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401

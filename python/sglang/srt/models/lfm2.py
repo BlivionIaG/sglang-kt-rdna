@@ -46,6 +46,9 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from typing import TYPE_CHECKING, Iterable, List, Optional, Set, Tuple
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 
 logger = logging.getLogger(__name__)
 

@@ -15,6 +15,8 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 from functools import reduce
 from copy import copy
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
+from sglang.srt.disaggregation.base import KVPoll
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs

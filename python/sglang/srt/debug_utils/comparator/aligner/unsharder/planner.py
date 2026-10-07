@@ -10,6 +10,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     UnsharderPlan,
 )
 from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
+from typing import NamedTuple, Optional
 
 # _CoordsList[tensor_index][axis] =
 #     the axis_rank (shard position) of the tensor_index-th tensor along `axis`

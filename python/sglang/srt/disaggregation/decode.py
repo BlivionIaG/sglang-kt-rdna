@@ -68,6 +68,9 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 import hashlib
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 

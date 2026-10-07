@@ -18,6 +18,10 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, next_power_of_2
+from typing import TYPE_CHECKING, Optional
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA

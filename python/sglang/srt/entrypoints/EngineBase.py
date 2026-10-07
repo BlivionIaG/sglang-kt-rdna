@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
+from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 
 class EngineBase(ABC):

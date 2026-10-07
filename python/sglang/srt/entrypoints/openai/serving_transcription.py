@@ -38,6 +38,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import GenerateReqInput
+from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
+from fastapi import Request, WebSocket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager

@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
+from compressed_tensors import CompressionFormat
 
 logger = logging.getLogger(__name__)
 

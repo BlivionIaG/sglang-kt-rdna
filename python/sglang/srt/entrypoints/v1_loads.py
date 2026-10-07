@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.version import __version__
 from functools import lru_cache
+from sglang.srt.utils import get_device_name
 
 router = APIRouter()
 

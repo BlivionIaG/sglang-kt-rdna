@@ -11,6 +11,11 @@ from sglang.srt.lora.triton_ops import (
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.kernels.ops.lora.dense.embedding_lora_a import embedding_lora_a_fwd
+from sglang.kernels.ops.lora.dense.gate_up_lora_b import gate_up_lora_b_fwd
+from sglang.kernels.ops.lora.dense.qkv_lora_b import qkv_lora_b_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_b import sgemm_lora_b_fwd
 
 
 class TritonLoRABackend(BaseLoRABackend):

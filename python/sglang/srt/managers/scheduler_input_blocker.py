@@ -19,6 +19,7 @@ from typing import Any, List, Optional
 
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 from sglang.srt.utils.poll_based_barrier import PollBasedBarrier
+from typing import Any, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 

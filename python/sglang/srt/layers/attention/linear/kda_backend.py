@@ -32,6 +32,9 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from typing import Optional, Tuple, Union
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 
 class KDAKernelDispatcher:

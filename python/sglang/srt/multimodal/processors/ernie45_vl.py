@@ -20,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils import get_bool_env_var, is_npu, logger
+from sglang.srt.utils import is_npu, logger
 
 _is_npu = is_npu()
 

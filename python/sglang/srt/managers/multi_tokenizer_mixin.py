@@ -52,6 +52,11 @@ from sglang.utils import get_exception_traceback
 import signal
 import socket
 from typing import List
+import zlib
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+import psutil
+from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.utils.network import get_zmq_socket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager

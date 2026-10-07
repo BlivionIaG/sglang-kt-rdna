@@ -8,6 +8,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

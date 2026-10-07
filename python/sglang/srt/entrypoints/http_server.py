@@ -182,6 +182,11 @@ from sglang.srt.utils import (
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
+import ssl
+from fastapi.routing import APIRoute
+from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

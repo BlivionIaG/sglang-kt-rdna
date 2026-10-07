@@ -9,6 +9,8 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
 from sglang.srt.debug_utils.comparator.utils import Pair
+from typing import Annotated, Optional, Union
+from sglang.srt.debug_utils.comparator.utils import Pair, _FrozenBase
 
 AlignerPerStepSubPlan = Union[UnsharderPlan, ReordererPlan]
 

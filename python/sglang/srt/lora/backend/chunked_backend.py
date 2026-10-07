@@ -9,6 +9,7 @@ from sglang.srt.lora.triton_ops import (
 from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
+from typing import List, Optional, Tuple
 
 MIN_CHUNK_SIZE = 16
 

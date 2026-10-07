@@ -35,6 +35,9 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from typing import TYPE_CHECKING, Any, Dict, Optional
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 
 if importlib.util.find_spec("sglang._vendor.compressed_tensors") is not None:
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (

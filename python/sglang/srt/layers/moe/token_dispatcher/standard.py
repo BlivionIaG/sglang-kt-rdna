@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.utils.common import get_bool_env_var, is_hip, is_sm120_supported
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip

@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional
 
 from torch.nn import Module
+from compressed_tensors import CompressionFormat
 
 
 def is_activation_quantization_format(format: str) -> bool:

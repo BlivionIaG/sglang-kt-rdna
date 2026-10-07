@@ -27,6 +27,9 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.offloader import get_offloader
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (

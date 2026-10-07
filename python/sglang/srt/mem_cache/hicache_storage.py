@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 import time
 import threading
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 

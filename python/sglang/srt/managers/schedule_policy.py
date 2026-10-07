@@ -45,6 +45,11 @@ from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
 from dataclasses import dataclass
 from functools import lru_cache
+from array import array
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from collections import Counter
+from contextlib import contextmanager, nullcontext
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator

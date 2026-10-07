@@ -3,6 +3,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from abc import ABC
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+import torch
+from sglang.srt.runtime_context import get_spec as get_spec_config
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch

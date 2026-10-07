@@ -49,6 +49,10 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from functools import partial
 import hashlib
+from typing import TYPE_CHECKING, List, Optional
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup

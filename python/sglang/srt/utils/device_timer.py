@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Callable, Deque, Dict, Optional
 
 import torch
+from contextlib import contextmanager, nullcontext
+from typing import Callable, Deque, Dict, List, Optional
 
 
 class DeviceTimer:

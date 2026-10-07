@@ -47,6 +47,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.utils import flatten_nested_list
+from typing import Callable, Literal, Optional, Sequence
 
 
 def has_valid_data(data) -> bool:

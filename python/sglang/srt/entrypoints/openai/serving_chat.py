@@ -53,6 +53,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from enum import Enum
+from collections.abc import AsyncGenerator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager

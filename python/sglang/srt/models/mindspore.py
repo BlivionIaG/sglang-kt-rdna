@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.registry import import_model_classes
 from sglang.srt.utils import is_npu
+from typing import Any, Iterable, List, Optional, Tuple
 
 _is_npu = is_npu()
 

@@ -14,6 +14,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import NamedTuple
+import torch
+from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs

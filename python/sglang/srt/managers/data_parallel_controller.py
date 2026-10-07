@@ -58,6 +58,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 

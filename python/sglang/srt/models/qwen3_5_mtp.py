@@ -31,6 +31,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix
+import copy
+from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 

@@ -18,6 +18,10 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Optional, Tuple
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner

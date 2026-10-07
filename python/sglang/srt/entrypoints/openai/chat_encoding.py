@@ -14,6 +14,8 @@ from typing import Optional
 
 from sglang.srt.entrypoints.openai import encoding_dsv4
 from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Union
+from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv41
 
 logger = logging.getLogger(__name__)
 

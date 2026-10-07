@@ -40,6 +40,12 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_sparse_attention_config,
 )
 from sglang.utils import is_in_ci
+import copy
+from functools import cached_property, lru_cache
+from typing import Any, Callable, List, Optional, Set, Union
+from transformers.utils import cached_file
+from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
+from sglang.srt.utils import is_hip, retry
 
 logger = logging.getLogger(__name__)
 

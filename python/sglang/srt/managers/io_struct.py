@@ -40,6 +40,14 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
 import msgspec
 import socket
+import logging
+import pickle
+import numpy as np
+import zmq
+from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.environ import envs
+from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:

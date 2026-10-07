@@ -32,6 +32,7 @@ from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 

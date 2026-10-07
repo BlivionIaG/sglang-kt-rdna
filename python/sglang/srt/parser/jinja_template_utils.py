@@ -11,6 +11,7 @@ import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
 from sglang.srt.utils import ImageData
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
 
 logger = logging.getLogger(__name__)
 

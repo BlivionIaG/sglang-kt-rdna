@@ -13,6 +13,8 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import _is_complete_json
+from typing import List, Literal, Optional, Union
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 logger = logging.getLogger(__name__)
 

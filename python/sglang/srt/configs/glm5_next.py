@@ -16,6 +16,7 @@ from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 import time
+from typing import List, Optional, Union
 
 _GLM5_NEXT_ARCH = "Glm5NextForConditionalGeneration"
 GLM5_NEXT_SUPPORTED_TP_SIZES = frozenset((1, 2, 4, 8))

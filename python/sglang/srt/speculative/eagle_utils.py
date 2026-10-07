@@ -9,6 +9,11 @@ from itertools import chain
 from copy import copy
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from typing import TYPE_CHECKING, List, Optional, Tuple
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.runtime_context import get_spec
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

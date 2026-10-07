@@ -61,6 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 

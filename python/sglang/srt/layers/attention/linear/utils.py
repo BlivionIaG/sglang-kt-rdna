@@ -5,6 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.utils.common import rank0_log
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs

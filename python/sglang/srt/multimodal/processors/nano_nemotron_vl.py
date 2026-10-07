@@ -28,6 +28,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils.common import sample_video_frames
+import math
 
 if TYPE_CHECKING:
     from decord import VideoReader

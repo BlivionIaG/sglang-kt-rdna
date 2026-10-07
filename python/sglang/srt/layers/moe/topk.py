@@ -61,6 +61,9 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from dataclasses import dataclass, field
+from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig

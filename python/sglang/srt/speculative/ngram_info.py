@@ -35,6 +35,8 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from typing import List, Optional
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 
 if is_cuda():
     from sgl_kernel import (

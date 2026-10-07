@@ -15,6 +15,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.utils import add_prefix
+from typing import Callable, Optional, Type, Union
 
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer

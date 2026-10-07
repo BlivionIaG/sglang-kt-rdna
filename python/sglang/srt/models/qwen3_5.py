@@ -79,6 +79,11 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 # Utils
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from typing import Iterable, Optional, Set, Tuple, Union
+from safetensors.torch import load_file
+from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
 

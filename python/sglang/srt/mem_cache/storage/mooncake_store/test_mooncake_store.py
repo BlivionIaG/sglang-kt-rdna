@@ -6,6 +6,7 @@ import torch
 from mooncake_store import MooncakeStore
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"

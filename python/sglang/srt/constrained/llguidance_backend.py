@@ -34,6 +34,8 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
+from llguidance import LLExecutor, LLMatcher, LLTokenizer, StructTag, grammar_from
 
 logger = logging.getLogger(__name__)
 

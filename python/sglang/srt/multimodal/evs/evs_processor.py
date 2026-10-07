@@ -22,6 +22,7 @@ from sglang.utils import logger
 
 from .evs_core import tokens_per_frame
 from .evs_module import EVS, EVSConfig, EVSDataItem, VideoEVSDataItem
+from .evs_module import EVS, EVSConfig
 
 
 def _non_evs_data_items(

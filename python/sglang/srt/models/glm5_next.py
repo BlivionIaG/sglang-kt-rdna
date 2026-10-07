@@ -63,6 +63,12 @@ from sglang.srt.models.glm5_next_norm import Glm5NextRMSNorm
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator
+from typing import Iterable, List, Optional, Tuple, Union
+from sglang.srt.distributed.utils import divide
+from sglang.srt.layers.attention import vision_utils
+from sglang.srt.layers.utils.common import PPMissingLayer
+from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
 
 
 logger = logging.getLogger(__name__)

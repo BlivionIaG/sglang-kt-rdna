@@ -123,6 +123,12 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+import time
+from functools import lru_cache
+import numpy as np
+import pybase64
+from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.utils.network import get_zmq_socket
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 

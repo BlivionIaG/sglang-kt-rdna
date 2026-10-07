@@ -22,6 +22,8 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.executor import (
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
 from sglang.srt.debug_utils.comparator.utils import Pair
+from dataclasses import dataclass, field
+from typing import NamedTuple, Optional
 
 
 @dataclass(frozen=True)

@@ -55,6 +55,7 @@ from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import logger
+from sglang.srt.utils import get_device, logger
 
 try:
     from transformers import LogitsWarper

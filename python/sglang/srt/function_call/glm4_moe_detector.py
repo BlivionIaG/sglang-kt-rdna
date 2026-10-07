@@ -14,6 +14,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import infer_type_from_json_schema
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 

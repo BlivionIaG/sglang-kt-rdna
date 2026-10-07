@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Union
 import re
+from typing import Dict, List, Optional, Sequence, Set, Union
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:

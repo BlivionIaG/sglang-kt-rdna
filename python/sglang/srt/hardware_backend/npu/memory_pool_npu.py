@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
 )
 from sglang.srt.utils import get_bool_env_var
+from typing import TYPE_CHECKING, Optional, Sequence
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

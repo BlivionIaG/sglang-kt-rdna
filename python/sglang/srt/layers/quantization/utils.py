@@ -11,6 +11,7 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig

@@ -44,6 +44,9 @@ KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from transformers.activations import PytorchGELUTanh
+from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 
 def apply_rope(

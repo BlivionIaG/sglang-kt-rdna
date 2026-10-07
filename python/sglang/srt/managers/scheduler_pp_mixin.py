@@ -30,6 +30,9 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from collections import defaultdict, deque
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 
 logger = logging.getLogger(__name__)
 

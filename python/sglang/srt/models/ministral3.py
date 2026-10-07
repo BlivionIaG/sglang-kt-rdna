@@ -13,6 +13,7 @@ from sglang.srt.models.llama import (
     LlamaModel,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 def _get_llama_4_attn_scale(

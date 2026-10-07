@@ -49,6 +49,9 @@ from typing import Protocol
 from pydantic import ConfigDict
 from typing import Annotated
 from typing import runtime_checkable
+import unicodedata
+from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
+from openai.types.responses.easy_input_message_param import EasyInputMessageParam
 
 logger = logging.getLogger(__name__)
 

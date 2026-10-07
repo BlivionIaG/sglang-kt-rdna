@@ -64,6 +64,9 @@ from sglang.srt.utils import (
 from sglang.utils import is_in_ci
 import threading
 import struct
+import re
+from pathlib import Path
+from sglang.srt.runtime_context import get_parallel
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup

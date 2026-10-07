@@ -37,6 +37,10 @@ from enum import auto
 from copy import copy
 from struct import pack
 import socket
+from itertools import count
+from typing import Any, Callable, Optional, Union
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 

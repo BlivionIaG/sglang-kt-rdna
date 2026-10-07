@@ -97,6 +97,10 @@ from sglang.srt.utils import (
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+import copy
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()

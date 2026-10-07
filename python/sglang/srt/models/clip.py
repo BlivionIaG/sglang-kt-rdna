@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.layers.activation import QuickGELU, get_act_fn
 
 
 class CLIPVisionEmbeddings(nn.Module):

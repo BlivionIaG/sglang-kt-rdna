@@ -26,6 +26,10 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_npu, is_xpu
+from typing import Optional
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()

@@ -31,6 +31,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.utils import logger
+from typing import Any, List, Optional, Union
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28

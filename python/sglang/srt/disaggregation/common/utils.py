@@ -7,6 +7,8 @@ import numpy as np
 import numpy.typing as npt
 import struct
 import dataclasses
+import ctypes
+from typing import List, Optional, Tuple, Union
 
 
 class FastQueue:

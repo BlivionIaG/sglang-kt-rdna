@@ -12,6 +12,7 @@ import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from typing import Any, Dict, Tuple
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm

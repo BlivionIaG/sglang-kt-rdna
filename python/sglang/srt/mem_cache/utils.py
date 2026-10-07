@@ -24,6 +24,8 @@ from copy import copy
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.evict_policy import EvictionStrategy
 import hashlib
+from typing import Any, Callable, List, Optional, Tuple
+from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 
 
 @triton.jit

@@ -14,6 +14,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from typing import TYPE_CHECKING, Optional
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

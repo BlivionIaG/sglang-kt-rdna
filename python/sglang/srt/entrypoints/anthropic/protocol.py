@@ -7,6 +7,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 from typing import Union
 from pydantic import model_validator
+from typing import Annotated, Any, Literal, Optional, Union
 
 
 class AnthropicError(BaseModel):

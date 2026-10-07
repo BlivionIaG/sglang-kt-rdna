@@ -29,6 +29,9 @@ from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
+from array import array
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 
 _is_npu = is_npu()
 

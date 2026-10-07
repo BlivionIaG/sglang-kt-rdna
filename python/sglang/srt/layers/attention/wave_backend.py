@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

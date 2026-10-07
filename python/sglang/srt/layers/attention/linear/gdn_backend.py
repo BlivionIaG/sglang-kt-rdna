@@ -21,6 +21,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
+from typing import Optional, Tuple, Union
+from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (

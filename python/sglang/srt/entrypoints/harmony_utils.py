@@ -42,6 +42,7 @@ from openai_harmony import (
 
 from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem
 from sglang.srt.utils import random_uuid
+from typing import Optional, Union
 
 REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,

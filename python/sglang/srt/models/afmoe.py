@@ -59,6 +59,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.srt.utils import add_prefix, is_npu
 
 
 def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]:

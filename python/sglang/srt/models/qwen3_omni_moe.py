@@ -45,6 +45,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     load_fused_expert_weights,
 )
 from sglang.srt.utils import add_prefix, is_npu, logger
+from sglang.srt.utils import add_prefix, is_cpu, is_npu, logger
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):

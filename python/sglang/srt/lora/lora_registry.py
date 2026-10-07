@@ -22,6 +22,8 @@ from uuid import uuid4
 
 from sglang.srt.utils import ConcurrentCounter
 from sglang.srt.utils.aio_rwlock import RWLock
+from uuid import NAMESPACE_URL, uuid4, uuid5
+from msgspec.structs import fields
 
 
 @dataclass(frozen=True)

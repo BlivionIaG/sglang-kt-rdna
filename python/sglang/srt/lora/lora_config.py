@@ -18,6 +18,7 @@ import os
 from typing import Dict, Optional
 
 from huggingface_hub import snapshot_download
+import logging
 
 
 class LoRAConfig:

@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

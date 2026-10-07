@@ -23,6 +23,8 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
+from sglang.kernels.ops.attention.utils import canonicalize_stride
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 logger = logging.getLogger(__name__)
 

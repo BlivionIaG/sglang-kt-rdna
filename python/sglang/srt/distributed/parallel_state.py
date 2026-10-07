@@ -64,6 +64,9 @@ import time
 import sys
 import warnings
 import functools
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
+from sglang.srt.utils.network import get_local_ip_auto
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()

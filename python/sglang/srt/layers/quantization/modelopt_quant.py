@@ -75,6 +75,9 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
+from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs

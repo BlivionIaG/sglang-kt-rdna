@@ -4,6 +4,7 @@ from typing import Tuple, Union
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from typing import Optional, Tuple, Union
 
 
 class BaseLoRABackend:

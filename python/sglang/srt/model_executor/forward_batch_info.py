@@ -61,6 +61,14 @@ from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 import hashlib
+from dataclasses import dataclass
+from functools import total_ordering
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from sglang.kernels.ops.attention.clamp_position import clamp_position
+from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend

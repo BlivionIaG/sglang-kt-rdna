@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM
 from sglang.srt.utils import add_prefix, is_npu
+from typing import List, Optional, Set, Tuple
 
 
 class Projector(nn.Module):

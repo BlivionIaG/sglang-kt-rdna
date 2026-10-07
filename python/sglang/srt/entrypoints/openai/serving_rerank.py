@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+import math
 
 logger = logging.getLogger(__name__)
 

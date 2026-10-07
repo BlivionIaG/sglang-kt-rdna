@@ -92,6 +92,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
+import copy
+from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

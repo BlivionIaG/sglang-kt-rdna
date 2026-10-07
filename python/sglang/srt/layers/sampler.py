@@ -18,6 +18,8 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
 if is_cuda():
     from flashinfer.sampling import (

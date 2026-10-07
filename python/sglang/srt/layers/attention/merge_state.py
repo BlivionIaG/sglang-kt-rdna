@@ -6,6 +6,7 @@ from sgl_kernel import merge_state_v2
 
 from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
 from sglang.srt.utils import is_cuda
+from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
 _is_cuda = is_cuda()
 

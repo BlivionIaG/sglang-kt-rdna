@@ -23,6 +23,8 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.utils import next_power_of_2, set_weight_attrs
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 

@@ -16,6 +16,12 @@ device_module = get_device_module()
 
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 

@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config, is_ocr2_config
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],

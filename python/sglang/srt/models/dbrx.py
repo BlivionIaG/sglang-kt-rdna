@@ -50,6 +50,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 
 class DbrxRouter(nn.Module):

@@ -16,6 +16,13 @@ from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
+import numpy as np
+from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_serving, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch

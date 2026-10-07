@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Literal
 
 from sglang.srt.debug_utils.comparator.utils import _FrozenBase
+from typing import Annotated, Literal, Union
 
 
 class ZigzagToNaturalParams(_FrozenBase):

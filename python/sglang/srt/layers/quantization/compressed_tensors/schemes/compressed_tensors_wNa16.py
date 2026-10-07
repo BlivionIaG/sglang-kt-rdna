@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.utils import (
     unpack_cols,
 )
 from sglang.srt.utils import is_cuda
+from compressed_tensors.quantization import ActivationOrdering
 
 _is_cuda = is_cuda()
 

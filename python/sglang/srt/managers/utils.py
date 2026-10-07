@@ -18,6 +18,13 @@ from sglang.srt.server_args import ServerArgs
 import msgspec
 import struct
 import re
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, List, Optional, Union
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.managers import io_struct
+from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult

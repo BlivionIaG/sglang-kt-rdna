@@ -12,6 +12,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from typing import TYPE_CHECKING, List, Optional
 
 
 class PoolingType(IntEnum):

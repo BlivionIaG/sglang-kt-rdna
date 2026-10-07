@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Sequence
 import torch
 
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
+from dataclasses import dataclass, replace
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

@@ -62,6 +62,8 @@ _is_amx_available = cpu_has_amx_support()
 
 import triton
 import triton.language as tl
+from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.model_executor.runner import get_is_capture_mode
 
 
 @triton.jit

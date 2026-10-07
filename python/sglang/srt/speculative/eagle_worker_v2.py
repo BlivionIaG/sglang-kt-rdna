@@ -63,6 +63,8 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from typing import List, Optional
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()

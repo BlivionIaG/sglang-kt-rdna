@@ -7,6 +7,7 @@ from typing import Any, Dict, Tuple
 
 import polars as pl
 import torch
+from typing import Any, Callable, Dict, Optional, Tuple
 
 _TYPED_FIELDS: list[tuple[str, type]] = [("rank", int)]
 

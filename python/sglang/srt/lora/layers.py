@@ -24,6 +24,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
+from typing import Dict, Optional, Union
+from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 
 class BaseLayerWithLoRA(nn.Module):

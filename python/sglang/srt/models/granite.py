@@ -45,6 +45,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
+from transformers import GraniteConfig, PretrainedConfig
+from sglang.srt.utils import add_prefix, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 

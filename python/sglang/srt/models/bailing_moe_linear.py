@@ -79,6 +79,10 @@ from sglang.srt.utils import (
     make_layers,
 )
 from sglang.srt.utils.common import rank0_log
+from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()

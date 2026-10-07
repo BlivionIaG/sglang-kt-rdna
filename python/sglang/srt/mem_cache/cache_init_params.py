@@ -4,6 +4,7 @@ import dataclasses
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator

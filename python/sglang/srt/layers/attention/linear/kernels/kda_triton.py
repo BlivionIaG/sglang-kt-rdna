@@ -4,6 +4,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (

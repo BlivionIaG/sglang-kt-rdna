@@ -18,6 +18,7 @@ from sglang.srt.lora.utils import (
     get_target_module_name,
 )
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 
 logger = logging.getLogger(__name__)
 

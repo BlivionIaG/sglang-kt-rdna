@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from typing import List, Optional, Union
 
 logger = logging.getLogger(__name__)
 

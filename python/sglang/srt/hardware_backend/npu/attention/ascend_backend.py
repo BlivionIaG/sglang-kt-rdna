@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 import logging
 
 import numpy as np
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
 def _reshape_kv_for_fia_nz(

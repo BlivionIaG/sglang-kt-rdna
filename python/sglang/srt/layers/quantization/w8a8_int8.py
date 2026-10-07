@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput

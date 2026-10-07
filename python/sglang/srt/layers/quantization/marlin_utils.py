@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from typing import TYPE_CHECKING, Optional
 
 try:
     from vllm import _custom_ops as ops

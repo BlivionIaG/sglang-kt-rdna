@@ -7,6 +7,8 @@ import pkgutil
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.runtime_context import get_model
 
 logger = logging.getLogger(__name__)
 

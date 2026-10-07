@@ -37,6 +37,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback, logger
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token

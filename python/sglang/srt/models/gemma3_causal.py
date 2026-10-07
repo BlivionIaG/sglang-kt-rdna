@@ -44,6 +44,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from typing import Iterable, List, Optional, Set, Tuple
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token

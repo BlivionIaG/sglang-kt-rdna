@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig

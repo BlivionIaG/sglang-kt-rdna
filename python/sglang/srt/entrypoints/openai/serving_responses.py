@@ -68,6 +68,8 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
+from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
+from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager

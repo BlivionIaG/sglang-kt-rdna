@@ -79,6 +79,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.model_executor.runner import get_is_capture_mode
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
