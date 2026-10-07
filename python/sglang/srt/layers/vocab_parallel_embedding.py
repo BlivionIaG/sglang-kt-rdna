@@ -206,6 +206,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         params_dtype: Optional[torch.dtype] = None,
+        # `output_dtype` added with the qwen4 subsystem (sgl-project/sglang).
+        # The Qwen4-Exp n-gram (PLE) embedding builds a VocabParallelEmbedding
+        # whose gathered rows are cast to the PLE table's dtype (FP8 checkpoints
+        # keep the table in a narrower type than bf16), so the parameter is not
+        # cosmetic: it decides the dtype the caller receives.
+        output_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
@@ -216,6 +222,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -492,6 +499,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
+
+        # Cast the gathered rows when the caller asked for a different dtype
+        # (the Qwen4-Exp PLE n-gram table keeps its rows in the checkpoint's
+        # narrow dtype). Applied before the all-reduce, as upstream does, so the
+        # reduce runs in the requested precision.
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
 
         if self.tp_size > 1:
             # Mask the output embedding.
