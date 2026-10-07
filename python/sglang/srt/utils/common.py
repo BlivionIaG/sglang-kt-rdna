@@ -4269,3 +4269,31 @@ def is_gfx1250_supported():
         return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
         return False
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def is_mps() -> bool:
+    return hasattr(torch, "mps") and torch.mps.is_available()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def get_cuda_graph_batch_size_alignment() -> int:
+    alignment = 1
+    if get_exec().overlap.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer():
+        alignment *= get_parallel().attn_tp_size
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def is_building_neighbour_layer() -> bool:
+    """Whether the layer under construction belongs to another pipeline stage
+    and is built here only to read the stage boundaries it declares. It is
+    built on the meta device and never loaded or run, so its constructor skips
+    the host and device resources a running layer needs: tables, streams,
+    engines and communicators."""
+    return _building_neighbour_layer

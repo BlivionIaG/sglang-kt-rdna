@@ -423,3 +423,7 @@ class EventPublisherFactory:
         except KeyError as exc:
             raise ValueError(f"Unknown event publisher '{kind}'") from exc
         return constructor(attn_dp_rank=attn_dp_rank, **config_dict)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+LOAD_TOPIC = "load"

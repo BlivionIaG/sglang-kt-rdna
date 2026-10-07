@@ -1359,3 +1359,43 @@ def validate_fp8_block_shape(
                     f"{output_partition_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -----------------
+# `layers/layer_boundary/residual/add_norm.py` imports these two names.
+#
+# Upstream computes the gate as
+#     `_use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)`
+# from helpers (`_use_aiter_gfx95`, `get_hip_version`) this fork's copy of this
+# module does not have. The gate is AMD-gfx95-only by construction -- it selects
+# AITER's bpreshuffle FP8 scale layout, which exists only on ROCm -- and false is
+# the value upstream itself produces on every non-gfx95 host, which is this one.
+# Left false rather than approximated: hard-coding true would send an NVIDIA box
+# down an AITER code path.
+_use_aiter_bpreshuffle_gfx95 = False
+
+
+def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Materialize the physical scale layout consumed by gfx95 bpreshuffle GEMM."""
+    return scale.t().contiguous().t() if scale.dim() == 2 else scale
+
+
+def materialize_bpreshuffle_fp8_scale_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
+    return (
+        value[0],
+        materialize_bpreshuffle_fp8_scale(value[1]),
+        *value[2:],
+    )
+
+
+def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> bool:
+    """Whether a producer should emit its fp8 scale already transposed.
+
+    The transposed zero-copy path is only taken on gfx95 bpreshuffle and only for
+    M(tokens) >= 2: at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide,
+    so the transposed emit buys nothing and the materialize path is used.
+    """
+    return on_bpreshuffle_gfx95 and m >= 2
