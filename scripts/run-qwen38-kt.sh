@@ -103,9 +103,12 @@ if [ "${ISOLATE:-0}" = "1" ]; then
   # Hard memory cap in a transient scope: the cgroup kills the load BEFORE the host
   # thrashes, so sshd keeps working and the log survives to be read.
   MEMCAP="${MEMCAP:-70G}"
-  echo "running under systemd-run --scope -p MemoryMax=$MEMCAP -p MemorySwapMax=8G"
+  MEMSWAP="${MEMSWAP:-8G}"
+  # Swap allowance matters: the first measured run hit 69.30 GiB RSS at layer 40/48 with
+  # only 8G of swap permitted, and was killed by the CAP rather than by the machine.
+  echo "running under systemd-run --scope -p MemoryMax=$MEMCAP -p MemorySwapMax=$MEMSWAP"
   exec systemd-run --user --scope --collect \
-    -p MemoryMax="$MEMCAP" -p MemorySwapMax=8G \
+    -p MemoryMax="$MEMCAP" -p MemorySwapMax="$MEMSWAP" \
     python3 -m sglang.launch_server "${ARGS[@]}"
 fi
 
