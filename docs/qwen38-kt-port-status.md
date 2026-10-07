@@ -162,3 +162,20 @@ consequences:**
 - Launch work under `tmux` on the host and read the log later; that survived the wedge before.
 - A recovery window is short: the first command issued must be the one you actually want.
 - The `file` PLE route's cost matters more now, because a wedging host is the real constraint.
+
+## VERIFY THE RUN IS NEW BEFORE CONCLUDING A FIX FAILED
+
+Cost a full cycle on 2026-10-07: an `AttributeError` appeared to persist after a fix that was
+demonstrably on disk. The fix was fine -- **the relaunch had not happened at all**, and I was
+reading a log from 24 minutes earlier as if it were the new run:
+
+    stat /tmp/plb3.log  -> 15:49:53   (unchanged)
+    date                -> 15:54:51
+    pgrep launch_server -> (nothing)
+
+Before concluding a fix failed, confirm the run is NEW: a fresh log mtime compared against
+`date`, AND a live PID. A log file existing is not a run happening.
+
+A related trap from the same session: a single ssh call that chains `pkill` + `sed` + `setsid`
++ `stat` returned no output and created nothing. Split launch steps so each is verifiable --
+write the script, `bash -n` it, launch, then check mtime and PID.
