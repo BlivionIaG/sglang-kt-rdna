@@ -5,6 +5,7 @@ vision configuration serializable here, but deliberately avoid importing the
 GLM-OCR vision stack.  Stage 7 can replace the lightweight holder with the
 runtime vision implementation without changing text-only config loading.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum

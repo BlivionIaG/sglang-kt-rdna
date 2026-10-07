@@ -7,6 +7,7 @@ MoE runner -- but two of them must never declare the *same* field for it:
 nobody would own that value, and which module supplied it would come down to
 the order of the imports below. Keep each field owned by one family module.
 """
+from __future__ import annotations
 
 from sglang.srt.arg_groups.model_overrides import bailing_moe_v3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import cohere2_moe  # noqa: F401

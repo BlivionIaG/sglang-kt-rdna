@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright (c) 2023-2024 DeepSeek.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy of

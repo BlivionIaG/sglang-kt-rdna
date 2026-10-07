@@ -13,6 +13,7 @@ For regular users, weight_utils.py provides simple download functionality withou
 the overhead of validation and automatic cleanup. The CI-specific behavior is
 gated by is_in_ci() checks in weight_utils.py.
 """
+from __future__ import annotations
 
 import glob as glob_module
 import hashlib

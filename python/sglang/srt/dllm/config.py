@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Any
 
 from sglang.srt.configs.model_config import ModelConfig

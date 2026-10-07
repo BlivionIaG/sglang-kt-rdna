@@ -1,4 +1,5 @@
 """Config-time override declarations for minimax_m2."""
+from __future__ import annotations
 
 import logging
 from typing import Any

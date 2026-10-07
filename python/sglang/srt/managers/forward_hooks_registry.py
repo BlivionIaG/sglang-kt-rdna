@@ -13,6 +13,7 @@ The DSV4 plugin (HiSparseCoordinator) self-registers via
 hisparse_coordinator.py is imported (triggered via deepseek_v4.py
 side-effect).
 """
+from __future__ import annotations
 
 from typing import Any, Dict, List
 import time

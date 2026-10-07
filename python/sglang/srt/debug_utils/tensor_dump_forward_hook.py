@@ -9,6 +9,7 @@ Each complete forward pass of the model generates a `.pt` file named `f"Pass{pas
 The file contains a series of key-value pairs, where the keys correspond to operator names in the model
 (similar to those in model.safetensors.index.json), and the values are the outputs produced by the respective operators.
 """
+from __future__ import annotations
 
 import logging
 import os

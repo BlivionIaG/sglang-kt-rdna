@@ -1,3 +1,4 @@
+from __future__ import annotations
 import threading
 from collections import deque
 from typing import List, Tuple, Optional, Union, Set

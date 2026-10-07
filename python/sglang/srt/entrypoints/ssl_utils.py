@@ -1,4 +1,5 @@
 """Utilities for SSL certificate hot-reloading."""
+from __future__ import annotations
 
 import asyncio
 import logging

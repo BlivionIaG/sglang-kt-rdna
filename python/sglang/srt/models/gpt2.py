@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/gpt2/modeling_gpt2.py

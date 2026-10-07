@@ -1,4 +1,5 @@
 """Layer-communication helpers for the Nemotron-H model."""
+from __future__ import annotations
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.layer_boundary import (

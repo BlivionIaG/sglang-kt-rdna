@@ -1,4 +1,5 @@
 """MiMoV2 multimodal processor -- protocol, utilities, and processor."""
+from __future__ import annotations
 
 import asyncio
 import base64

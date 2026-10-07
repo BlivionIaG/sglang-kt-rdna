@@ -1,4 +1,5 @@
 """Shared config choices, re-exported by server_args for plugin compatibility."""
+from __future__ import annotations
 
 LOAD_FORMAT_CHOICES = [
     "auto",

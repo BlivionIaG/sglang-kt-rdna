@@ -4,6 +4,7 @@ Standard gRPC health check service implementation for Kubernetes probes.
 This module implements the grpc.health.v1.Health service protocol, enabling
 native Kubernetes gRPC health probes for liveness and readiness checks.
 """
+from __future__ import annotations
 
 import logging
 import time

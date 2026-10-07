@@ -1,3 +1,4 @@
+from __future__ import annotations
 import functools
 import json
 from typing import AbstractSet, Collection, List, Literal, Union

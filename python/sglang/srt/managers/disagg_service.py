@@ -1,4 +1,5 @@
 """Start bootstrap/kv-store-related server"""
+from __future__ import annotations
 
 import os
 

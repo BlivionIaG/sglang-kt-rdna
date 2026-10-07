@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 # SPDX-License-Identifier: Apache-2.0
 

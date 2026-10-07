@@ -5,6 +5,7 @@ It handles all CPU-bound work: media I/O (image/video/audio loading),
 HF processor calls, config validation, and related helper computations.
 GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
+from __future__ import annotations
 
 import asyncio
 import concurrent.futures

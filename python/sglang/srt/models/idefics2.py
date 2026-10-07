@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2023 The SGLang team.
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #

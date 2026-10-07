@@ -1,4 +1,5 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
+from __future__ import annotations
 
 import logging
 from fractions import Fraction

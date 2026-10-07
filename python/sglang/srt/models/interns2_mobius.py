@@ -1,4 +1,5 @@
 """Inference-only Intern-S2-Mobius model."""
+from __future__ import annotations
 
 import logging
 from collections.abc import Iterable

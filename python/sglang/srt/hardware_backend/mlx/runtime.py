@@ -1,4 +1,5 @@
 """Runtime gate for the opt-in MLX backend on Apple silicon."""
+from __future__ import annotations
 
 from functools import lru_cache
 

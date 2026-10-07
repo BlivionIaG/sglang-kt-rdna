@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/fix_functionalization.py
 
 import logging

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/kv_cache.py
 
 import logging

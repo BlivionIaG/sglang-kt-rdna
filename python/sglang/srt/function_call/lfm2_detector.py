@@ -16,6 +16,7 @@ Also supports JSON format:
 <|tool_call_start|>[{"name": "func_name", "arguments": {...}}]<|tool_call_end|>
 ```
 """
+from __future__ import annotations
 
 import ast
 import json

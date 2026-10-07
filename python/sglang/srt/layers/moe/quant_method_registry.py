@@ -9,6 +9,7 @@ Plugins register themselves at import time. The DSV4 plugin is pulled in
 when sglang.srt.models.deepseek_v4 is auto-discovered by ModelRegistry —
 no base file imports the wrapper directly.
 """
+from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 import time

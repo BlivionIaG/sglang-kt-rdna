@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/blob/bf214ca22625e311a2c4c0dfbf7af19128f4919c/vllm/distributed/device_communicators/symm_mem.py
 import logging
 from typing import Optional, Union

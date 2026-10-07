@@ -1,4 +1,5 @@
 """Config-time override declarations for cohere2_moe."""
+from __future__ import annotations
 
 import logging
 from typing import Any

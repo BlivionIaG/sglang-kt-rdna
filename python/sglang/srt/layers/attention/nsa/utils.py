@@ -1,3 +1,4 @@
+from __future__ import annotations
 # temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate

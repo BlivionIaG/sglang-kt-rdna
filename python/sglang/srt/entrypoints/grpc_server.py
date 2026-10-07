@@ -2,6 +2,7 @@
 Standalone gRPC Server for SGLang - Fully separated from HTTP server.
 Uses GrpcRequestManager for orchestration without tokenization.
 """
+from __future__ import annotations
 
 import asyncio
 import dataclasses

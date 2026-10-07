@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args

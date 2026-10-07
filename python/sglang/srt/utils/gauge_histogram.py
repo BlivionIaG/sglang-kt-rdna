@@ -6,6 +6,7 @@ non-cumulative buckets (gt < value <= le) suitable for heatmap display.
 Note: Keep in sync with Rust implementation in
 sgl-model-gateway/src/observability/gauge_histogram.rs
 """
+from __future__ import annotations
 
 import bisect
 from typing import Dict, Iterator, List, Tuple, Union

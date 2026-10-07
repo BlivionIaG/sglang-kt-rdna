@@ -4,6 +4,7 @@ Asynchronous dynamic batch tokenizer for SGLang.
 This module provides an async tokenizer with dynamic batching capabilities
 to reduce tokenization overhead when multiple requests arrive concurrently.
 """
+from __future__ import annotations
 
 import asyncio
 import logging

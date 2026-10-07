@@ -1,4 +1,5 @@
 """MiMo audio: tokenizer, encoding utilities, and audio encoder."""
+from __future__ import annotations
 
 # Audio tokenizer adapted from https://github.com/XiaomiMiMo/MiMo-Audio-Tokenizer.git
 

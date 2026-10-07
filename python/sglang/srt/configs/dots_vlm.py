@@ -1,3 +1,4 @@
+from __future__ import annotations
 from transformers import AutoProcessor, PretrainedConfig
 from transformers.processing_utils import ProcessingKwargs
 

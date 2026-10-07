@@ -8,6 +8,7 @@ after the 3x3 aligner downsample, which the LLM sees as
 Every one of those positions carries `image_token_id` in `input_ids`; only the token type tells them
 apart. The IMAGE slots are filled with aligner rows in reading order.
 """
+from __future__ import annotations
 
 import math
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 from sglang.srt.debug_utils.schedule_simulator.routers.base import RouterPolicy
 

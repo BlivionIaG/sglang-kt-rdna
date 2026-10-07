@@ -5,6 +5,7 @@ than changing checkpoint loading or fused projections. Both gathers go through
 SGLang's communicator so AITER registration and graph capture remain owned by
 the runtime. Communication cost must be included in performance comparisons.
 """
+from __future__ import annotations
 
 import logging
 

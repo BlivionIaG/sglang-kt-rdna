@@ -4,6 +4,7 @@ Verification utilities for NSA backend fused metadata copy operations.
 This module contains verification code to ensure that fused metadata copy kernels
 produce the same results as individual copy operations.
 """
+from __future__ import annotations
 
 import torch
 

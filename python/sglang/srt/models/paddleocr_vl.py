@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Reference: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest
 # Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 #

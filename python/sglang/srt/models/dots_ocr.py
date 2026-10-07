@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 # Adapted from Qwen2.5-VL SGLang implementation
 

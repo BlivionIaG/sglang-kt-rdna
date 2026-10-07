@@ -3,6 +3,7 @@
 Model-family modules in ``model_overrides/`` import this module without
 creating a dependency back to ``overrides.py``.
 """
+from __future__ import annotations
 
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple

@@ -1,4 +1,5 @@
 """Config-time override declarations for muse_glimmer."""
+from __future__ import annotations
 
 import logging
 from typing import Any

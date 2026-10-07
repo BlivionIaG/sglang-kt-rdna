@@ -24,6 +24,7 @@ Method status annotations:
   (e.g. ``torch.cuda.empty_cache()``). OOT implementations will NOT take
   effect until the core is migrated in a future PR.
 """
+from __future__ import annotations
 
 import enum
 import random

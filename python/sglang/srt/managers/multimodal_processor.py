@@ -1,3 +1,4 @@
+from __future__ import annotations
 # TODO: also move pad_input_ids into this module
 import importlib
 import inspect

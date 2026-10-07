@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Optional
 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo

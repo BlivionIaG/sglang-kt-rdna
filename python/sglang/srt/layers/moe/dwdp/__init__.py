@@ -1,4 +1,5 @@
 """DWDP (Distributed Weight Data Parallelism): MoE prefill with tokens kept on-rank and peer expert weights prefetched via NVLink into a composite VMM address space."""
+from __future__ import annotations
 
 from sglang.srt.layers.moe.dwdp.dwdp_manager import DwdpManager
 from sglang.srt.runtime_context import (

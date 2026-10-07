@@ -23,6 +23,7 @@ Public API:
     re-exported here for the EAGLE / multi-step draft cuda graph
     runners that were authored against the legacy public surface.
 """
+from __future__ import annotations
 
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F401
     BaseCudaGraphRunner,

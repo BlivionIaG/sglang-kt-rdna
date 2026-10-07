@@ -7,6 +7,7 @@ class from base code.
 Plugins register themselves at import time. The DSV4 plugin (HiSparse) is
 loaded via the DSV4 model entry-point and registers under name "hisparse".
 """
+from __future__ import annotations
 
 from typing import Any, Callable, Dict
 import time

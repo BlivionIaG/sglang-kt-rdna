@@ -13,6 +13,7 @@ before the conversion that none of the 8 consumers (AutoConfig, check_gguf_file,
 download_from_hf, get_config, get_processor, get_rope_config, get_tokenizer,
 resolve_hf_gguf_reference) would break.
 """
+from __future__ import annotations
 
 from sglang.srt.utils.hf_transformers import *  # noqa: F401, F403
 from sglang.srt.utils.hf_transformers import __all__  # noqa: F401

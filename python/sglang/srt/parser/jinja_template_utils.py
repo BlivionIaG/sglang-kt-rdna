@@ -3,6 +3,7 @@
 This module provides utilities for analyzing and processing Jinja chat templates,
 including content format detection and message processing.
 """
+from __future__ import annotations
 
 import logging
 

@@ -1,4 +1,5 @@
 """Config-time override declarations for moss_vl."""
+from __future__ import annotations
 
 import logging
 from typing import Any, Dict

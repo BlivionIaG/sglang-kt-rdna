@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import ClassVar
 
 from sglang.srt.configs.qwen3_5 import (

@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs

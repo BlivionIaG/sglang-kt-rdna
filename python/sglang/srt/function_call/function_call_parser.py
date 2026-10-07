@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union

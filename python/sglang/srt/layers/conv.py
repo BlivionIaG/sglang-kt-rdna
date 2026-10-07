@@ -6,6 +6,7 @@ is equivalent to unfold + F.linear, which is significantly faster on CUDA and
 also avoids the PyTorch 2.9.1 + CuDNN < 9.15 Conv3d bug
 (https://github.com/pytorch/pytorch/issues/168167).
 """
+from __future__ import annotations
 
 import math
 from typing import Tuple, Union

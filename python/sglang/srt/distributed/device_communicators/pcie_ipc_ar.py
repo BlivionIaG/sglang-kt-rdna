@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """FlashInfer PCIe-IPC all-reduce for switch-free intra-node machines.
 

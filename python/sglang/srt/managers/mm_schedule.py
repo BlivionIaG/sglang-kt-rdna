@@ -1,4 +1,5 @@
 """Multimodal embedding scheduling and cache coordination."""
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple

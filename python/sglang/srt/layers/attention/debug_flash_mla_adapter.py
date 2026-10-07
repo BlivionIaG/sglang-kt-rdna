@@ -1,3 +1,4 @@
+from __future__ import annotations
 # DeepSeek V4 Flash attention dispatcher.
 #
 # Two backends:

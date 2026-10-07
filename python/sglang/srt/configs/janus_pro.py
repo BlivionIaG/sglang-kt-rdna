@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from:
 # https://github.com/deepseek-ai/Janus/tree/main/janus/models
 

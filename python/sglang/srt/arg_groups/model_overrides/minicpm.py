@@ -1,4 +1,5 @@
 """Config-time override declarations for minicpm."""
+from __future__ import annotations
 
 from typing import Any, Dict
 

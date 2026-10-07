@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 from http import HTTPStatus
 from typing import List, Union

@@ -1,4 +1,5 @@
 """Elastic EP scaling HTTP endpoints for dp_attention deployments."""
+from __future__ import annotations
 
 import json
 from http import HTTPStatus

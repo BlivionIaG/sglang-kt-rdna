@@ -1,4 +1,5 @@
 """Merge Chrome trace files from multiple ranks (TP, DP, PP, EP) into a single trace."""
+from __future__ import annotations
 
 import glob
 import gzip

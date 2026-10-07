@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_intern_vit.py
 
 import logging

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #

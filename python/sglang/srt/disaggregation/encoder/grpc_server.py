@@ -6,6 +6,7 @@ This server provides gRPC-based encoding for multimodal inputs.
 Usage:
     python -m sglang.launch_server --model-path <model> --encoder-only --grpc-mode
 """
+from __future__ import annotations
 
 import asyncio
 import logging

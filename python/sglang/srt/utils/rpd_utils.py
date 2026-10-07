@@ -1,3 +1,4 @@
+from __future__ import annotations
 # https://raw.githubusercontent.com/ROCm/rocmProfileData/refs/heads/master/tools/rpd2tracing.py
 # commit 92d13a08328625463e9ba944cece82fc5eea36e6
 def rpd_to_chrome_trace(

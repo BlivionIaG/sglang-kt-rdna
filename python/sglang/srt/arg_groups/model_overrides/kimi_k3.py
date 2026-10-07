@@ -1,4 +1,5 @@
 """Config-time override declarations for kimi_k3."""
+from __future__ import annotations
 
 import inspect
 import logging

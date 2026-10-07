@@ -1,4 +1,5 @@
 """Config-time override declarations for falcon_h1."""
+from __future__ import annotations
 
 from typing import Any
 

@@ -4,6 +4,7 @@ two dump directories tensor-by-tensor.
 For advanced features (unshard, token alignment, per-dimension annotations), see the
 full ``comparator/`` package: ``python -m sglang.srt.debug_utils.comparator``.
 """
+from __future__ import annotations
 
 import argparse
 import functools

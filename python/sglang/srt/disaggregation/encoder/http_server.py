@@ -7,6 +7,7 @@ the protocol-neutral :mod:`runtime` module.
 
 GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
+from __future__ import annotations
 
 import asyncio
 import contextlib

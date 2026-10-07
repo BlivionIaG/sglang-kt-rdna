@@ -31,6 +31,7 @@ d_qk)`` argument, where ``s_kv`` is the total flat workspace length.
 For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import multiprocessing
 import time
 from typing import List, Optional, Tuple

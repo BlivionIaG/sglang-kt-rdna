@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend

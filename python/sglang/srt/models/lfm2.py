@@ -10,6 +10,7 @@ in some layers, providing linear memory complexity for those layers.
 
 Uses optimized causal_conv1d kernels from the mamba package for fast inference.
 """
+from __future__ import annotations
 
 import logging
 from typing import Iterable, Optional, Set, Tuple

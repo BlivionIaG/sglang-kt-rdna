@@ -9,6 +9,7 @@ Batches that don't qualify for two-stream (prefill / non-virtual-lora /
 batch without active LoRA) fall through to the saved-original function so
 their behavior is byte-identical to the unpatched code path.
 """
+from __future__ import annotations
 
 import torch
 

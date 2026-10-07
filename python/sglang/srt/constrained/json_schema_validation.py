@@ -1,4 +1,5 @@
 """Detect JSON Schema constraints that grammar backends silently ignore."""
+from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/1d45d90e5d1552eccb6d8cc9b7bba283ccefb808/src/transformers/models/qwen2_audio/modeling_qwen2_audio.py

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/modeling_kimi_vl.py

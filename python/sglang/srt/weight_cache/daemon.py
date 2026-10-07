@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """Weight Cache Daemon — a persistent process that holds post-quantized,
 TP-sharded model weights in GPU memory and serves them via pluggable transport backends.

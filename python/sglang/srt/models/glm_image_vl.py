@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm_image/modeling_glm_image.py
 # Copyright 2025 The ZhipuAI Team.

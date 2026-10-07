@@ -3,6 +3,7 @@
 Ported from cybertron_alm ``dots_audio_encoder/modeling_whisper.py``.
 Upstream ``WhisperEncoder`` is exposed as :class:`DotsSpeechEncoder`.
 """
+from __future__ import annotations
 
 import math
 from functools import lru_cache

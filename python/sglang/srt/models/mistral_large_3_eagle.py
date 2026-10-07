@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3_eagle.py
 # SPDX-License-Identifier: Apache-2.0
 from typing import Optional

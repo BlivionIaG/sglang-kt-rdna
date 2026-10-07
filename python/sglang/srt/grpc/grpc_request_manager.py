@@ -2,6 +2,7 @@
 gRPC Request Manager - Orchestrates request lifecycle without tokenization.
 Mimics TokenizerManager's state management and ZMQ communication patterns.
 """
+from __future__ import annotations
 
 import asyncio
 import copy

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/models/kimi_linear.py
 
 from collections.abc import Iterable

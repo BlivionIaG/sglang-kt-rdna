@@ -5,6 +5,7 @@ Follows the same pattern as MooncakeStore:
 - Uses mem_pool_host.get_page_buffer_meta() for pointer/size extraction
 - Key suffix generation per TP rank / PP rank
 """
+from __future__ import annotations
 
 import logging
 import os

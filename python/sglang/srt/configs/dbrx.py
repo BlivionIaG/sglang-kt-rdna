@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from
 # https://huggingface.co/databricks/dbrx-base/blob/main/configuration_dbrx.py
 # https://github.com/vllm-project/vllm/blob/main/vllm/transformers_utils/configs/dbrx.py

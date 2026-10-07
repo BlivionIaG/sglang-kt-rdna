@@ -1,4 +1,5 @@
 """Static April V4 training adapters; original base weights remain quantized."""
+from __future__ import annotations
 
 import hashlib
 import json

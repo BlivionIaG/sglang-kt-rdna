@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """This is basically a copy from perception_models/core/vision_encoder/pe.py"""

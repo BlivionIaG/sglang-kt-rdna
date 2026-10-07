@@ -16,6 +16,7 @@ transposed and the scale reshaped to 3D, then ``npu_quant_matmul`` runs with
 This differs from ``W4A8_MXFP`` only in the activation dtype (FP4 vs FP8), and
 from ``W8A8_MXFP8`` in both weight packing and activation dtype.
 """
+from __future__ import annotations
 
 from typing import Dict, List, Optional
 

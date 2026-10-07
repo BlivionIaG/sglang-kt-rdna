@@ -1,3 +1,4 @@
+from __future__ import annotations
 # [Deprecated] attention/nsa/ is a thin re-export shim for backward compatibility.
 # Use attention/dsa/ instead. This directory will be removed in a future release.
 import warnings

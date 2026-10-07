@@ -1,4 +1,5 @@
 """Pydantic models for Anthropic Messages API protocol"""
+from __future__ import annotations
 
 import uuid
 from typing import Any, Literal, Optional

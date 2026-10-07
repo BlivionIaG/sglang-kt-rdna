@@ -7,6 +7,7 @@ images onto the checkpoint-configured background
 "after_resize"`` in preprocessor_config.json), instead of dropping alpha
 at load time.
 """
+from __future__ import annotations
 
 import functools
 import math

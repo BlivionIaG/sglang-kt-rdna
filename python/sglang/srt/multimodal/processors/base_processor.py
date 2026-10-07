@@ -1,3 +1,4 @@
+from __future__ import annotations
 import concurrent
 import concurrent.futures
 import dataclasses

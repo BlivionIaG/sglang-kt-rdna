@@ -1,3 +1,4 @@
+from __future__ import annotations
 import concurrent.futures
 import logging
 from typing import List, Tuple

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 #
 # Intentionally empty: importing any weight_cache submodule (e.g.

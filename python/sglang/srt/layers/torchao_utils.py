@@ -1,6 +1,7 @@
 """
 Common utilities for torchao.
 """
+from __future__ import annotations
 
 import logging
 from typing import Callable, Optional

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from functools import lru_cache

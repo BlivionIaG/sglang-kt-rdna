@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 
 from sglang.srt.managers.schedule_batch import Modality

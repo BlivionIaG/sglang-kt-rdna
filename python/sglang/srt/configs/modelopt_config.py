@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Configuration for NVIDIA ModelOpt quantization integration
 from dataclasses import dataclass
 from typing import Optional

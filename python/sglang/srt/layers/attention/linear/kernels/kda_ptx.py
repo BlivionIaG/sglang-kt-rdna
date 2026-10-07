@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """PTX/tcgen05 KDA chunked-prefill backend (``--linear-attn-prefill-backend ptx_kda``).
 

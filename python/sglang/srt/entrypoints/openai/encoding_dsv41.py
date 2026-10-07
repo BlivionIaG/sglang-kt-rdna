@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from the DeepSeek-V4.1 release reference implementation.
 """Encode DeepSeek-V4.1 chat messages.
 

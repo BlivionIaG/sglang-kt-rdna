@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from qwen2_moe.py
 
 # Copyright 2023-2024 SGLang Team

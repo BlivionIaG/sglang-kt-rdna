@@ -1,3 +1,4 @@
+from __future__ import annotations
 # adapted from
 # https://github.com/vllm-project/vllm/blob/82a1b1a82b1fbb454c82a9ef95730b929c9b270c/vllm/model_executor/layers/pooler.py
 

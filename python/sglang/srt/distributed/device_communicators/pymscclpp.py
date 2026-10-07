@@ -1,3 +1,4 @@
+from __future__ import annotations
 import bisect
 import logging
 import math

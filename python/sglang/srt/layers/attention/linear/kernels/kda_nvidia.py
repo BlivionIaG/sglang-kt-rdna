@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """NVIDIA split KDA prefill backend (K1-K4 CuTe/Triton/cuTile pipeline).
 

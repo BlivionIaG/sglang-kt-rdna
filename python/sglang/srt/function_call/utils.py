@@ -1,3 +1,4 @@
+from __future__ import annotations
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union

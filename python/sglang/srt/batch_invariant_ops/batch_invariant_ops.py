@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Shared vision tower and helpers for MiniMax VL models.
 #

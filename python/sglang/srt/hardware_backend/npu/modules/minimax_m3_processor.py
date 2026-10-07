@@ -8,6 +8,7 @@ This patch restructures the computation using transform_patches_to_flatten
 to stay within 8 dimensions, following the same pattern as the Qwen VL and
 GLM-4.6V NPU patches.
 """
+from __future__ import annotations
 
 import math
 from typing import List

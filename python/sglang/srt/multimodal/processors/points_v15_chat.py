@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copy from qwen_vl.py, adapted for points-v15-chat
 
 from typing import List, Union

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 # Copyright 2023 Antgroup and The HuggingFace Inc. team. All rights reserved.
 import copy

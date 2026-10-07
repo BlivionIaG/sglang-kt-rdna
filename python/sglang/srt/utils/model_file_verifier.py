@@ -9,6 +9,7 @@ Example commands:
     python -m sglang.srt.utils.model_file_verifier generate --model-path <hf-id-or-model-path> --model-checksum checksums.json
     python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
 """
+from __future__ import annotations
 
 import argparse
 import fnmatch

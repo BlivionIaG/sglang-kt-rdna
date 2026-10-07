@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from qwen2.py
 
 from typing import Iterable, Optional, Tuple

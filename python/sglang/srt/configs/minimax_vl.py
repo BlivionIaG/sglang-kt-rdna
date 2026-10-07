@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """HuggingFace config for the MiniMax M3 VL family."""
 

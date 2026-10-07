@@ -3,6 +3,7 @@
 Audio preprocessing is delegated to :class:`MiMoAudioPipeline`; this
 processor only handles the special-token contract and content interleaving.
 """
+from __future__ import annotations
 
 import asyncio
 import re

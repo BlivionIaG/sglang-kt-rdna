@@ -20,6 +20,7 @@ Usage:
         HookType.AROUND,
     )
 """
+from __future__ import annotations
 
 import contextvars
 import functools

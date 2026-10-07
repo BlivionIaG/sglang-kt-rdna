@@ -7,6 +7,7 @@ which exceeds Ascend NPU's 8-dimension limit.
 This patch restructures the computation to stay within 8 dimensions, following
 the same pattern as the Qwen VL NPU patch.
 """
+from __future__ import annotations
 
 import torch
 import torchvision.transforms.v2.functional as tvF

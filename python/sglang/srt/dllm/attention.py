@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0.
 """dLLM FA4 compute and graph workspaces over Triton paged-cache metadata."""

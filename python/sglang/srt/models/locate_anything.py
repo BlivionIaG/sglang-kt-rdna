@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://huggingface.co/nvidia/LocateAnything-3B/blob/main/modeling_locateanything.py
 # and from vllm-project/vllm PR #44182.

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from the DeepSeek-V4 release reference implementation.
 """
 DeepSeek-V4 Encoding

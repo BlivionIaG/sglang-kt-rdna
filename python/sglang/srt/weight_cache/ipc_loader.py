@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """IPC Model Loader — loads model weights from a Weight Cache Daemon.
 

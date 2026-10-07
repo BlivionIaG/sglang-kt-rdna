@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Benchmark script for KTEPWrapperMethod.apply() performance testing.
 

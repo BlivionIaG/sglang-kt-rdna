@@ -1,3 +1,4 @@
+from __future__ import annotations
 # modified from https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/tool_parser/internlm2_parser.py
 
 import json

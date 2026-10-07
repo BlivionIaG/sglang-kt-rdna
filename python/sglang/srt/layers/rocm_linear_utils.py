@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat

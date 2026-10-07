@@ -4,6 +4,7 @@ Tests the Triton sparse GQA kernel against a PyTorch reference that computes
 attention only on the topk blocks via standard softmax, covering GQA ratios,
 sink tokens, paged KV (randperm), variable seq_lens, and edge cases.
 """
+from __future__ import annotations
 
 import sys
 

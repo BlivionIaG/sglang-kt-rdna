@@ -36,6 +36,7 @@ Protocol (gated by ``SGLANG_OPT_LORA_SHARED_ADD_OVERLAP``):
 The state is a single slot: MoE layers run sequentially within one scheduler
 process, and the stage/consume pair lives within a single layer forward.
 """
+from __future__ import annotations
 
 from typing import Optional, Tuple
 

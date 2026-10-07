@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 import weakref
 from typing import Dict, List, Optional, Tuple, Union

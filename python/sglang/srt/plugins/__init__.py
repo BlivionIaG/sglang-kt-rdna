@@ -9,6 +9,7 @@ Plugins are discovered automatically when installed via pip.
 - Platform plugins: use ``SGLANG_PLATFORM`` to select when multiple are installed.
 - General plugins: use ``SGLANG_PLUGINS`` (comma-separated) to restrict which are loaded.
 """
+from __future__ import annotations
 
 import logging
 from collections.abc import Callable

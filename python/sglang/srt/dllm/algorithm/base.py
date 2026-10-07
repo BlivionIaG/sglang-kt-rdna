@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.server_args import ServerArgs

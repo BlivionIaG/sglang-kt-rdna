@@ -1,4 +1,5 @@
 """Qwen3-ASR model compatible with HuggingFace weights"""
+from __future__ import annotations
 
 import logging
 from array import array

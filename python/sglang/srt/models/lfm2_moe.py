@@ -11,6 +11,7 @@ Key MoE characteristics:
 - Expert bias (fp32) affects selection but not weighting
 - Post-hoc normalization of top-k weights
 """
+from __future__ import annotations
 
 from typing import Iterable, Optional, Set, Tuple
 

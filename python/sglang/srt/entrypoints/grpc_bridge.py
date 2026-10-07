@@ -5,6 +5,7 @@ The RuntimeHandle exposes synchronous methods that Rust can call via PyO3
 channels via callback objects while all async work stays on the
 TokenizerManager's event loop.
 """
+from __future__ import annotations
 
 import asyncio
 import json

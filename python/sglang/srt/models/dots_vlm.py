@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2025 The RedNote HiLab team.
 # Copyright 2025 The SGLang team.
 #

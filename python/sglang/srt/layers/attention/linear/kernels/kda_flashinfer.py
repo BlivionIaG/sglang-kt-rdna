@@ -10,6 +10,7 @@ Contract with the Triton KDA reference:
   - q/k are L2-normalized in-kernel;
   - state layout is ``[N, HV, V, K]`` for committed and speculative state.
 """
+from __future__ import annotations
 
 import logging
 import os

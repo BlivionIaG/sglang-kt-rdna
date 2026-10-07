@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from qwen2.py
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 # Copyright 2024 The LG AI Research EXAONE Lab. All rights reserved.
 # Copyright 2024 The LG CNS AI Engineering Team.

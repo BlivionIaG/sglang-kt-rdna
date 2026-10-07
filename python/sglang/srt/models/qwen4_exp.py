@@ -1,4 +1,5 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
+from __future__ import annotations
 
 import math
 from contextlib import nullcontext

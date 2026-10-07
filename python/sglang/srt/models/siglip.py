@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/siglip/modeling_siglip.py
 

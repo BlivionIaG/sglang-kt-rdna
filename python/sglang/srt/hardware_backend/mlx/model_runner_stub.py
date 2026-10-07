@@ -3,6 +3,7 @@
 Skips PyTorch weight loading.  Creates only the CPU-side bookkeeping
 (req_to_token_pool, token_to_kv_pool_allocator) the scheduler needs.
 """
+from __future__ import annotations
 
 import logging
 from typing import Tuple

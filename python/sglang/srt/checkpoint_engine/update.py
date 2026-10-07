@@ -9,6 +9,7 @@ Usage:
 Or use the integrated entry point:
     python -m sglang.srt.checkpoint_engine.update --update-method broadcast --checkpoint-path /workspace/Qwen/Qwen3-4B/  --inference-parallel-size 2
 """
+from __future__ import annotations
 
 import argparse
 import json

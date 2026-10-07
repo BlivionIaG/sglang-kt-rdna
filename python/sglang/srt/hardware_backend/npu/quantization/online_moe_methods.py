@@ -9,6 +9,7 @@ Kept out of ``moe_methods.py`` because ``unquant.py`` imports that module at
 module scope, so subclassing ``UnquantizedFusedMoEMethod`` there would be a
 circular import.
 """
+from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 

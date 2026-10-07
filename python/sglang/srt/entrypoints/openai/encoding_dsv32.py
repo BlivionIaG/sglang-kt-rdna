@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/encoding/encoding_dsv32.py
 import copy
 import json

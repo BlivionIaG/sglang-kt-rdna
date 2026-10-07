@@ -11,6 +11,7 @@ Weight names match the checkpoint exactly (wqkv/wo, mlp.fc0/fc1,
 mm_projector.proj.0/proj.2, mm_projector.post_norm), so loading needs no
 renames.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple, Union

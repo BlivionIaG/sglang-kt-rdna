@@ -4,6 +4,7 @@ Scheduler process management for gRPC server.
 This module handles launching and managing scheduler processes for the gRPC server,
 including tensor parallelism, pipeline parallelism, and data parallelism configurations.
 """
+from __future__ import annotations
 
 import logging
 import multiprocessing as mp

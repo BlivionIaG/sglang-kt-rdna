@@ -1,3 +1,4 @@
+from __future__ import annotations
 # coding=utf-8
 """
 SGLang SDARMoeModelLM (block diffusion / dLLM-style forward) with MoE MLP.

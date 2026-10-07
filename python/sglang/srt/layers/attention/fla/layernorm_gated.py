@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/layernorm_gated.py
 # Copyright (c) 2024, Tri Dao.
 # Based on the Triton LayerNorm tutorial: https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html

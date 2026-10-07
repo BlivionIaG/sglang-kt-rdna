@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copied and adapted from: https://huggingface.co/openbmb/MiniCPM-o-2_6/blob/main/modeling_minicpmo.py
 
 # Copyright 2023-2024 SGLang Team

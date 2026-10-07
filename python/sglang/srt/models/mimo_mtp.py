@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/pull/17433/files  and deepseek_nextn.py
 
 from typing import Iterable, Optional, Tuple

@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Dict, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

@@ -1,4 +1,5 @@
 """Config-time override declarations for qwen3_moe."""
+from __future__ import annotations
 
 import logging
 from typing import Any, Dict

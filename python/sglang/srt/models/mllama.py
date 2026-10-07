@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""

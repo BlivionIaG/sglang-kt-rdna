@@ -5,6 +5,7 @@ This kernel replaces the expensive advanced indexing operations in
 `update_mamba_state_after_mtp_verify` with a single fused gather-scatter kernel,
 avoiding multiple `index_elementwise_kernel` launches.
 """
+from __future__ import annotations
 
 import torch
 import triton

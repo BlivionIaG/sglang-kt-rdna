@@ -1,4 +1,5 @@
 """Stateful audio preprocessing pipeline shared by MiMo multimodal and ASR processors."""
+from __future__ import annotations
 
 import io
 import math

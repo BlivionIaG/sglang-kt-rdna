@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,

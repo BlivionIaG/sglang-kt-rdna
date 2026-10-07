@@ -1,3 +1,4 @@
+from __future__ import annotations
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig

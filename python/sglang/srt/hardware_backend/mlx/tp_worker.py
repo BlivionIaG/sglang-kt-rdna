@@ -11,6 +11,7 @@ the next decode step on top of a still-lazy previous decode, and
 ``finalize_mlx_result`` blocks on the lazy outputs and produces a
 normal ``GenerationBatchResult``.
 """
+from __future__ import annotations
 
 import logging
 from dataclasses import dataclass

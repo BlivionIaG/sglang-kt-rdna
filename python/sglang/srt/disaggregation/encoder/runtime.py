@@ -5,6 +5,7 @@ The current runtime keeps :class:`EncoderScheduler` and the rank-0
 existing DP replica processes and dispatch plumbing so another transport can
 reuse that backend topology without importing the HTTP server.
 """
+from __future__ import annotations
 
 import asyncio
 import atexit

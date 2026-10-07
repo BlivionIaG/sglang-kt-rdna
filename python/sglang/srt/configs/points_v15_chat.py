@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Optional, Union
 
 from transformers import PretrainedConfig, Qwen2Config

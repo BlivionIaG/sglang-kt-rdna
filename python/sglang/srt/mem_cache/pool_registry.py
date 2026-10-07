@@ -7,6 +7,7 @@ importing the pool classes from base code.
 Plugins register themselves at import time via the DSV4 model entry-point.
 Lookups are tried in registration order; first non-None match wins.
 """
+from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 

@@ -14,6 +14,7 @@ config flags on top of the same layout:
 * ``norm_output``: emit post-norm (rather than pre-norm) hidden states as
   the auxiliary output consumed by the next draft step.
 """
+from __future__ import annotations
 
 import copy
 import logging

@@ -1,6 +1,7 @@
 """
 Records startup latency breakdown by context using gauge metrics in seconds
 """
+from __future__ import annotations
 
 import logging
 import time

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # copy from https://huggingface.co/OpenGVLab/InternVL3-1B
 import torch
 import torchvision.transforms as T

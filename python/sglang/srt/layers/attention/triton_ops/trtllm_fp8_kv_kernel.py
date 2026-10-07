@@ -11,6 +11,7 @@ Performance benefits:
 - Reduces kernel launch overhead
 - Better memory bandwidth utilization
 """
+from __future__ import annotations
 
 import logging
 from typing import Optional
