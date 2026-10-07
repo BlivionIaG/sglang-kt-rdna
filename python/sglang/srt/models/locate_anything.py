@@ -43,6 +43,7 @@ from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import add_prefix
+import msgspec
 
 logger = logging.getLogger(__name__)
 
