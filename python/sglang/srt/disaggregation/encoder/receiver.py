@@ -58,6 +58,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+import copy
 
 logger = logging.getLogger(__name__)
 

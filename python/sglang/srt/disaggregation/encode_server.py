@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
+import copy
 
 logger = logging.getLogger(__name__)
 

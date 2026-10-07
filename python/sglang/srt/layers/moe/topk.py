@@ -67,6 +67,7 @@ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from typing import Tuple
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig

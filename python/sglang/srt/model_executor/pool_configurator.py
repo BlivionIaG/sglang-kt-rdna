@@ -60,6 +60,7 @@ from sglang.srt.utils.common import (
     is_npu,
     spec_decode_alloc_len_per_request,
 )
+import time
 
 _is_hip = is_hip()
 _is_npu = is_npu()

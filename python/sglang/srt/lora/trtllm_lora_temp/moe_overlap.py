@@ -20,6 +20,7 @@ from sglang.srt.lora.trtllm_lora_temp import (
     get_original_moe_lora_func,
     is_two_stream_active,
 )
+import copy
 
 # GEMM1-LoRA overlap: keep LoRA-ready events recorded during cuda-graph capture alive so the
 # captured cross-stream wait (resolved inside the trtllm op before activation) isn't torn down

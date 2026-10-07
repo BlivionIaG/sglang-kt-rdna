@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
 )
+import copy
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()

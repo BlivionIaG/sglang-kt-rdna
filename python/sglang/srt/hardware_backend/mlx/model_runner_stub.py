@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+import inspect
 
 logger = logging.getLogger(__name__)
 

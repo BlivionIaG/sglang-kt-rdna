@@ -30,6 +30,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 import re
+import time
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput

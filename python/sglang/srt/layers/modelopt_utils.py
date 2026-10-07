@@ -1,6 +1,14 @@
 """
 ModelOpt related constants
 """
+from __future__ import annotations
+from typing import Literal, TypeAlias
+
+ModelOptQuantMethod: TypeAlias = Literal[
+    "modelopt_fp8",
+    "modelopt_fp4",
+    "mxfp8",
+]
 
 QUANT_CFG_CHOICES = {
     "fp8": "FP8_DEFAULT_CFG",

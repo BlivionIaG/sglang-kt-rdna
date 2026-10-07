@@ -11,6 +11,7 @@ from sglang.srt.multimodal.transport.memory_pool import (
     StreamOrderedMmFeaturePool,
     StreamOrderedPoolConsumerMixin,
 )
+import copy
 
 logger = logging.getLogger(__name__)
 

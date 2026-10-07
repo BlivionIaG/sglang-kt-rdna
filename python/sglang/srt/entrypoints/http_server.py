@@ -405,6 +405,7 @@ app.add_middleware(
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+import json
 
 app.include_router(v1_loads_router)
 

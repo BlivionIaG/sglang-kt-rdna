@@ -27,6 +27,8 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from typing import Optional
+from contextlib import contextmanager
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

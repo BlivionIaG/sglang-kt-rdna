@@ -55,6 +55,7 @@ from typing import (
 
 import msgspec
 import msgspec.structs
+from dataclasses import field, fields
 
 A = Annotated
 

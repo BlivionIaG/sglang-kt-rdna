@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, Optional
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
+from dataclasses import field, fields
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,

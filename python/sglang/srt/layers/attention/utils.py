@@ -3,7 +3,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+# Upstream moved `is_fp8_fnuz` to kernels/ops/quantization/fp8_kernel.py; importing
+# it from layers/quantization/fp8_kernel.py here created a cycle, because that module
+# is still initialising when this one is reached (fp8_kernel -> attention.utils).
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_cuda
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn

@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+import types
 
 logger = logging.getLogger(__name__)
 

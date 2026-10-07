@@ -85,6 +85,8 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
 )
+import time
+import copy
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req

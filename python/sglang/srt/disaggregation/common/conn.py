@@ -41,6 +41,8 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
+import msgspec
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 

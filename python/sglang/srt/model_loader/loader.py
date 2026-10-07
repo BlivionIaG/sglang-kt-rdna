@@ -117,6 +117,7 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
+import hashlib
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig

@@ -26,6 +26,7 @@ from .response_templates import (
     ResponseTemplateField,
     load_response_template,
 )
+import types
 
 
 def _schema_types(schema: Any) -> tuple[str, ...]:

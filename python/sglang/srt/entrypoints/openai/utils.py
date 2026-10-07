@@ -8,6 +8,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     LogProbs,
 )
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 

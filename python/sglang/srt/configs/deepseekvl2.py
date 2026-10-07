@@ -11,6 +11,7 @@ from transformers import (
     PretrainedConfig,
     ProcessorMixin,
 )
+import time
 
 
 def select_best_resolution(image_size, candidate_resolutions):

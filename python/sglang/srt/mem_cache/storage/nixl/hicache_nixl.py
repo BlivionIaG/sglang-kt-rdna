@@ -20,6 +20,8 @@ from .nixl_utils import (
     NixlFileManager,
     NixlRegistration,
 )
+import os
+from dataclasses import dataclass
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config

@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
 )
+import time
 
 logger = logging.getLogger(__name__)
 

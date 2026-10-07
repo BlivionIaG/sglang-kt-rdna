@@ -108,6 +108,7 @@ from sglang.srt.runtime_context import get_platform
 import copy
 import gc
 from urllib.parse import unquote, urljoin, urlparse
+from typing import Iterator
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below

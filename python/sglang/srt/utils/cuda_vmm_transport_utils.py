@@ -45,6 +45,7 @@ from sglang.srt.utils.cuda_vmm_utils import (
     release_mappings,
     tensor_from_pointer,
 )
+import copy
 
 logger = logging.getLogger(__name__)
 

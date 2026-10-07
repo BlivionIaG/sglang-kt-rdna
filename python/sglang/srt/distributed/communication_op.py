@@ -12,6 +12,7 @@ from .parallel_state import (
     get_moe_tp_group,
     get_tp_group,
 )
+from typing import List
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

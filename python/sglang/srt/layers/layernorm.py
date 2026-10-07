@@ -38,6 +38,8 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.kernels.fused_op import BaseFusedOp
+from functools import lru_cache
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
