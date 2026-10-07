@@ -68,6 +68,11 @@ if [ "${LIMIT_V:-0}" = "1" ]; then
   echo "ulimit -v set to 60 GB"
 fi
 CPUINFER="${CPUINFER:-16}"
+# After the FULL load (all 48 MoE layers, 512 experts each) the configurator computes a floor
+# from the weights actually resident; 0.55 fails with "Raise --mem-fraction-static above
+# 0.692 (minimum viable = 1 - available/pre = 0.6911)". Kept settable so the floor can be
+# met without editing the script.
+MEMFRAC="${MEMFRAC:-0.55}"
 [ "${FEWER_THREADS:-0}" = "1" ] && CPUINFER=4
 echo "cpuinfer=$CPUINFER  ISOLATE=${ISOLATE:-0}  LIMIT_V=${LIMIT_V:-0}"
 
@@ -93,7 +98,7 @@ ARGS=(
   "${PLE_OFFLOAD[@]}"
   --quantization modelopt_mixed
   --kt-num-gpu-experts 0 --kt-cpuinfer "$CPUINFER" --kt-threadpool-count 1 --kt-method NVFP4
-  --attention-backend triton --disable-cuda-graph --mem-fraction-static 0.55
+  --attention-backend triton --disable-cuda-graph --mem-fraction-static "${MEMFRAC:-0.55}"
   --max-running-requests 2
   --host 127.0.0.1 --port "$PORT"
   --trust-remote-code --disable-radix-cache

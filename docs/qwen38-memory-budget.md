@@ -222,3 +222,32 @@ If it does become necessary, two things bound it:
 
 **Cheapest lever first:** `--kt-gpu-experts-ratio` moves experts to the 16 GB card (10.17 GiB
 is already used of 15.48, so there is little room) or fewer `--kt-cpuinfer` threads.
+
+## BREAKTHROUGH: THE LOAD COMPLETES (attempt 2, 2026-10-07 15:38)
+
+    TP MOE layer 47, pool: 0x36ca45b0, expert num: 512, num_experts_per_tok: 10
+    Created AVX2_MXFP4_MOE_TP 0 at numa 0 (group_size=16)
+    --- 48 of 48 MoE layers created, 512 experts each ---
+    [NativeMoEWrapper Layer 34] load_experts: 1179.0ms, cpp_load_weights: 257.1ms, total: 1762.2ms
+
+**Every expert group was created. The model loaded.** Against the previous attempts, which
+stopped at layer 30 (pinned placement) or layer 40 (70 G cap), attempt 2 walked all 48.
+
+The failure that remained was NOT memory:
+
+    ValueError: Loaded weights leave no GPU memory for the KV cache under
+    --mem-fraction-static=0.55. Raise --mem-fraction-static above 0.692
+    (minimum viable = 1 - available/pre = 0.6911)
+
+That is a TUNABLE, not a wall: the configurator measures the weights actually resident after
+the load and computes the fraction needed for the KV cache. `mem-fraction-static` is now a
+script parameter (`MEMFRAC`), and attempt 3 runs at 0.75.
+
+    RAM peak in attempt 2   : the cap was 88 G and the run was NOT OOM-killed
+    host after             : up, 88 G free, no wedge
+
+So the three-part placement stands confirmed by observation:
+  experts  -> host RAM via kt's AMX path        (works)
+  PLE      -> sparse mmap on disk, RSS trimmed  (trimmed 11.7 -> 0.1 GiB repeatedly)
+  rest     -> GPU                               (10.17 GiB, all 48 layers resident)
+and MoE-to-disk is NOT needed.
