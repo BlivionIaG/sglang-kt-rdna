@@ -1017,6 +1017,18 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    # Imported with the qwen4 subsystem (sgl-project/sglang): qwen4_exp declares
+    # `packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping`, so the
+    # attribute has to exist on this class. The four entries are the fused
+    # projections this model family actually packs -- qkv, gate/up, and the GDN
+    # in_proj pairs -- matching what the weight loaders here already expect.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
