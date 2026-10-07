@@ -1,3 +1,5 @@
+import functools
+import json
 import os
 import subprocess
 import warnings
@@ -38,8 +40,9 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 class EnvField:
     _allow_set_name = True
 
-    def __init__(self, default: Any):
+    def __init__(self, default: Any, secret: bool = False):
         self.default = default
+        self.secret = secret
         # NOTE: environ can only accept str values, so we need a flag to indicate
         # whether the env var is explicitly set to None.
         self._set_to_none = False
@@ -51,6 +54,10 @@ class EnvField:
     def parse(self, value: str) -> Any:
         raise NotImplementedError()
 
+    def _resolve_default(self) -> Any:
+        # Callable defaults are evaluated lazily, only when the env is unset.
+        return self.default() if callable(self.default) else self.default
+
     def get(self) -> Any:
         value = os.getenv(self.name)
 
@@ -61,7 +68,7 @@ class EnvField:
 
         # Not set, return default
         if value is None:
-            return self.default
+            return self._resolve_default()
 
         try:
             return self.parse(value)
@@ -154,6 +161,119 @@ class ToolStrictLevel(IntEnum):
     OFF = 0
     FUNCTION = 1
     PARAMETER = 2
+
+
+class _DeprecatedEnvFallback:
+    """Mixin for EnvField subclasses: if the canonical env var is not set,
+    check *deprecated_name* and emit DeprecationWarning before reading it.
+    """
+
+    def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
+        super().__init__(default, secret=secret)
+        self.deprecated_name = deprecated_name
+
+    def get(self) -> Any:
+        if os.getenv(self.name) is None:
+            fallback = os.getenv(self.deprecated_name)
+            if fallback is not None:
+                warnings.warn(
+                    f"Environment variable '{self.deprecated_name}' is deprecated; "
+                    f"use '{self.name}' instead. "
+                    "The alias will be removed in a future release.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                os.environ[self.name] = fallback
+        return super().get()
+
+
+class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
+    pass
+
+
+class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
+    pass
+
+
+class EnvJSON(EnvField):
+    def parse(self, value: str | None) -> list | dict | None:
+        if not value:
+            return None
+        if os.path.exists(value):
+            with open(value) as f:
+                return json.load(f)
+        return json.loads(value)
+
+
+@functools.lru_cache(maxsize=1)
+class DsparkFoldedSampling(IntEnum):
+    """Sampling support in the graph-folded DSpark draft proposal: OFF =
+    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
+    FORCE = always."""
+
+    OFF = 0
+    AUTO = 1
+    FORCE = 2
+
+
+class GateGemvMode(IntEnum):
+    """Small-batch Inkling gate linear implementation.
+
+    OFF: always the cublas GEMM
+    PAIR: PDL-chained GEMV and gate JIT kernels
+    FUSED: single-launch GEMV + gate epilogue (last-block ticket)
+    """
+
+    OFF = 0
+    PAIR = 1
+    FUSED = 2
+
+
+class InvariantCheckLevel(IntEnum):
+    """Signal level for value/index validity checks (see invariants.py).
+
+    OFF: data layer only (sanitize/containment); no detection, no signal.
+    WARN: detect + throttled log/count; degrade, never crash (prod on-demand).
+    STRICT: detect + crash on GUARD/FATAL violations (CI default).
+
+    The data layer is unconditional and independent of this level; only the
+    detection + signal layer is gated here.
+    """
+
+    OFF = 0
+    WARN = 1
+    STRICT = 2
+
+
+def _default_cache_subdir(name: str) -> str:
+    """A directory under SGLANG_CACHE_DIR, for env defaults that track it.
+
+    Pass as a callable default: SGLANG_CACHE_DIR is declared further down the
+    Envs body, and resolving late also lets tests override it.
+    """
+    return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
+
+
+@functools.lru_cache(maxsize=1)
+def _default_hip() -> bool:
+    """Lazy ROCm/HIP detection for platform-conditional env defaults.
+
+    Avoids importing torch at environ import time (this module is intentionally
+    stdlib-only and loaded very early). Resolved on first EnvField.get() that uses
+    it as a default, by which point torch is already imported in any real run;
+    falls back to False if torch is unavailable.
+    """
+    try:
+        import torch
+
+        return torch.version.hip is not None
+    except Exception:
+        return False
+
+
+def _default_tree_cache_sanity_check() -> bool:
+    """Enable the expensive tree-cache sanity check by default in CI."""
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 class Envs:
@@ -571,6 +691,470 @@ class Envs:
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
 
 
+    # ---------- merged from sgl-project/sglang: qwen4_exp port ----------
+    # runtime_context / layer_boundary / qwen4_exp read these through Envs.
+    # Added here instead of replacing this file wholesale: this fork also
+    # defines 65 SGLANG_* names upstream lacks (SGLANG_CUTLASS_MOE,
+    # SGLANG_DSV4_*, SGLANG_OPT_MEGA_MOE_*, ...). Descriptor semantics are
+    # byte-identical between the two files; only the registry differs.
+    SGLANG_ROLE_NAMESPACES = EnvStr("off")
+    SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
+    SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
+    SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
+    SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+    SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
+    SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
+    SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
+    SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+    SGLANG_TCP_STORE_PORT = EnvInt(29600)
+    SGLANG_PORT = EnvInt(None)
+    SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
+    SGLANG_SKIP_RUST_TESTS = EnvBool(False)
+    SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
+    SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
+    SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
+    SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
+    SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
+    SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    SGLANG_TEST_METRICS_FILE = EnvStr(None)
+    SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
+    SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
+    SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
+    SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
+    SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
+    SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
+    SGLANG_TRACE_ASYNC = EnvBool(False)
+    SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
+    SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
+    SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
+    SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
+    SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E = EnvBool(False)
+    SGLANG_DEEPEP_V2_TRACE_CONTIG = EnvBool(False)
+    SGLANG_DEEPEP_V2_TRACE_MASKED = EnvBool(False)
+    SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
+    SGLANG_DEBUG_POISON_POOL = EnvBool(False)
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
+    SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+    SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
+    SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
+    SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
+    SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
+    SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
+    SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
+    SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
+    SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
+    SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
+    SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
+    SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
+    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
+    SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
+    SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
+    SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
+    SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
+    SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
+    SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
+    SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
+    SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
+    SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
+    SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
+    SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
+    SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)
+    SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
+    SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
+    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
+    SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
+    SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
+    SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
+    SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    SGLANG_RADIX_FORCE_MISS = EnvBool(False)
+    SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
+    SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
+    )
+    SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
+    SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
+    SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
+    SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
+    SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
+    SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
+    SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
+    SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    SGLANG_EXA_NUM_RESULTS = EnvInt(10)
+    SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
+    SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
+    SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
+    SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
+    SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
+    SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
+    SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
+    SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_STAGING_USE_TORCH = EnvBool(False)
+    SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
+    SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
+    SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
+    SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
+    SGLANG_MORI_POST_BATCH_SIZE = EnvInt(-1)
+    SGLANG_MORI_NUM_WORKERS = EnvInt(4)
+    SGLANG_MORI_TRANSFER_SHARDS = EnvInt(8)
+    SGLANG_MORI_WAIT_POLL_MS = EnvInt(1000)
+    SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+    SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    SGLANG_USE_AITER_AG = EnvBool(True)
+    SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
+    SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
+    SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
+    SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
+    SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
+    SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
+    SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    SGLANG_AITER_MLA_DCP_DECODE_BACKEND = EnvStr("gluon")
+    SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
+    SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    SGLANG_USE_MLX = EnvBool(False)
+    SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
+    SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
+    SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
+    SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
+    SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
+    SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
+    SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
+    SGLANG_OPT_NPU_BF16_WO_A_GEMM = EnvBool(False)
+    SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
+    SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
+    SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
+    SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
+    SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
+    SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
+    SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
+    SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
+    SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
+    SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
+    SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
+    SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
+    SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
+    SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
+    SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
+    SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    SGLANG_DISABLE_LEAN_ATTENTION = EnvBool(False)
+    SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
+    SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
+    SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
+    SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+    SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
+    SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
+    SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
+        32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
+    )
+    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
+    SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
+    SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
+    SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
+    SGLANG_OPT_DG_COMPACT_EAGER = EnvBool(False)
+    SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
+    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    SGLANG_CUTE_AOT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("cute_aot"))
+    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
+    SGLANG_JIT_CACHE_KEEP = EnvInt(None)
+    SGLANG_JIT_FORCE_RECOMPILE = EnvBool(False)
+    SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
+    SGLANG_JIT_LOG_RESOURCE_USAGE = EnvBool(False)
+    SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
+    SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
+    SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
+    SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
+    SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
+    SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
+    SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+    SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
+    SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
+    SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
+    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+    SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
+    SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
+    SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
+    SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
+    SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
+    SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
+    SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
+    SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
+    SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
+    SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
+    SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
+    SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
+    SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)
+    SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
+    SGLANG_DEFAULT_THINKING = EnvBool(False)
+    SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
+    SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
+    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
+    SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
+    SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
+    SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
+    SGLANG_GRPC_PORT = EnvInt(None)
+    SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
+    SGLANG_AUTO_NUMA_BIND = EnvBool(True)
+    SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
+    SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
+    SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
+    SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
+    SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
+    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
+    SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
+    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_GATE_TOPK_JIT = EnvBool(True)
+    SGLANG_OPT_GATE_GEMV_MODE = EnvInt(GateGemvMode.PAIR)
+    SGLANG_ENABLE_SINGLE_CG_DRAFT = EnvBool(True)
+    SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    SGLANG_OPT_LINEARIZED_SHARED_SINK = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_CUSTOM_AR = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH = EnvBool(True)
+    SGLANG_OPT_INKLING_MXFP8_FUSED_QUANT_STORE = EnvBool(True)
+    SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
+    SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
+    SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+    SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
+    SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
+    SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER = EnvBool(False)
+    SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
+    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+    SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
+    SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
+    SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
+    SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
+    SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
+    SGLANG_MINIMAX_NPU_NATIVE_INDEXER = EnvBool(False)
+    SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
+    SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
+    SGLANG_K3_AR_FUSION = EnvBool(False)
+    SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
+    SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
+    SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
+    SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
+    SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
+    SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
+    SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
+    SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+    SGLANG_RUST_SERVER = EnvBool(False)
+    SGLANG_RUST_BUILD_MODE = EnvStr("auto")
+    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE = EnvStr(
+        "/tmp/sglang_weight_cache_{device_uuid}.sock"
+    )
+    SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
+        "/tmp/sglang_weight_cache_{device_uuid}.ready"
+    )
 envs = Envs()
 EnvField._allow_set_name = False
 
