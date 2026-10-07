@@ -4807,7 +4807,13 @@ def create_kt_config_from_server_args(
         threadpool_count=server_args.kt_threadpool_count,
         numa_nodes=server_args.kt_numa_nodes,
         weight_path=server_args.kt_weight_path,
-        chunked_prefill_size=server_args.chunked_prefill_size,
+        # `chunked_prefill_size` is None unless a memory hook fills it in (the newer
+        # base computes it in arg_groups/memory_hook.py rather than by default), and
+        # kt_kernel's MOEConfig.max_len is a typed C++ int -- passing None raises
+        # "incompatible function arguments ... arg0: int". This module already
+        # defaults the value elsewhere (`... or 8192` below); do the same here so the
+        # CPU expert path gets a usable chunk size.
+        chunked_prefill_size=server_args.chunked_prefill_size or 8192,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
