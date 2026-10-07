@@ -11,7 +11,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
-from dataclasses import fields
 
 logger = logging.getLogger(__name__)
 

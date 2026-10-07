@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -74,7 +73,6 @@ class BaseConnector(ABC):
 
 
 class BaseKVConnector(BaseConnector):
-
     @abstractmethod
     def get(self, key: str) -> Optional[torch.Tensor]:
         raise NotImplementedError()

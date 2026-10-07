@@ -9,7 +9,6 @@ Usage:
     from sglang.srt.platforms import current_platform
     print(current_platform.device_name)
 """
-from __future__ import annotations
 
 import logging
 import os

@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2025 Qwen Team
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");

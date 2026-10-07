@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Optional
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

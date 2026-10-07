@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +13,10 @@ from __future__ import annotations
 # ==============================================================================
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
-from typing import Iterable, List, Optional, Tuple
+from __future__ import annotations
+
+from array import array
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,7 +30,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.utils import add_prefix
-from typing import Iterable, Optional, Tuple
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -59,8 +60,10 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        pad_values = [item.pad_value for item in image_inputs.mm_items]
+    def pad_input_ids(
+        self, input_ids: array[int], image_inputs: MultimodalInputs
+    ) -> array[int]:
+        pad_values = array("q", (item.pad_value for item in image_inputs.mm_items))
         new_image_feature_len = self.image_feature_len
 
         pad_ids = pad_values * (
@@ -225,9 +228,10 @@ class LlavaVidForCausalLM(nn.Module):
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
+        device = next(self.language_model.parameters()).device
         self.vision_tower = CLIPVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
-        ).cuda()
+        ).to(device)
         self.vision_tower.eval()
 
         self.vision_feature_layer = self.config.mm_vision_select_layer
@@ -257,6 +261,9 @@ class LlavaVidForCausalLM(nn.Module):
             "model.vision_resampler.mm_projector.0": "multi_modal_projector.linear_1",
             "model.vision_resampler.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_tower.vision_tower": "vision_tower",
+            # transformers 5.6.0 flattened CLIPVisionModel/SiglipVisionModel,
+            # dropping the `vision_model` intermediate wrapper.
+            "vision_tower.vision_model.": "vision_tower.",
             # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }

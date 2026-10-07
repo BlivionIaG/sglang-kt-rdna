@@ -5,7 +5,6 @@ components via ``AudioEncoderMixin``. The encoder modules are attached as
 top-level attributes (no ``audio_encoder.`` prefix) so the checkpoint
 state_dict aligns 1:1 with ``self.named_parameters()``.
 """
-from __future__ import annotations
 
 import logging
 from array import array

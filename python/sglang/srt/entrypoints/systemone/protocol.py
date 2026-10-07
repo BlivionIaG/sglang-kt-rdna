@@ -4,7 +4,6 @@ Follows the published System One OpenAPI 0.2.0 request and response shapes:
 a state, a map of noul, choice, and score questions keyed by caller ids, and
 one answer per question id.
 """
-from __future__ import annotations
 
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 

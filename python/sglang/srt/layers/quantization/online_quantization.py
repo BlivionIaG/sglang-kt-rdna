@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/pull/31914
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
-import copy
 
 
 class CopyNumelCounter(TorchDispatchMode):

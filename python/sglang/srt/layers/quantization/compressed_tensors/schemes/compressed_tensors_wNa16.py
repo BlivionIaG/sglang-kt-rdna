@@ -1,12 +1,12 @@
-from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 from typing import Callable, Optional
 
 import torch
-from sglang._vendor.compressed_tensors.quantization import ActivationOrdering
+from compressed_tensors.quantization import ActivationOrdering
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -40,19 +40,18 @@ from sglang.srt.layers.quantization.utils import (
     unpack_cols,
 )
 from sglang.srt.utils import is_cuda
-from compressed_tensors.quantization import ActivationOrdering
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 
 ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CompressedTensorsWNA16"]
+__all__ = ["CompressedTensorsWNA16", "XPUCompressedTensorsWNA16"]
 WNA16_SUPPORTED_TYPES_MAP = {
     4: scalar_types.uint4b8,
     8: scalar_types.uint8b128
@@ -339,9 +338,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             is_k_full=self.is_k_full,
             bias=bias,
         )
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
 
 
 class XPUCompressedTensorsWNA16(CompressedTensorsWNA16):

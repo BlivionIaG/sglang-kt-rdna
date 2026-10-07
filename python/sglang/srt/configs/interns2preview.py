@@ -1,4 +1,3 @@
-from __future__ import annotations
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,

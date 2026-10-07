@@ -25,7 +25,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-import time
 
 if TYPE_CHECKING:
     from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager

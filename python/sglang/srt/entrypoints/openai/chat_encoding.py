@@ -1,8 +1,8 @@
-"""Helpers for model-specific chat encoding configuration.
+"""Single home for the chat-encoding dispatch.
 
-This module intentionally contains only the DeepSeek-V4 reasoning-effort
-profile logic needed by the KTransformers release branch.  Encoder dispatch
-remains in ``serving_chat.py`` so that unrelated model paths are unchanged.
+Which encoder turns chat messages into prompt tokens is a property of the
+model, so the serving path and offline tools (benchmarks, evals) must resolve
+it here instead of re-deriving it from model architectures themselves.
 """
 
 from __future__ import annotations
@@ -10,11 +10,8 @@ from __future__ import annotations
 import ast
 import logging
 from pathlib import Path
-from typing import Optional
-
-from sglang.srt.entrypoints.openai import encoding_dsv4
-from typing import Any, Dict, List
 from typing import Any, Dict, List, Optional, Union
+
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv41
 
 logger = logging.getLogger(__name__)
@@ -27,8 +24,6 @@ _MAX_DSV4_ENCODER_BYTES = 1 << 20
 def _detect_dsv4_reasoning_effort_profile(
     model_path: str, revision: Optional[str] = None
 ) -> Optional[str]:
-    """Detect the preview or official profile without importing model code."""
-
     encoder_path = Path(model_path) / _DSV4_REASONING_EFFORT_ENCODER
     try:
         if not encoder_path.is_file():
@@ -110,9 +105,6 @@ def resolve_dsv4_reasoning_effort_profile(
     )
 
 
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
 def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
     """Check model_type before matching the DeepseekV4 architecture substring;
     V4.1 configs can also use the V4 architecture name.
@@ -177,6 +169,9 @@ def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
     if value in encoding_dsv41.REASONING_EFFORT_MAPPINGS:
         return value
     return None
+
+
+_OPENAI_FUNCTION_FIELD_ORDER = ("name", "description", "parameters")
 
 
 def dsv41_tool_payload(tool: Any) -> Dict[str, Any]:

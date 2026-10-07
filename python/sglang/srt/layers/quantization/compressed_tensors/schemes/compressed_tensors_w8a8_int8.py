@@ -1,13 +1,14 @@
-from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Callable, Optional
 
 import torch
-from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
+from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
@@ -19,11 +20,8 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import is_cuda
-from compressed_tensors.quantization import QuantizationStrategy
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
@@ -33,7 +31,6 @@ if _is_cuda:
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
-
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
@@ -182,7 +179,6 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
 
 class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
-
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):

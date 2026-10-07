@@ -4,7 +4,6 @@ Gated on `SGLANG_ENABLE_REQUEST_DECOMPRESSION` and request header
 `x-body-compressed`, whose value names the method. For example, a caller that
 compressed the body with zstd sets the `x-body-compressed: zstd` header.
 """
-from __future__ import annotations
 
 import asyncio
 import io

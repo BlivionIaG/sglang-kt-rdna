@@ -5,8 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import time
-import copy
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig

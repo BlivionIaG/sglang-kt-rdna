@@ -1,7 +1,6 @@
 """
 Kimi K25 Model Configuration.
 """
-from __future__ import annotations
 
 from transformers import DeepseekV3Config
 from transformers.configuration_utils import PretrainedConfig

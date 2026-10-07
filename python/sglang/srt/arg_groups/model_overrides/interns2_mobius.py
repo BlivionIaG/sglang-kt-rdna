@@ -1,5 +1,4 @@
 """Config-time override declarations for interns2_mobius."""
-from __future__ import annotations
 
 from typing import Any
 

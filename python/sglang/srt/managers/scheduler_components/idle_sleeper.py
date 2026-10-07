@@ -7,7 +7,6 @@ import zmq
 from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
-import socket
 
 if TYPE_CHECKING:
     from sglang.srt.rust_server.server import RustServer

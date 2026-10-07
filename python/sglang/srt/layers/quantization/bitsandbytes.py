@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/d4d2751732c3ccae162a5a0160c7d4fe05d2779a/vllm/model_executor/layers/quantization/bitsandbytes.py
 from __future__ import annotations
 
@@ -15,7 +16,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import direct_register_custom_op, set_weight_attrs
 from sglang.srt.utils import set_weight_attrs
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -24,6 +24,21 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+
+
+def require_bitsandbytes() -> None:
+    try:
+        import bitsandbytes
+
+        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
+            raise ImportError(
+                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
+            )
+    except ImportError as err:
+        raise ImportError(
+            "Please install bitsandbytes>=0.46.1 via "
+            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
+        ) from err
 
 
 class BitsAndBytesConfig(QuantizationConfig):
@@ -90,7 +105,7 @@ class BitsAndBytesConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "BitsAndBytesConfig":
+    def from_config(cls, config: dict[str, Any]) -> BitsAndBytesConfig:
         def get_safe_value(config, keys, default_value=None):
             try:
                 value = QuantizationConfig.get_from_keys(config, keys)
@@ -184,21 +199,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: BitsAndBytesConfig):
-        try:
-            import bitsandbytes
-
-            if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-                raise ImportError(
-                    "bitsandbytes version is wrong. Please "
-                    "install bitsandbytes>=0.46.1."
-                )
-        except ImportError as err:
-            raise ImportError(
-                "Please install bitsandbytes>=0.46.1 via "
-                "`pip install bitsandbytes>=0.46.1` to use "
-                "bitsandbytes quantizer."
-            ) from err
-
+        require_bitsandbytes()
         self.quant_config = quant_config
 
     def create_weights(
@@ -319,9 +320,9 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
                 matmul_states[i].CB = qweight[offsets[i] : offsets[i + 1]]
                 matmul_states[i].SCB = quant_states[i].to(x.device)
                 matmul_states[i].threshold = self.quant_config.llm_int8_threshold
-                matmul_states[i].has_fp16_weights = (
-                    self.quant_config.llm_int8_has_fp16_weight
-                )
+                matmul_states[
+                    i
+                ].has_fp16_weights = self.quant_config.llm_int8_has_fp16_weight
                 matmul_states[i].is_training = False
                 if (
                     matmul_states[i].threshold > 0.0
@@ -394,7 +395,8 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         return out
 
 
-def _apply_bnb_4bit(
+@register_custom_op(mutates_args=["out"])
+def apply_bnb_4bit(
     x: torch.Tensor,
     weight: torch.Tensor,
     offsets: torch.Tensor,
@@ -415,28 +417,6 @@ def _apply_bnb_4bit(
             x, weight[offsets[i] : offsets[i + 1]].t(), quant_states[i]
         )
         current_index += output_size
-
-
-def _apply_bnb_4bit_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    offsets: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    return
-
-
-try:
-    direct_register_custom_op(
-        op_name="apply_bnb_4bit",
-        op_func=_apply_bnb_4bit,
-        mutates_args=["out"],
-        fake_impl=_apply_bnb_4bit_fake,
-    )
-    apply_bnb_4bit = torch.ops.sglang.apply_bnb_4bit
-
-except AttributeError as error:
-    raise error
 
 
 class BitsAndBytesMoEMethod(FusedMoEMethodBase):
@@ -497,7 +477,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -620,45 +600,3 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def require_bitsandbytes() -> None:
-    try:
-        import bitsandbytes
-
-        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-            raise ImportError(
-                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
-            )
-    except ImportError as err:
-        raise ImportError(
-            "Please install bitsandbytes>=0.46.1 via "
-            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
-        ) from err
-
-
-@register_custom_op(mutates_args=["out"])
-def apply_bnb_4bit(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    offsets: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    # only load the bitsandbytes module when needed
-    from bitsandbytes import matmul_4bit
-
-    quant_states = weight.bnb_quant_state
-    current_index = 0
-    for i in range(len(quant_states)):
-        output_size = quant_states[i].shape[0]
-        # It is more efficient to use out kwarg like
-        # matmul_4bit(..., out = ...).  Infeasible now due to the bug
-        # https://github.com/TimDettmers/bitsandbytes/issues/1235.
-        # Need to change  after the bug is fixed.
-        out[:, current_index : current_index + output_size] = matmul_4bit(
-            x, weight[offsets[i] : offsets[i + 1]].t(), quant_states[i]
-        )
-        current_index += output_size

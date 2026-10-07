@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """FlashInfer PCIe-IPC all-reduce for switch-free intra-node machines.
 
@@ -71,7 +70,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.environ import envs
-import time
 
 logger = logging.getLogger(__name__)
 

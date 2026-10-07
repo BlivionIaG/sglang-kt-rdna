@@ -6,7 +6,6 @@ graph memory pool, and the DeepEP capture/replay adapter. Runners in
 cuda_graph_runner/ import from here; nothing here should import
 back into cuda_graph_runner/.
 """
-from __future__ import annotations
 
 from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: F401
     DecodeInputBuffers,

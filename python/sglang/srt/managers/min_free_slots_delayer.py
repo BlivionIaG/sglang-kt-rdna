@@ -1,6 +1,4 @@
-from __future__ import annotations
 from typing import Optional
-import time
 
 
 def resolve_min_free_slots(

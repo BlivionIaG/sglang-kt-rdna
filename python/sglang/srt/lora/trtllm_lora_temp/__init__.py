@@ -21,7 +21,6 @@ to the saved-original implementation for non-decode batches (token count above
 ``SGLANG_TWO_STREAM_MAX_TOKENS`` default 256), so prefill stays on the serial
 path even with the patch installed.
 """
-from __future__ import annotations
 
 from typing import Callable, Optional
 

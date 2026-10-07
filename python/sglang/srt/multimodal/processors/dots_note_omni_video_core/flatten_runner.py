@@ -1,5 +1,4 @@
 """Build and render the train-compatible dots video interleave plan."""
-from __future__ import annotations
 
 import hashlib
 import random

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/ab3e80042eac24dd362408e6d63ad98768046359/vllm/model_executor/layers/quantization/gguf.py
 from __future__ import annotations
 
@@ -11,8 +12,13 @@ import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUUnquantMoEMethod,
+)
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -20,11 +26,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_hip, is_xpu, set_weight_attrs
-from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -35,8 +37,22 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
+_is_npu = is_npu()
 
 if _is_cuda:
+    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel.quantization import (
+        ggml_dequantize,
+        ggml_moe_a8,
+        ggml_moe_a8_vec,
+        ggml_moe_get_block_size,
+        ggml_mul_mat_a8,
+        ggml_mul_mat_vec_a8,
+    )
+
+    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
@@ -46,11 +62,24 @@ if _is_cuda:
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
+elif _is_npu:
+    from gguf import dequantize as gguf_dequantize
 else:
     if not _is_hip:
-        warnings.warn(f"Only CUDA support GGUF quantization currently.")
+        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
+
+
+def _ordered_gguf_shard_ids(shard_ids: list) -> list:
+    """Return checkpoint shards in the fused layer's logical output order."""
+    if len(shard_ids) == 3 and set(shard_ids) == {"q", "k", "v"}:
+        return ["q", "k", "v"]
+    if all(isinstance(shard_id, int) for shard_id in shard_ids) and set(
+        shard_ids
+    ) == set(range(len(shard_ids))):
+        return sorted(shard_ids)
+    return list(shard_ids)
 
 
 class GGUFConfig(QuantizationConfig):
@@ -59,7 +88,7 @@ class GGUFConfig(QuantizationConfig):
     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
         if _is_hip:
-            warnings.warn(f"Only CUDA support GGUF quantization currently.")
+            warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
@@ -68,7 +97,7 @@ class GGUFConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def get_name(self) -> "str":
+    def get_name(self) -> str:
         return "gguf"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -76,14 +105,14 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 60
+        return 60 if not _is_musa else 21
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
         return []  # no extra configs.
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "GGUFConfig":
+    def from_config(cls, config: dict[str, Any]) -> GGUFConfig:
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
@@ -91,17 +120,23 @@ class GGUFConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped_gguf(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
+            if _is_npu:
+                return GGUFLinearAscendMethod(self)
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
+            if _is_npu:
+                return GGUFEmbeddingAscendMethod(self)
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, FusedMoE):
+            if _is_npu:
+                return GGUFMoEAscendMethod(self)
             return GGUFMoEMethod(self)
         return None
 
@@ -145,6 +180,15 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
+def dequantize_gguf_weight(
+    qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Dequantize a packed GGUF matrix using its inferred logical shape."""
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+    return ggml_dequantize(qweight, qweight_type, *shape, dtype)
+
+
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -167,9 +211,7 @@ def fused_mul_mat_gguf(
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
-        shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        weight = dequantize_gguf_weight(qweight, qweight_type, x.dtype)
         y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
@@ -191,16 +233,11 @@ def fused_moe_gguf(
     activation: str,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            silu_and_mul(out, x)
+            return silu_and_mul(x)
         elif activation == "gelu":
-            gelu_and_mul(out, x)
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
-        return out
+            return gelu_and_mul(x)
+        raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
@@ -398,16 +435,20 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             # (dim0_start, dim0_end, dim1_size)
             shard_offset_map = dict[str, tuple[int, int, int]]()
-            for idx in shard_id:
+            ordered_shard_ids = _ordered_gguf_shard_ids(shard_id)
+            cursor = 0
+            for idx in ordered_shard_ids:
                 id_in_container = shard_id_map[idx]
-                start = sum(x.size(0) for x in data_container[:id_in_container])
+                start = cursor
                 end = start + data_container[id_in_container].size(0)
                 size = data_container[id_in_container].size(1)
                 padded_data[start:end, :size] = data_container[id_in_container]
                 shard_offset_map[idx] = (start, end, size)
+                cursor = end
             qweight.data_container.clear()
             padded_param = Parameter(padded_data, requires_grad=False)
             set_weight_attrs(padded_param, vars(qweight))
+            padded_param.shard_id = ordered_shard_ids
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
@@ -421,7 +462,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            shard_id = _ordered_gguf_shard_ids(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:
@@ -528,9 +569,9 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -573,29 +614,9 @@ class GGUFUninitializedParameter(UninitializedParameter):
     data_container: list[torch.Tensor]
 
 
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def _ordered_gguf_shard_ids(shard_ids: list) -> list:
-    """Return checkpoint shards in the fused layer's logical output order."""
-    if len(shard_ids) == 3 and set(shard_ids) == {"q", "k", "v"}:
-        return ["q", "k", "v"]
-    if all(isinstance(shard_id, int) for shard_id in shard_ids) and set(
-        shard_ids
-    ) == set(range(len(shard_ids))):
-        return sorted(shard_ids)
-    return list(shard_ids)
-
-
-def dequantize_gguf_weight(
-    qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
-) -> torch.Tensor:
-    """Dequantize a packed GGUF matrix using its inferred logical shape."""
-    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
-    shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-    return ggml_dequantize(qweight, qweight_type, *shape, dtype)
-
-
+# =============================================================================
+# NPU-specific implementations for Ascend hardware
+# =============================================================================
 def ggml_dequantize_ascend(
     qweight: torch.Tensor,
     qweight_type: int,

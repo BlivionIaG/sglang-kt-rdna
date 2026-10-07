@@ -1,9 +1,7 @@
-from __future__ import annotations
 from typing import List, Optional
 
 import torch
 from torch.nn import Module
-import time
 
 _NPU_ARCH35_MXFP8_BLOCK_SIZE = 32
 

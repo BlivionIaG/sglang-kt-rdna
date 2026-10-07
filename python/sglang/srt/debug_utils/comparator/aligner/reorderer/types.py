@@ -1,18 +1,29 @@
-from __future__ import annotations
-from typing import Literal
+from typing import Annotated, Literal, Union
+
+from pydantic import Field
 
 from sglang.srt.debug_utils.comparator.utils import _FrozenBase
-from typing import Annotated, Literal, Union
 
 
 class ZigzagToNaturalParams(_FrozenBase):
     op: Literal["zigzag_to_natural"] = "zigzag_to_natural"
-    dim: int
+    dim_name: str
     cp_size: int
 
 
-ReordererParams = ZigzagToNaturalParams
+class ZigzagToNaturalThdParams(_FrozenBase):
+    op: Literal["zigzag_to_natural_thd"] = "zigzag_to_natural_thd"
+    dim_name: str
+    cp_size: int
+    seq_lens: list[int]  # unshard-ed per-seq token counts, e.g. [100, 64, 92]
+
+
+ReordererParams = Annotated[
+    Union[ZigzagToNaturalParams, ZigzagToNaturalThdParams],
+    Field(discriminator="op"),
+]
 
 
 class ReordererPlan(_FrozenBase):
+    type: Literal["reorderer"] = "reorderer"
     params: ReordererParams

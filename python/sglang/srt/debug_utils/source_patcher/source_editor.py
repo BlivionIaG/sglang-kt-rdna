@@ -1,4 +1,3 @@
-from __future__ import annotations
 from sglang.srt.debug_utils.source_patcher.types import EditSpec, PatchApplicationError
 
 

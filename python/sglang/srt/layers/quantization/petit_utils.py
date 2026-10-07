@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Optional
 
 import torch
@@ -48,7 +47,7 @@ def _check_petit_nvfp4_supported(
     if group_size is not None and group_size != 16:
         return (
             False,
-            "Petit currently only supports: group_size=16" " quantizations.",
+            "Petit currently only supports: group_size=16 quantizations.",
         )
     return (True, None)
 

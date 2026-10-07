@@ -1,5 +1,4 @@
 """Host-side transport of output-token sampling masks."""
-from __future__ import annotations
 
 import pickle
 import sys

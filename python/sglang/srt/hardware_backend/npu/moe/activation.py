@@ -1,4 +1,3 @@
-from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple
 
@@ -9,7 +8,6 @@ from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.runtime_context import get_parallel
-import time
 
 
 # =============================================================================

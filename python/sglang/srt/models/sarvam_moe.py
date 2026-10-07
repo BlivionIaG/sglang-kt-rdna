@@ -2,7 +2,6 @@
 - SarvamMLAForCausalLM (105B)
 - SarvamMoEForCausalLM (30B)
 """
-from __future__ import annotations
 
 import math
 from enum import IntEnum, auto

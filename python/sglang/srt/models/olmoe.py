@@ -1,4 +1,5 @@
-from __future__ import annotations
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +25,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -43,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, print_warning_once
 
 
@@ -63,7 +64,6 @@ class OlmoeMoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         layer_id: int = 0,
         prefix: str = "",
     ):
@@ -81,6 +81,7 @@ class OlmoeMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=False,
         )
 
@@ -106,7 +107,6 @@ class OlmoeMoE(nn.Module):
 
 
 class OlmoeAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -121,7 +121,7 @@ class OlmoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -195,7 +195,6 @@ class OlmoeAttention(nn.Module):
 
 
 class OlmoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -205,8 +204,8 @@ class OlmoeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 4096)
 
         self.self_attn = OlmoeAttention(
@@ -260,7 +259,6 @@ class OlmoeDecoderLayer(nn.Module):
 
 
 class OlmoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -310,7 +308,6 @@ class OlmoeModel(nn.Module):
 
 
 class OlmoeForCausalLM(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(

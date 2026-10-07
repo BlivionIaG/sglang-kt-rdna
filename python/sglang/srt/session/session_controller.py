@@ -27,7 +27,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.utils.common import log_info_on_rank0
-import copy
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache

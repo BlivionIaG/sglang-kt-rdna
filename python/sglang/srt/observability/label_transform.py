@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Optional
 
 _PRIORITY_MIN = 0

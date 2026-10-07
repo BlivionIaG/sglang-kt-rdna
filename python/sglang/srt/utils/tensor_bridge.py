@@ -23,7 +23,6 @@ from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import torch
-import copy
 
 if TYPE_CHECKING:
     import mlx.core as mx

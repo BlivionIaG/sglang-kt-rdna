@@ -1,6 +1,5 @@
 """Weight-free TileLang MQA operators for the simple QSA indexer;
 the torch implementations are the fallback and the reference."""
-from __future__ import annotations
 
 import math
 from typing import Optional

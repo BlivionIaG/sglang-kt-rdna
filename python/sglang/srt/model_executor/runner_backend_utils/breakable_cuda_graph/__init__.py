@@ -8,7 +8,6 @@ Public API (also reachable via the deeper module paths):
   - is_in_breakable_cuda_graph — runtime flag getter
 
 """
-from __future__ import annotations
 
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (  # noqa: F401
     BreakableCUDAGraph,

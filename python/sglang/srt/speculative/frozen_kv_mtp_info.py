@@ -22,7 +22,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-import time
 
 
 @dataclass(frozen=True)

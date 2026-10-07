@@ -1,4 +1,3 @@
-from __future__ import annotations
 # coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #

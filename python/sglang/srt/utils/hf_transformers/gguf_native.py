@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,7 +35,6 @@ from typing import Any, Callable, Dict, Optional
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
-from dataclasses import field, fields
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,

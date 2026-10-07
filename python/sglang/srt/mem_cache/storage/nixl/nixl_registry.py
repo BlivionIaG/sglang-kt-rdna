@@ -10,7 +10,6 @@ None on failure), and unwinds ``agent.deregister_memory`` plus any
 The host side is pre-registered up front by ``HiCacheNixl`` and is not
 touched per transfer.
 """
-from __future__ import annotations
 
 import logging
 import threading
@@ -18,7 +17,6 @@ from contextlib import contextmanager
 from typing import List, Optional
 
 from .nixl_utils import NixlFileManager
-import os
 
 logger = logging.getLogger(__name__)
 

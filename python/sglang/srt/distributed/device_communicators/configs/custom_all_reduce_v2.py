@@ -5,7 +5,6 @@ Thresholds and block counts come from sweeps of
 on the listed GPUs; ``get_all_reduce_config`` picks the table for the current
 arch and world size.
 """
-from __future__ import annotations
 
 from functools import cache
 from typing import NamedTuple, Optional

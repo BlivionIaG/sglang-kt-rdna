@@ -18,7 +18,6 @@ float4_e2m1fn_x2`` matmul with ``group_sizes=[0, 0, 32]``. Requires a recent
 torch_npu for the FP4 matmul on Ascend 950/A5 (older builds reject the NZ weight) —
 see ``NPUMXFP4W4A8OfflineLinearMethod`` for the version caveat.
 """
-from __future__ import annotations
 
 from typing import Dict, List, Optional
 

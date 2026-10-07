@@ -4,6 +4,8 @@ import inspect
 from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 
 import torch
+import torch.library
+
 from sglang.kernels.kernel_api_logging import debug_torch_op
 
 F = TypeVar("F", bound=Callable)
@@ -101,15 +103,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None
@@ -159,7 +161,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = getattr(torch.ops.sglang, self.op_name)
+            self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
         return self._impl
 
@@ -190,9 +192,6 @@ class CustomOpWrapper:
                 )
 
         return fake_impl
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
 
 
 def register_custom_op_from_extern(

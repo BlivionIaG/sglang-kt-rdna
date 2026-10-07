@@ -1,4 +1,6 @@
-from __future__ import annotations
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,9 +25,10 @@ import torch.nn as nn
 
 from sglang.srt.configs import DbrxConfig
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    fused_moe_npu,
 )
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -33,8 +36,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -49,9 +52,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+
+_is_npu = is_npu()
 
 
 class DbrxRouter(nn.Module):
@@ -66,7 +70,6 @@ class DbrxRouter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.d_model = config.d_model
         self.layer = ReplicatedLinear(
@@ -93,12 +96,13 @@ class DbrxExperts(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.top_k = config.ffn_config.moe_top_k
         self.d_model = config.d_model
@@ -111,6 +115,7 @@ class DbrxExperts(nn.Module):
         self.router = DbrxRouter(config, self.params_dtype)
         self.topk = TopK(
             self.top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
@@ -145,11 +150,12 @@ class DbrxExperts(nn.Module):
                 "weight_loader": self.weight_loader,
             },
         )
+        self.fused_moe_method = fused_moe if not _is_npu else fused_moe_npu
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
     ):
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         param_data = param.data
         shard_size = self.intermediate_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
@@ -180,7 +186,7 @@ class DbrxExperts(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
+        final_hidden_states = self.fused_moe_method(
             hidden_states,
             self.ws,
             self.w2s,
@@ -236,8 +242,7 @@ class DbrxAttention(nn.Module):
             is_neox_style=True,
         )
 
-        tp_world_size = get_tensor_model_parallel_world_size()
-        self.tp_size = tp_world_size
+        tp_world_size = get_parallel().tp_size
         assert self.total_num_heads % tp_world_size == 0
         self.num_heads = self.total_num_heads // tp_world_size
         if self.total_num_kv_heads >= tp_world_size:
@@ -331,7 +336,7 @@ class DbrxBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("norm_attn_norm", prefix),
         )
-        self.ffn = DbrxExperts(config, quant_config=quant_config)
+        self.ffn = DbrxExperts(config, layer_id, quant_config=quant_config)
 
     def forward(
         self,

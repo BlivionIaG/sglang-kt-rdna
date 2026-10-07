@@ -9,7 +9,6 @@ Kept out of ``moe_methods.py`` because ``unquant.py`` imports that module at
 module scope, so subclassing ``UnquantizedFusedMoEMethod`` there would be a
 circular import.
 """
-from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
@@ -19,7 +18,6 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoE
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-import time
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig

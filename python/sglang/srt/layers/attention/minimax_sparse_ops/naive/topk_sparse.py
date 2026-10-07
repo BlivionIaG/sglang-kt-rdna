@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2025 XunhaoLai. All rights reserved.
 
 from typing import Optional

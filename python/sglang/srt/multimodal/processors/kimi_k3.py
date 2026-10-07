@@ -7,7 +7,6 @@ images onto the checkpoint-configured background
 "after_resize"`` in preprocessor_config.json), instead of dropping alpha
 at load time.
 """
-from __future__ import annotations
 
 import functools
 import math
@@ -62,7 +61,6 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.utils import is_cuda
-import time
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:

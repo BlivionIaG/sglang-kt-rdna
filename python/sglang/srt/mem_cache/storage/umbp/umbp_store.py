@@ -5,7 +5,6 @@ Follows the same pattern as MooncakeStore:
 - Uses mem_pool_host.get_page_buffer_meta() for pointer/size extraction
 - Key suffix generation per TP rank / PP rank
 """
-from __future__ import annotations
 
 import logging
 import os
@@ -25,7 +24,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-import msgspec
 
 logger = logging.getLogger(__name__)
 

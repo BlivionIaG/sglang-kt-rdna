@@ -19,7 +19,6 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-import time
 
 logger = logging.getLogger(__name__)
 

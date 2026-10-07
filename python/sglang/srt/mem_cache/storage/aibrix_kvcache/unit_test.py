@@ -8,7 +8,6 @@ from aibrix_kvcache_storage import AibrixKVCacheStorage
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 logging.basicConfig(

@@ -1,5 +1,4 @@
 """Multimodal embedding scheduling and cache coordination."""
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -14,7 +13,6 @@ from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
-import copy
 
 _is_hip = is_hip()
 _is_npu = is_npu()

@@ -1,14 +1,13 @@
-from __future__ import annotations
 # TODO: also move pad_input_ids into this module
 import importlib
 import inspect
 import logging
 import pkgutil
 
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import get_model
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -43,24 +42,6 @@ def import_processors(package_name: str, overwrite: bool = False):
                     PROCESSOR_MAPPING[arch] = cls
 
 
-def get_mm_processor(
-    hf_config, server_args: ServerArgs, processor, transport_mode, **kwargs
-) -> BaseMultimodalProcessor:
-    for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-        if model_cls.__name__ in hf_config.architectures:
-            return processor_cls(
-                hf_config, server_args, processor, transport_mode, **kwargs
-            )
-
-    raise ValueError(
-        f"No processor registered for architecture: {hf_config.architectures}.\n"
-        f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
-    )
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
 def get_mm_processor_cls(hf_config, model_config=None):
     """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
     architecture has no registered processor."""
@@ -89,3 +70,20 @@ def get_mm_processor_cls(hf_config, model_config=None):
         return TransformersAutoMultimodalProcessor
 
     return None
+
+
+def get_mm_processor(
+    hf_config,
+    server_args: ServerArgs,
+    processor,
+    transport_mode,
+    model_config=None,
+    **kwargs,
+) -> BaseMultimodalProcessor:
+    processor_cls = get_mm_processor_cls(hf_config, model_config)
+    if processor_cls is None:
+        raise ValueError(
+            f"No processor registered for architecture: {hf_config.architectures}.\n"
+            f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+        )
+    return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)

@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,7 +55,12 @@ class InternLM2ForRewardModel(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.v_head(last_token_hidden)
-        return EmbeddingPoolerOutput(scores)
+        return EmbeddingPoolerOutput(
+            embeddings=scores,
+            pooled_hidden_states=(
+                last_token_hidden if forward_batch.return_pooled_hidden_states else None
+            ),
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return InternLM2ForCausalLM.load_weights(self, weights)

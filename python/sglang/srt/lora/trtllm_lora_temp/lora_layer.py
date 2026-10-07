@@ -18,7 +18,6 @@ trtllm path instead of ~70 lines of inlined logic.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-import time
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

@@ -11,7 +11,6 @@ from typing import Any, Dict, List
 import msgspec
 
 from sglang.srt.utils.msgspec_utils import msgspec_struct_pydantic_core_schema
-import struct
 
 
 class KvHintAction(msgspec.Struct, frozen=True, kw_only=True):

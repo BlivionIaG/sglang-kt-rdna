@@ -4,7 +4,6 @@ This module is deliberately declarative.  Server-argument resolution, model
 implementations, documentation, and benchmarks can consume the same contract
 without each reimplementing a partial list of embedding architectures.
 """
-from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum

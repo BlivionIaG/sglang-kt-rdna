@@ -2,7 +2,6 @@
 
 Shared by KimiVLImageProcessor and KimiK2_5VLImageProcessor.
 """
-from __future__ import annotations
 
 from typing import Optional, Union
 

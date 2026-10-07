@@ -122,7 +122,6 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
-import time
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta

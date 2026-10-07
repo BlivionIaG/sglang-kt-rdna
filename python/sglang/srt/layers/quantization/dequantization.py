@@ -1,7 +1,6 @@
 """
 Utilities to manage the dequantization of weights.
 """
-from __future__ import annotations
 
 from typing import Optional
 

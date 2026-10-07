@@ -4,7 +4,6 @@ Ollama-compatible API serving handlers.
 This module provides handlers that convert Ollama API requests to SGLang's
 internal format and return Ollama-compatible responses.
 """
-from __future__ import annotations
 
 import time
 from datetime import datetime, timezone

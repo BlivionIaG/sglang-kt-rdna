@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Kimi-K3 Attention Residual: snapshot bank + aggregation.
 #

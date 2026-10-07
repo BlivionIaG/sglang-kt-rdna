@@ -7,7 +7,6 @@ them and a captured aclgraph sees stable tensors; decode only does index_select.
 mscale: cos/sin stored in freqs_cis must already be pre-multiplied by the YARN
 mscale at precompute time (see precompute_freqs_cis). We just read what's stored.
 """
-from __future__ import annotations
 
 from typing import Optional
 

@@ -1,5 +1,4 @@
 """Inference-only full-sharing Dots3 MTP / NextN draft model."""
-from __future__ import annotations
 
 import logging
 from collections.abc import Iterable

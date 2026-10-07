@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Kimi-K3 multimodal model: KimiLinear text backbone + MoonViT3d vision tower.
 # Based on kimi_linear.py with K3-specific features:
 #   - Attention Residual (attn_res_block_size)

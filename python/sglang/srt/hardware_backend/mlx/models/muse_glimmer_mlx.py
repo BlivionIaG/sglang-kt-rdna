@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -115,7 +114,6 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import KVCache
-import copy
 
 # Version of the packaged (fused/folded) weight layout this file understands.
 MUSE_GLIMMER_MLX_FORMAT_VERSION = 1

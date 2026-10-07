@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Adapted from the DeepSeek-V4 release reference implementation.
 """
 DeepSeek-V4 Encoding
@@ -48,9 +47,7 @@ assistant_msg_template: str = "{reasoning}{content}{tool_calls}" + eos_token
 assistant_msg_wo_eos_template: str = "{reasoning}{content}{tool_calls}"
 thinking_template: str = "{reasoning_content}"
 
-response_format_template: str = (
-    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
-)
+response_format_template: str = "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
 tool_call_template: str = (
     '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
 )
@@ -160,7 +157,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     Encode tool call arguments into DSML parameter format.
 
     Args:
-        tool_call: Dict with "name" and "arguments" (JSON string) keys.
+        tool_call: Dict with "name" and "arguments" keys.
 
     Returns:
         DSML-formatted parameter string.
@@ -168,10 +165,14 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call["arguments"]
+    arguments = (
+        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    )
+    if not isinstance(arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
@@ -242,6 +243,16 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
             last_user_index = idx
             break
     return last_user_index
+
+
+def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) -> None:
+    """Set `task` on the most recent user/developer message; raise if none exists."""
+    idx = find_last_user_index(messages)
+    if idx == -1:
+        raise ValueError(
+            "`task` requires at least one message with role='user' or 'developer'."
+        )
+    messages[idx]["task"] = task
 
 
 # ============================================================
@@ -434,9 +445,9 @@ def render_message(
     task = messages[index].get("task")
     if task is not None:
         # Task special token for internal classification tasks
-        assert (
-            task in VALID_TASKS
-        ), f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}"
+        assert task in VALID_TASKS, (
+            f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}"
+        )
         task_sp_token = DS_TASK_SP_TOKENS[task]
 
         if task != "action":
@@ -830,9 +841,9 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
             index, text, [thinking_end_token, tool_calls_start_token]
         )
         reasoning_content = content_delta
-        assert (
-            stop_token == thinking_end_token
-        ), "Invalid thinking format: missing </think>"
+        assert stop_token == thinking_end_token, (
+            "Invalid thinking format: missing </think>"
+        )
 
     index, content_delta, stop_token = _read_until_stop(
         index, text, [eos_token, tool_calls_start_token]
@@ -861,9 +872,9 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
         thinking_end_token,
         dsml_token,
     ]:
-        assert (
-            sp_token not in summary_content and sp_token not in reasoning_content
-        ), f"Unexpected special token '{sp_token}' in content"
+        assert sp_token not in summary_content and sp_token not in reasoning_content, (
+            f"Unexpected special token '{sp_token}' in content"
+        )
 
     return {
         "role": "assistant",
@@ -871,16 +882,3 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
         "reasoning_content": reasoning_content,
         "tool_calls": tool_calls_to_openai_format(tool_calls),
     }
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) -> None:
-    """Set `task` on the most recent user/developer message; raise if none exists."""
-    idx = find_last_user_index(messages)
-    if idx == -1:
-        raise ValueError(
-            "`task` requires at least one message with role='user' or 'developer'."
-        )
-    messages[idx]["task"] = task

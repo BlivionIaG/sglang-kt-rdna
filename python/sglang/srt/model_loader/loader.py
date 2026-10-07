@@ -1,32 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/model_loader/loader.py
 
 from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
+import concurrent.futures
 import dataclasses
 import fnmatch
 import gc
 import glob
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import socket
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
 from typing import (
+    TYPE_CHECKING,
     Any,
     Dict,
     Generator,
     Iterable,
     List,
     Optional,
-    Set,
-    TYPE_CHECKING,
     Tuple,
     Union,
     cast,
@@ -36,12 +41,20 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+    get_server_args,
+)
+from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
 try:
@@ -59,9 +72,6 @@ from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-from functools import reduce
-from enum import auto
-from copy import copy
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.connector import (
@@ -71,20 +81,25 @@ from sglang.srt.connector import (
 )
 from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.moe.utils import (
+    install_shared_experts_fusion_decision,
+)
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
-    post_load_weights,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -92,6 +107,8 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    CheckpointFilePrefetchHandle,
+    _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -101,6 +118,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
+    initialize_capture_safe_weights,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
@@ -109,6 +127,7 @@ from sglang.srt.model_loader.weight_utils import (
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -117,7 +136,7 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-import hashlib
+from sglang.srt.utils.common import temp_set_env
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -134,61 +153,15 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
         yield module
         return
 
-    original_infos: Dict[str, Dict] = {}
-
-    # Store original device states and move parameters to GPU if they're on CPU
-    for name, p in module.named_parameters():
-        if p.device.type == "cpu":
-            original_data = p.data
-            device_data = p.data.to(target_device)
-            original_infos[name] = dict(
-                device=p.device,
-                original_data=original_data,
-                device_data=device_data,
-            )
-            p.data = device_data
-        # Parameters already on target device are not touched
-
-    try:
+    with stage_module_for_post_load(
+        module,
+        target_device,
+        pin_memory=target_device.type != "cpu" and is_pin_memory_available(),
+    ):
         yield module
-
-    finally:
-        # Restore parameters to their original devices, ignoring new parameters
-        pin_memory = is_pin_memory_available()
-        for name, p in module.named_parameters():
-            if name in original_infos:
-                original_info = original_infos[name]
-                device_data = original_info["device_data"]
-                original_data = original_info["original_data"]
-                original_device: torch.device = original_info["device"]
-
-                if (
-                    (device_data.device == p.data.device)
-                    and (device_data.data_ptr() == p.data.data_ptr())
-                    and (device_data.shape == p.data.shape)
-                    and (device_data.dtype == p.data.dtype)
-                ):
-                    original_data.copy_(p.data.to(original_data.device))
-                    p.data = original_data
-                elif original_device.type == "cpu":
-                    # `torch.empty_like` does not support `pin_memory` argument
-                    cpu_data = torch.empty_strided(
-                        size=p.data.size(),
-                        stride=p.data.stride(),
-                        dtype=p.data.dtype,
-                        layout=p.data.layout,
-                        device="cpu",
-                        pin_memory=pin_memory,
-                    )
-                    cpu_data.copy_(p.data)
-                    p.data = cpu_data
-                else:
-                    p.data = p.data.to(original_device)
-        # New parameters or parameters already on target device are untouched
 
 
 logger = logging.getLogger(__name__)
@@ -202,6 +175,15 @@ def _get_quantization_config(
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
+    # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
+    if model_config.quantization == "quark":
+        packed_modules_mapping.update(
+            {
+                "gate_up_proj": ["gate_proj", "up_proj"],
+                "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+            }
+        )
+
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -220,6 +202,7 @@ def _get_quantization_config(
                         "q_a_proj",
                         "kv_a_proj_with_mqa",
                     ],
+                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
                 },
             }
         )
@@ -231,6 +214,38 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        if isinstance(quant_config, Fp8Config):
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
+            quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
+            nvfp4_meta = model_config.nvfp4_moe_meta
+            if nvfp4_meta is not None:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    HybridFp8NvFp4Config,
+                    ModelOptFp4Config,
+                )
+
+                # Draft experts serialized under mtp.* remain source MXFP4.
+                # NextN exposes them as model.decoder.*; DSpark as stages.*.
+                nvfp4_exclude_modules = list(
+                    nvfp4_meta.get("exclude_modules") or []
+                ) + ["model.decoder.*", "stages.*"]
+                nvfp4_config = ModelOptFp4Config(
+                    is_checkpoint_nvfp4_serialized=True,
+                    group_size=int(nvfp4_meta["group_size"]),
+                    exclude_modules=nvfp4_exclude_modules,
+                    packed_modules_mapping=quant_config.packed_modules_mapping,
+                )
+                quant_config = HybridFp8NvFp4Config(
+                    fp8_config=quant_config, nvfp4_config=nvfp4_config
+                )
+        elif quant_config.get_name() == "humming":
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
 
@@ -251,7 +266,11 @@ def _get_quantization_config(
                 f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}"
             )
-        hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+        get_hf_to_sglang_mapper = getattr(model_class, "get_hf_to_sglang_mapper", None)
+        if get_hf_to_sglang_mapper is not None:
+            hf_to_sglang_mapper = get_hf_to_sglang_mapper(model_config.hf_config)
+        else:
+            hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
         # pass mappings by reference to quant_config
         if hf_to_sglang_mapper is not None and quant_config is not None:
             quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
@@ -266,6 +285,13 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    # Decide the shared-experts-fusion question here, once per runner, before any
+    # layer exists: this is the only place a model class is instantiated, and it
+    # is the last point that still knows both the checkpoint's quantization and
+    # (through the build scope) whether this runner is a draft.
+    install_shared_experts_fusion_decision(
+        model_class, model_config.hf_config, quant_config
+    )
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
@@ -279,11 +305,38 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    return model_class(**kwargs)
+    model = model_class(**kwargs)
+    check_stage_producers(model)
+    return model
+
+
+def post_load_weights(model: nn.Module) -> None:
+    # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
+    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
+    # would normally do it internally. NextN subclasses override the method to fill in
+    # `is_nextn=True`, so the loader doesn't need to know.
+    if hasattr(model, "post_load_weights"):
+        model.post_load_weights()
+
+
+def _modules_with_quant_method(model: nn.Module):
+    from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+    for _, module in model.named_modules():
+        # LoRA wrappers forward quant_method but do not own the packed params
+        if isinstance(module, BaseLayerWithLoRA):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            yield module, quant_method
 
 
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
+
+    # Rank-local weight memory already resident when ModelRunner sampled its
+    # pre-load baseline. Shared allocations must be reported by only one loader.
+    preloaded_weights_bytes: int = 0
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
@@ -302,6 +355,28 @@ class BaseModelLoader(ABC):
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
+
+
+def _validate_default_loader_extra_config(
+    *, extra_config: dict, load_format: LoadFormat
+) -> None:
+    allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format == LoadFormat.FASTSAFETENSORS:
+        allowed_keys.add("enable_gds")
+        if "enable_gds" in extra_config and not isinstance(
+            extra_config["enable_gds"], bool
+        ):
+            raise ValueError(
+                "enable_gds in --model-loader-extra-config must be a boolean"
+            )
+
+    unexpected_keys = set(extra_config.keys()) - allowed_keys
+    if unexpected_keys:
+        raise ValueError(
+            f"Unexpected extra config keys for load format "
+            f"{load_format}: "
+            f"{unexpected_keys}"
+        )
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -328,7 +403,13 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
-        model_config: Optional["ModelConfig"] = None
+        allow_patterns_overrides: Optional[list[str]] = None
+        """If defined, weights will load exclusively using these patterns.
+
+        Used by checkpoints whose weights live in subfolders (e.g. the Cosmos3
+        diffusers-style layout with ``transformer/`` and ``vision_encoder/``)."""
+
+        model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
         @classmethod
@@ -338,24 +419,30 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config.revision,
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                allow_patterns_overrides=getattr(
+                    model, "allow_patterns_overrides", None
+                ),
                 model_config=model_config,
             )
+
+    @dataclasses.dataclass(frozen=True)
+    class ResolvedSource:
+        """A weight source whose local checkpoint files are already resolved."""
+
+        source: DefaultModelLoader.Source
+        hf_folder: str
+        weight_files: Tuple[str, ...]
+        use_safetensors: bool
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
-        unexpected_keys = set(extra_config.keys()) - allowed_keys
-
-        if unexpected_keys:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{unexpected_keys}"
-            )
+        _validate_default_loader_extra_config(
+            extra_config=load_config.model_loader_extra_config,
+            load_format=load_config.load_format,
+        )
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -384,7 +471,11 @@ class DefaultModelLoader(BaseModelLoader):
         return model
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        fall_back_to_pt: bool,
+        allow_patterns_overrides: Optional[list[str]] = None,
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -424,6 +515,9 @@ class DefaultModelLoader(BaseModelLoader):
         if fall_back_to_pt:
             allow_patterns += ["*.pt"]
 
+        if allow_patterns_overrides is not None:
+            allow_patterns = allow_patterns_overrides
+
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
@@ -435,18 +529,18 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             hf_folder = model_name_or_path
 
-        server_args = get_global_server_args()
-        if server_args and server_args.model_checksum is not None:
+        server_args = get_server_args()
+        if server_args and get_model().model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
-            checksums_source = server_args.model_checksum or model_name_or_path
+            checksums_source = get_model().model_checksum or model_name_or_path
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
-                if pattern == "*.safetensors":
+                if pattern.endswith(".safetensors"):
                     use_safetensors = True
                 break
 
@@ -464,7 +558,12 @@ class DefaultModelLoader(BaseModelLoader):
                     revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                allow_patterns=(
+                    allow_patterns if allow_patterns_overrides is not None else None
+                ),
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -474,25 +573,55 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        # Sort and optionally stagger weight files (see SGLANG_SORT_WEIGHT_FILES).
+        # k=-1: no sort; k=0: sort only; k>0: sort + stagger by (tp_rank*k).
+        k = envs.SGLANG_SORT_WEIGHT_FILES.get()
+        if k >= 0:
+            hf_weights_files.sort()
+            if k > 0:
+                tp_size = get_parallel().tp_size
+                if tp_size > 1:
+                    tp_rank = get_parallel().tp_rank
+                    group_size = tp_size * k
+                    staggered: List[str] = []
+                    for i in range(0, len(hf_weights_files), group_size):
+                        group = hf_weights_files[i : i + group_size]
+                        n = len(group)
+                        staggered.extend(group[(j + tp_rank * k) % n] for j in range(n))
+                    hf_weights_files = staggered
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self,
+        source: Source,
+        *,
+        resolved_source: Optional[ResolvedSource] = None,
+        startup_prefetch_started: bool = False,
+        startup_prefetch_active: bool = False,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        use_multithread = extra_config.get("enable_multithread_load", False)
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path, source.revision, source.fall_back_to_pt
-        )
+        use_multithread = extra_config.get("enable_multithread_load", True)
 
-        if use_safetensors and source.model_config is not None:
-            hf_weights_files = maybe_add_mtp_safetensors(
-                hf_weights_files,
-                hf_folder,
-                "model.safetensors.index.json",
-                source.model_config.hf_config,
+        if resolved_source is None:
+            hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+                source.allow_patterns_overrides,
             )
+            if use_safetensors and source.model_config is not None:
+                hf_weights_files = maybe_add_mtp_safetensors(
+                    hf_weights_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+        else:
+            hf_folder = resolved_source.hf_folder
+            hf_weights_files = list(resolved_source.weight_files)
+            use_safetensors = resolved_source.use_safetensors
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -504,13 +633,53 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weight_loader_disable_mmap = (
-                get_global_server_args().weight_loader_disable_mmap
+            weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
+            configured_prefetch = get_model().weight_loader_prefetch_checkpoints
+            start_iterator_prefetch = (
+                configured_prefetch and not startup_prefetch_started
+            )
+            concurrent_prefetch_active = (
+                startup_prefetch_active or start_iterator_prefetch
+            )
+            prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
+            weight_loader_drop_cache_after_load = (
+                get_model().weight_loader_drop_cache_after_load
             )
 
+            # Prefetch and multi-threaded loading both read the same shards,
+            # competing for I/O on shared/network storage. When prefetch is
+            # active (mmap path, not FASTSAFETENSORS) and the user didn't
+            # explicitly request multi-threaded loading, fall back to the
+            # single-threaded loader and let prefetch feed the page cache.
+            # Setting enable_multithread_load or num_threads in
+            # --model-loader-extra-config opts out (the latter is consumed
+            # only by the multi-threaded iterator, so it signals intent);
+            # e.g. local NVMe, where prefetch is a no-op and multi-threading
+            # helps.
+            if (
+                concurrent_prefetch_active
+                and not weight_loader_disable_mmap
+                and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
+                and use_multithread
+                and not (
+                    {"enable_multithread_load", "num_threads"} & extra_config.keys()
+                )
+            ):
+                logger.debug(
+                    "Checkpoint prefetching is active; falling "
+                    "back to single-threaded weight loading to avoid I/O "
+                    "oversubscription with the prefetch threads. Set "
+                    "enable_multithread_load=true in --model-loader-extra-config "
+                    "to keep multi-threaded loading."
+                )
+                use_multithread = False
+
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    enable_gds=enable_gds,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -519,10 +688,17 @@ class DefaultModelLoader(BaseModelLoader):
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
+                    prefetch=start_iterator_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
-                    hf_weights_files, disable_mmap=weight_loader_disable_mmap
+                    hf_weights_files,
+                    disable_mmap=weight_loader_disable_mmap,
+                    prefetch=start_iterator_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
 
         else:
@@ -549,10 +725,12 @@ class DefaultModelLoader(BaseModelLoader):
     @classmethod
     def _filter_mtp_weights(
         cls, weights_iterator, prefix: str, draft_model_idx: int
-    ) -> Tuple[Tuple[str, torch.Tensor], ...]:
-        """Filter MTP (Multi-Token Prediction) weights to keep only the
-        specified draft model layer and remap it to layer 0."""
-        filtered_weights = []
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Filter MTP weights to keep only the specified draft model layer
+        and remap it to layer 0. Yields lazily so the upstream buffered
+        iterator's sliding window actually bounds CPU memory — eager
+        materialization caused page-reclaim hangs on large MoE checkpoints
+        with multi-layer EAGLE."""
         for name, tensor in weights_iterator:
             match = cls._MTP_PATTERN.match(name)
             if match is not None:
@@ -562,8 +740,7 @@ class DefaultModelLoader(BaseModelLoader):
                 new_name = name.replace(match.group(), "model.mtp.layers.0.")
             else:
                 new_name = name
-            filtered_weights.append((prefix + new_name, tensor))
-        return tuple(filtered_weights)
+            yield (prefix + new_name, tensor)
 
     def _get_all_weights(
         self,
@@ -579,6 +756,144 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
+
+    def resolve_model_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Tuple[ResolvedSource, ...]:
+        """Resolve all checkpoint files before background startup prefetching."""
+        sources = [DefaultModelLoader.Source.init_new(model_config, model)]
+        sources.extend(
+            cast(
+                Iterable[DefaultModelLoader.Source],
+                getattr(model, "secondary_weights", ()),
+            )
+        )
+
+        resolved_sources = []
+        for source in sources:
+            hf_folder, weight_files, use_safetensors = self._prepare_weights(
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+                source.allow_patterns_overrides,
+            )
+            if use_safetensors and source.model_config is not None:
+                weight_files = maybe_add_mtp_safetensors(
+                    weight_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+            resolved_sources.append(
+                DefaultModelLoader.ResolvedSource(
+                    source=source,
+                    hf_folder=hf_folder,
+                    weight_files=tuple(weight_files),
+                    use_safetensors=use_safetensors,
+                )
+            )
+        return tuple(resolved_sources)
+
+    @staticmethod
+    def start_checkpoint_prefetch(
+        resolved_sources: Tuple[ResolvedSource, ...],
+        *,
+        num_threads: int,
+    ) -> CheckpointFilePrefetchHandle:
+        """Start CPU-only page-cache staging for already-resolved sources."""
+        if not all(source.use_safetensors for source in resolved_sources):
+            raise ValueError(
+                "Startup weight-loading overlap requires safetensors checkpoints"
+            )
+        weight_files = sorted(
+            {path for source in resolved_sources for path in source.weight_files}
+        )
+        return _prefetch_all_checkpoints(weight_files, num_threads=num_threads)
+
+    def initialize_model_for_startup(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Build the final model structure and GPU parameter storage."""
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        return model
+
+    def prepare_model_for_capture(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+    ) -> nn.Module:
+        """Initialize final storage with values safe for graph warmup.
+
+        Mirrors the post-initialization sequence of ``DummyModelLoader``, except
+        that parameters are filled with a detectable sentinel instead of random
+        values so ``commit_model_weights`` can prove every one of them was
+        replaced.
+
+        Note that this runs ``process_weights_after_loading`` on the sentinel
+        values, and ``commit_model_weights`` runs it again on the real weights,
+        so overlap invokes it once more than the serial path. That is safe for
+        the currently supported matrix, where the CUDA unquantized path is a
+        no-op, and it is not covered by the storage manifest, which proves
+        tensor identity rather than idempotence. Any quantization method that
+        mutates weights in place therefore has to be evaluated here before its
+        configuration is added to the supported set.
+        """
+        with set_default_torch_dtype(model_config.dtype):
+            initialize_capture_safe_weights(model)
+            post_load_weights(model)
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None:
+                    continue
+                if (
+                    hasattr(module, "is_weights_quantized")
+                    and module.is_weights_quantized()
+                ):
+                    continue
+                quant_method.process_weights_after_loading(module)
+        return model.eval()
+
+    def commit_model_weights(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        resolved_sources: Tuple[ResolvedSource, ...],
+        target_device: torch.device,
+        startup_prefetch_active: bool,
+    ) -> None:
+        """Load real checkpoint values into a capture-ready model."""
+
+        def weights_iterator():
+            for resolved_source in resolved_sources:
+                yield from self._get_weights_iterator(
+                    resolved_source.source,
+                    resolved_source=resolved_source,
+                    startup_prefetch_started=True,
+                    startup_prefetch_active=startup_prefetch_active,
+                )
+
+        with set_default_torch_dtype(model_config.dtype):
+            self.load_weights_and_postprocess(
+                model,
+                weights_iterator(),
+                target_device,
+            )
+        self.counter_after_loading_weights = time.perf_counter()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -597,11 +912,19 @@ class DefaultModelLoader(BaseModelLoader):
                 "Please install it with: pip install accelerate"
             )
 
-        hf_config = AutoConfig.from_pretrained(
-            model_config.model_path,
-            trust_remote_code=True,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                model_config.model_path,
+                trust_remote_code=True,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+        except (KeyError, ValueError):
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            hf_config = get_config(
+                model_config.model_path,
+                trust_remote_code=True,
+            )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
             model = AutoModelForCausalLM.from_config(
@@ -630,6 +953,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         model = AutoModelForCausalLM.from_pretrained(
             model_config.model_path,
+            config=hf_config,
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
@@ -688,20 +1012,85 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        DefaultModelLoader.load_weights_only(model, weights, target_device)
+        DefaultModelLoader.postprocess_weights(model, target_device)
 
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            peak_memory = torch.cuda.max_memory_allocated()
+            logger.debug(
+                "Peak GPU memory before loading weights: %s GiB",
+                f"{peak_memory / GIB_BYTES:.3f}",
+            )
+            memory_start = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+
+        quant_config = getattr(model, "quant_config", None)
+        is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_modelopt_fp4_online = (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not quant_config.is_checkpoint_nvfp4_serialized
+        )
+        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        if is_mxfp8:
+            weights = (
+                (
+                    f"{name}_inv" if name.endswith(".weight_scale") else name,
+                    loaded_weight,
+                )
+                for name, loaded_weight in weights
+            )
+
+        if is_nvfp4_online or is_modelopt_fp4_online:
+            # Scope exact FP4 quantization math to load-time conversion only;
+            # restore the original environment before serving starts.
+            with temp_set_env(
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_NVFP4_4OVER6="1",
+                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
+                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
+                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
+            ):
+                model.load_weights(weights)
+            if target_device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        else:
+            model.load_weights(weights)
+
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            memory_end = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+            logger.debug(
+                "Memory increase during load_weights: %s GiB",
+                f"{memory_start - memory_end:.3f}",
+            )
+
+    @staticmethod
+    def postprocess_weights(model, target_device):
+        for module, quant_method in _modules_with_quant_method(model):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        """Undo in-place quant packing so fresh weights can be loaded."""
+        for module, quant_method in _modules_with_quant_method(model):
+            # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
+            if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-                if _is_npu:
-                    torch.npu.empty_cache()
+                    quant_method.restore_weights_before_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -719,10 +1108,6 @@ class LayeredModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.server_args import get_global_server_args
-
-        torchao_config = get_global_server_args().torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -763,17 +1148,9 @@ class LayeredModelLoader(DefaultModelLoader):
                     fqn_path,
                     weights,
                 )
-                # Quantize weights if applicable
-                if torchao_config and "proj" in fqn_path:
-                    # Note: `None` here is needed to indicate no filter, see
-                    # `apply_torchao_config_to_model` for details.
-                    apply_torchao_config_to_model(module, torchao_config, None)
 
             # Start calling on root module
             fill_module(model, [], weights)
-
-        if torchao_config:
-            model.torchao_applied = True
 
         return model.eval()
 
@@ -973,8 +1350,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         if scale_info is None:
             return
         # Get tp rank and size
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_parallel().tp_rank
+        tp_size = get_parallel().tp_size
 
         def _get_tp_sharded_scale(full_scale_tensor):
             """Get tp sharded scale from full scale tensor"""
@@ -1109,7 +1486,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.fp8_kernel import (
+            from sglang.kernels.ops.quantization.fp8_kernel import (
                 per_token_group_quant_fp8,
             )
 
@@ -1181,7 +1558,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         del current_param_data
         if is_last_update:
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
         logger.info("[QuantizedRL] Reload complete")
         return updated_param_names, is_last_update
@@ -1287,6 +1664,12 @@ class DummyModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+
+            post_load_weights(model)
+
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
@@ -1297,12 +1680,6 @@ class DummyModelLoader(BaseModelLoader):
                     ):
                         continue
                     quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-
-            post_load_weights(model, model_config)
 
         return model.eval()
 
@@ -1352,6 +1729,15 @@ class ShardedStateLoader(BaseModelLoader):
         result: Dict[str, torch.Tensor] = {}
         for group in same_storage_groups.values():
             for k, t in group:
+                if not t.is_contiguous():
+                    # End-pointer dedup assumes a flat view; non-contiguous
+                    # tensors (e.g. produced by
+                    # ``.transpose(...).contiguous().transpose(...)`` in some
+                    # quant ``post_load_weights`` paths) cannot be flattened
+                    # via ``view(-1)``. Include them directly; downstream
+                    # writers call ``.contiguous()`` before save.
+                    result[k] = t
+                    continue
                 a, b = t.data_ptr(), get_end_ptr(t)
                 for k2, t2 in group:
                     if not t2.is_contiguous():
@@ -1392,8 +1778,6 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
-
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
         )
@@ -1407,7 +1791,7 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
-            rank = get_tensor_model_parallel_rank()
+            rank = get_parallel().tp_rank
             pattern = os.path.join(
                 local_model_path,
                 self.pattern.format(rank=rank, part="*"),
@@ -1445,7 +1829,7 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-            post_load_weights(model, model_config)
+            post_load_weights(model)
 
         return model.eval()
 
@@ -1458,11 +1842,9 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> None:
         from safetensors.torch import save_file
 
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
-
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
-        rank = get_tensor_model_parallel_rank()
+        rank = get_parallel().tp_rank
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -1486,1369 +1868,6 @@ class ShardedStateLoader(BaseModelLoader):
                 state_dict_part,
                 os.path.join(path, filename),
             )
-
-
-class BitsAndBytesModelLoader(BaseModelLoader):
-    """Model loader to load model weights with BitAndBytes quantization."""
-
-    possible_config_file_names = ["adapter_config.json"]
-
-    default_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-        ".fc1.",
-        ".fc2.",
-        ".dense.",
-        ".query_key_value.",
-        ".qkv_proj.",
-        ".dense_h_to_4h.",
-        ".dense_4h_to_h.",
-        ".out_proj.",
-    ]
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-
-        # we don't need to quantize the whole model, only the target modules
-        # that are specified in the adapter config file. If the adapter config
-        # file is not provided, we will quantize the default modules.
-        if (
-            not load_config.model_loader_extra_config
-            or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config
-        ):
-            self.target_modules = []
-            return
-
-        qlora_adapter = load_config.model_loader_extra_config[
-            "qlora_adapter_name_or_path"
-        ]
-
-        config_file_path = self._get_config_file(qlora_adapter)
-
-        with open(config_file_path, "r") as f:
-            config = json.load(f)
-            self.target_modules = config["target_modules"]
-
-    def _get_config_file(self, qlora_adapter: str) -> str:
-        is_local = os.path.isdir(qlora_adapter)
-        config_file_path = None
-        if is_local:
-            for file in self.possible_config_file_names:
-                config_file_path = os.path.join(qlora_adapter, file)
-                if os.path.exists(config_file_path):
-                    break
-        else:
-            hf_api = HfApi()
-            repo_files = hf_api.list_repo_files(repo_id=qlora_adapter)
-            for file in self.possible_config_file_names:
-                if file in repo_files:
-                    config_file_path = hf_hub_download(
-                        repo_id=qlora_adapter, filename=file
-                    )
-                    break
-
-        if not config_file_path:
-            raise ValueError(f"Cannot find adapter config file in {qlora_adapter}")
-
-        return config_file_path
-
-    def _get_weight_files(
-        self,
-        model_name_or_path: str,
-        allowed_patterns: List[str],
-        revision: Optional[str] = None,
-    ) -> Tuple[List[str], str]:
-        """Retrieve weight files. Download the files if necessary.
-
-        Return the weight files and the file pattern."""
-        is_local = os.path.isdir(model_name_or_path)
-
-        if is_local:
-            for pattern in allowed_patterns:
-                weight_files = glob.glob(os.path.join(model_name_or_path, pattern))
-                if weight_files:
-                    return weight_files, pattern
-        else:
-            hf_api = HfApi()
-            repo_files = hf_api.list_repo_files(repo_id=model_name_or_path)
-            for pattern in allowed_patterns:
-                matching_files = fnmatch.filter(repo_files, pattern)
-                if matching_files:
-                    hf_folder = download_weights_from_hf(
-                        model_name_or_path,
-                        self.load_config.download_dir,
-                        [pattern],
-                        revision,
-                        ignore_patterns=self.load_config.ignore_patterns,
-                    )
-                    return glob.glob(os.path.join(hf_folder, pattern)), pattern
-
-        raise RuntimeError(f"No model weights found in: `{model_name_or_path}`")
-
-    def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str]
-    ) -> Tuple[List[str], bool]:
-        """Prepare weight files for the model."""
-
-        allowed_patterns = ["*.safetensors", "*.bin", "*.pt"]
-
-        hf_weights_files, matched_pattern = self._get_weight_files(
-            model_name_or_path, allowed_patterns, revision
-        )
-
-        if matched_pattern != "*.safetensors":
-            hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
-
-        if len(hf_weights_files) == 0:
-            raise RuntimeError(
-                f"Cannot find any model weights with `{model_name_or_path}`"
-            )
-
-        return hf_weights_files, matched_pattern == "*.safetensors"
-
-    def _hf_weight_iter(self, hf_weights_files, use_safetensors: bool):
-        if use_safetensors:
-            return safetensors_weights_iterator(hf_weights_files)
-        else:
-            return pt_weights_iterator(hf_weights_files)
-
-    def _get_quantized_weights_iterator(
-        self,
-        model_name_or_path: str,
-        revision: Optional[str],
-        pre_quant: bool,
-        load_8bit: bool,
-    ) -> Tuple[Generator[Tuple[str, torch.Tensor], None, None], Dict[str, Any]]:
-        """Get an iterator to the model weights with bitsandbytes quantization,
-        as well as the quantization state dictionary."""
-
-        # only load the bitsandbytes module when needed
-        try:
-            import bitsandbytes
-
-            if bitsandbytes.__version__ < "0.44.0":
-                raise ImportError(
-                    "bitsandbytes version is wrong. Please "
-                    "install bitsandbytes>=0.44.0."
-                )
-        except ImportError as err:
-            raise ImportError(
-                "Please install bitsandbytes>=0.44.0 via "
-                "`pip install bitsandbytes>=0.44.0` to use "
-                "bitsandbytes quantizer."
-            ) from err
-
-        hf_weights_files, use_safetensors = self._prepare_weights(
-            model_name_or_path, revision
-        )
-
-        quant_state_dict: Dict[str, Any] = {}
-
-        if pre_quant:
-            if load_8bit:
-                return (
-                    self._quantized_8bit_generator(
-                        hf_weights_files, use_safetensors, quant_state_dict
-                    ),
-                    quant_state_dict,
-                )
-            else:
-                return (
-                    self._quantized_4bit_generator(
-                        hf_weights_files, use_safetensors, quant_state_dict
-                    ),
-                    quant_state_dict,
-                )
-
-        return (
-            self._unquantized_generator(
-                hf_weights_files, use_safetensors, quant_state_dict
-            ),
-            quant_state_dict,
-        )
-
-    def _is_8bit_weight_name(self, weight_name: str):
-        quantized_suffix = {".scb", ".weight_format"}
-        return any(weight_name.lower().endswith(suffix) for suffix in quantized_suffix)
-
-    def _is_4bit_weight_name(self, weight_name: str):
-        quantized_suffix = {
-            "absmax",
-            "quant_map",
-            "nested_absmax",
-            "nested_quant_map",
-            "bitsandbytes",
-        }
-        suffix = weight_name.split(".")[-1]
-        return any(q_suffix in suffix for q_suffix in quantized_suffix)
-
-    def _quantized_8bit_generator(
-        self, hf_weights_files, use_safetensors, quant_state_dict
-    ) -> Generator:
-        for weight_name, weight_tensor in self._hf_weight_iter(
-            hf_weights_files, use_safetensors
-        ):
-            if not weight_name.lower().endswith(".scb"):
-                continue
-
-            weight_key = weight_name.lower().replace(".scb", ".weight")
-            quant_state_dict[weight_key] = weight_tensor
-
-        for weight_name, weight_tensor in self._hf_weight_iter(
-            hf_weights_files, use_safetensors
-        ):
-            if self._is_8bit_weight_name(weight_name):
-                continue
-
-            if weight_name in quant_state_dict:
-                set_weight_attrs(weight_tensor, {"load_in_8bit": True})
-                yield weight_name, weight_tensor
-            else:
-                yield weight_name, weight_tensor
-
-    def _quantized_4bit_generator(
-        self, hf_weights_files, use_safetensors, quant_state_dict
-    ) -> Generator:
-        from bitsandbytes.functional import QuantState
-
-        # First iterate over all quant state weights
-        weight_iterator = self._hf_weight_iter(hf_weights_files, use_safetensors)
-        temp_state_dict = {}
-        for weight_name, weight_tensor in weight_iterator:
-            if not self._is_4bit_weight_name(weight_name):
-                continue
-            # bitsandbytes library requires
-            # weight.quant_state.bitsandbytes__* in CPU
-            if "quant_state.bitsandbytes" in weight_name:
-                temp_state_dict[weight_name] = weight_tensor.cpu().data
-            else:
-                temp_state_dict[weight_name] = weight_tensor
-
-        # Closure to parse quant_state for each prequant weight
-        def _parse_quant_state(param_name: str, temp_state_dict: Dict) -> QuantState:
-            quant_state = {}
-            for k in temp_state_dict:
-                if param_name + "." in k:
-                    quant_state[k] = temp_state_dict[k]
-
-            return QuantState.from_dict(quant_state, device="cuda")
-
-        # Second iterate over all prequant and normal weights
-        # pre quantized weights would have a quant_state
-        for weight_name, weight_tensor in self._hf_weight_iter(
-            hf_weights_files, use_safetensors
-        ):
-
-            if self._is_4bit_weight_name(weight_name):
-                continue
-
-            if (f"{weight_name}.quant_state.bitsandbytes__nf4" in temp_state_dict) or (
-                f"{weight_name}.quant_state.bitsandbytes__fp4" in temp_state_dict
-            ):
-                quant_state = _parse_quant_state(weight_name, temp_state_dict)
-                quant_state_dict[weight_name] = quant_state
-                yield weight_name, weight_tensor
-            else:
-                yield weight_name, weight_tensor
-
-    def _unquantized_generator(
-        self, hf_weights_files, use_safetensors, quant_state_dict
-    ) -> Generator:
-        from bitsandbytes.functional import quantize_4bit
-
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-
-        for weight_name, weight_tensor in self._hf_weight_iter(
-            hf_weights_files, use_safetensors
-        ):
-
-            if any(
-                target_module in weight_name for target_module in self.target_modules
-            ) and weight_name.endswith(".weight"):
-                weight_name = weight_name.replace(".weight", ".qweight")
-
-                if any(
-                    module in weight_name
-                    for module in self.column_parallel_weights_modules
-                ):
-
-                    total_size = weight_tensor.size(-1)
-                    start_index = total_size // tp_size * tp_rank
-                    end_index = total_size // tp_size * (tp_rank + 1)
-                    weight_sub_tensor = weight_tensor[..., start_index:end_index]
-
-                else:
-                    total_size = weight_tensor.size(0)
-                    start_index = total_size // tp_size * tp_rank
-                    end_index = total_size // tp_size * (tp_rank + 1)
-                    weight_sub_tensor = weight_tensor[start_index:end_index, ...]
-
-                # bitsandbytes requires data in GPU
-                if weight_sub_tensor.is_cuda:
-                    loaded_weight = weight_sub_tensor
-                else:
-                    loaded_weight = weight_sub_tensor.cuda()
-
-                # remove the following after the issue is fixed:
-                # https://github.com/bitsandbytes-foundation/bitsandbytes/issues/1342
-                if loaded_weight.is_contiguous() is False:
-                    loaded_weight = loaded_weight.contiguous()
-
-                with set_default_torch_dtype(torch.float32):
-                    processed_weight, quant_state = quantize_4bit(
-                        loaded_weight, compress_statistics=True, quant_type="nf4"
-                    )
-
-                quant_state_dict[weight_name] = quant_state
-            else:
-                processed_weight = weight_tensor
-
-            yield weight_name, processed_weight
-
-    def _load_weights(self, model_config: ModelConfig, model: nn.Module) -> None:
-        if not hasattr(model, "load_weights"):
-            raise AttributeError(
-                "The required method 'load_weights' is not defined in class"
-                f" {type(model).__name__}."
-            )
-
-        if not hasattr(model, "bitsandbytes_stacked_params_mapping"):
-            raise AttributeError(
-                f"Model {type(model).__name__} does not support BitsAndBytes "
-                "quantization yet."
-            )
-
-        if len(self.target_modules) == 0:
-            if hasattr(model, "default_bitsandbytes_target_modules"):
-                self.target_modules = model.default_bitsandbytes_target_modules
-            else:
-                self.target_modules = self.default_target_modules
-
-        if hasattr(model, "column_parallel_weights_modules"):
-            self.column_parallel_weights_modules = model.column_parallel_weights_modules
-        else:
-            self.column_parallel_weights_modules = []
-
-        self.model_type = type(model).__name__
-
-        logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
-        )
-
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-
-        pre_quant = False
-        if quant_config is not None:
-            quant_method = quant_config.get("quant_method")
-            if quant_method == "bitsandbytes":
-                pre_quant = True
-            else:
-                raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
-                )
-
-        # The quant_states in pre_quantized models cannot work with a split
-        # weight tensor. So TP does not work with pre_quantized bnb models.
-        if pre_quant and get_tensor_model_parallel_world_size() > 1:
-            raise ValueError(
-                "Prequant BitsAndBytes models with TP is not supported."
-                "Please try with PP."
-            )
-
-        load_8bit = False
-        if pre_quant:
-            load_8bit = quant_config.get("load_in_8bit", False)
-
-        qweight_iterator, quant_state_dict = self._get_quantized_weights_iterator(
-            model_config.model_path, model_config.revision, pre_quant, load_8bit
-        )
-
-        model.load_weights(qweight_iterator)
-
-        torch.cuda.empty_cache()
-
-        param_dict = dict(model.named_parameters())
-        stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
-        model_type = model_config.hf_config.model_type
-        for quant_param_name in quant_state_dict:
-            non_stacked_param_name = quant_param_name
-            if model_type == "mllama" and "vision_model" in quant_param_name:
-                # adapt to VisionAttention
-                quant_param_name = quant_param_name.replace(
-                    "self_attn.o_proj", "self_attn.proj"
-                )
-            shard_index = 0
-            for shard_name, (
-                weight_name,
-                index,
-            ) in model.bitsandbytes_stacked_params_mapping.items():
-                if (
-                    model_type in ["qwen2_vl", "qwen2_5_vl"]
-                    and "visual" in quant_param_name
-                ):
-                    break
-                if shard_name in quant_param_name:
-                    shard_index = index
-                    quant_param_name = quant_param_name.replace(shard_name, weight_name)
-                    break
-
-            if (
-                model_type in ["qwen2_vl", "qwen2_5_vl"]
-                and "visual" in quant_param_name
-            ):
-                quant_param_name = quant_param_name.replace(
-                    r"attn.qkv.", r"attn.qkv_proj."
-                )
-
-            if quant_param_name not in param_dict:
-                raise ValueError(
-                    f"Parameter {quant_param_name} not found in the model."
-                )
-
-            if quant_param_name not in stacked_quant_state_dict:
-                stacked_quant_state_dict[quant_param_name] = {}
-
-            stacked_quant_state_dict[quant_param_name][shard_index] = quant_state_dict[
-                non_stacked_param_name
-            ]
-
-        # save quant_states and offsets as the attributes of the parameters
-        for param_name, param in param_dict.items():
-            if param_name in stacked_quant_state_dict:
-                quant_states = stacked_quant_state_dict[param_name]
-                set_weight_attrs(param, {"bnb_quant_state": quant_states})
-
-                pack_ratio = getattr(param, "pack_factor", -1)
-                if pack_ratio == -1:
-                    raise ValueError(f"pack_factor not set for parameter {param_name}.")
-
-                num_elements = [0] * len(quant_states)
-                for seq, quant_state in quant_states.items():
-                    num_elements[seq] = math.prod(quant_state.shape) // pack_ratio
-
-                offsets = np.concatenate(([0], np.cumsum(num_elements)))
-                # Make torch infer_schema happy(Compatible with vLLM)
-                offsets = torch.tensor(offsets).cpu()
-                set_weight_attrs(param, {"bnb_shard_offsets": offsets})
-
-                if load_8bit:
-                    set_weight_attrs(
-                        param, {"matmul_state": [None] * len(quant_states)}
-                    )
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(model_config.model_path, model_config.revision)
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-        quant_config = _get_quantization_config(model_config, self.load_config)
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    quant_config,
-                )
-
-                self._load_weights(model_config, model)
-
-        return model.eval()
-
-
-class GGUFModelLoader(BaseModelLoader):
-    """
-    Model loader that can load GGUF files. This is useful for loading models
-    that are quantized with GGUF and saved in the GGUF format. This loader
-    supports loading both full models and sharded models.
-    """
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
-
-    def _prepare_weights(self, model_name_or_path: str):
-        if os.path.isfile(model_name_or_path):
-            return model_name_or_path
-        else:
-            raise ValueError(f"{model_name_or_path} is not a file.")
-
-    def _get_gguf_weights_map(self, model_config: ModelConfig):
-        """
-        GGUF uses this naming convention for their tensors from HF checkpoint:
-        `blk.N.BB.weight` and `blk.N.BB.bias`
-        where N signifies the block number of a layer, and BB signifies the
-        attention/mlp layer components.
-        See "Standardized tensor names" in
-        https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
-        """
-
-        # only load the gguf module when needed
-        try:
-            import gguf
-
-            # FIXME: add version check for gguf
-        except ImportError as err:
-            raise ImportError(
-                "Please install gguf via `pip install gguf` to use gguf quantizer."
-            ) from err
-
-        config = model_config.hf_config
-        model_type = config.model_type
-        # hack: ggufs have a different name than transformers
-        if model_type == "cohere":
-            model_type = "command-r"
-        arch = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == model_type:
-                arch = key
-                break
-        if arch is None:
-            raise RuntimeError(f"Unknown gguf model_type: {model_type}")
-        num_layers = config.num_hidden_layers
-        name_map = gguf.get_tensor_name_map(arch, num_layers)
-        with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config)
-        state_dict = dummy_model.state_dict()
-
-        gguf_to_hf_name_map = {}
-        for hf_name in state_dict:
-            name, suffix = hf_name.rsplit(".", 1)
-            gguf_name = name_map.get_name(name)
-            gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
-        return gguf_to_hf_name_map
-
-    def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(model_config.model_path)
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-
-        local_model_path = self._prepare_weights(model_config.model_path)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
-            model_config.hf_config.update({"tie_word_embeddings": True})
-
-        target_device = torch.device(device_config.device)
-        quant_config = _get_quantization_config(model_config, self.load_config)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
-            )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-        return model
-
-
-class RemoteInstanceModelLoader(BaseModelLoader):
-    """Model loader that can load Tensors from remote sglang instance."""
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
-        self.remote_instance_transfer_engine_weight_info = None
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        raise NotImplementedError
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-        logger.info("Loading weights from remote instance ...")
-        load_config = self.load_config
-
-        assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
-            f"Model loader {self.load_config.load_format} is not supported for "
-            f"load format {load_config.load_format}"
-        )
-
-        quant_config = _get_quantization_config(model_config, self.load_config)
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config, quant_config)
-
-        if (
-            load_config.remote_instance_weight_loader_backend
-            == RemoteInstanceWeightLoaderBackend.NCCL
-        ):
-            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
-            with create_remote_connector(model_weights, device_config.device) as client:
-                connector_type = get_connector_type(client)
-                if connector_type == ConnectorType.INSTANCE:
-                    self.load_model_from_remote_instance_by_nccl(
-                        model, client, model_config, device_config
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported connector type {connector_type} for "
-                        f"remote tensor model loading."
-                    )
-        elif (
-            load_config.remote_instance_weight_loader_backend
-            == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
-        ):
-            if load_config.remote_instance_weight_loader_transfer_engine is None:
-                raise RuntimeError(
-                    "Transfer engine is not initialized for remote instance "
-                    "model loader with `transfer_engine` backend. "
-                )
-            logger.info(
-                "TransferEngine registering memory regions (this may take a few seconds)..."
-            )
-            # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                model, load_config.remote_instance_weight_loader_transfer_engine
-            )
-            logger.info(
-                "TransferEngine memory regions have been successfully registered."
-            )
-
-            # transfer weights
-            success = self.load_model_from_remote_instance_by_transfer_engine(
-                model,
-                load_config.remote_instance_weight_loader_transfer_engine,
-                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
-                load_config.tp_rank,
-            )
-            if not success:
-                raise RuntimeError(
-                    "Failed to load weights from remote instance via transfer engine."
-                )
-        else:
-            raise ValueError("Invalid remote instance weight loader backend.")
-
-        return model.eval()
-
-    def load_model_from_remote_instance_by_nccl(
-        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
-    ) -> nn.Module:
-        load_config = self.load_config
-        instance_ip = socket.gethostbyname(socket.gethostname())
-        start_build_group_tic = time.time()
-        client.build_group(
-            gpu_id=device_config.gpu_id,
-            tp_rank=load_config.tp_rank,
-            instance_ip=instance_ip,
-        )
-        torch.cuda.synchronize()
-        end_build_group_tic = time.time()
-        logger.debug(
-            f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
-        )
-
-        if load_config.tp_rank == 0:
-            t = threading.Thread(
-                target=trigger_transferring_weights_request,
-                args=(
-                    load_config.remote_instance_weight_loader_seed_instance_ip,
-                    load_config.remote_instance_weight_loader_seed_instance_service_port,
-                    load_config.remote_instance_weight_loader_send_weights_group_ports,
-                    instance_ip,
-                ),
-            )
-            t.start()
-
-        start_get_weights_tic = time.time()
-        with set_default_torch_dtype(model_config.dtype):
-            for _, tensor in model.named_parameters():
-                torch.distributed.broadcast(
-                    tensor.data,
-                    src=0,
-                    group=client._model_update_group,
-                )
-            torch.cuda.synchronize()
-
-            if hasattr(model, "post_load_weights"):
-                model.post_load_weights()
-        end_get_weights_tic = time.time()
-        logger.debug(
-            f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
-        )
-        # destroy the process group after loading weights
-        torch.distributed.distributed_c10d.destroy_process_group(
-            client._model_update_group
-        )
-        torch.cuda.empty_cache()
-
-    def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
-    ) -> bool:
-        # get remote weights metadata from source instance
-        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
-        )
-        if (
-            seed_transfer_engine_session_id is None
-            or seed_transfer_engine_weight_info is None
-        ):
-            logger.error("Cannot get transfer engine session or weight info.")
-            return False
-
-        # prepare local/remote RDMA keys
-        seed_ptr_list = []
-        client_ptr_list = []
-        client_len_list = []
-        for name, tensor in model.named_parameters():
-            weight_info = seed_transfer_engine_weight_info.get(name, None)
-            if weight_info is None:
-                logger.error(f"Cannot find weight info for {name}.")
-                return False
-
-            seed_ptr, seed_numel, seed_element_size = weight_info
-            if (
-                seed_numel != tensor.numel()
-                or seed_element_size != tensor.element_size()
-            ):
-                logger.error(
-                    f"Weight info does not match for {name}, "
-                    f"expected ({seed_numel}, {seed_element_size}), "
-                    f"got ({tensor.numel()}, {tensor.element_size()})"
-                )
-                return False
-            client_ptr = tensor.data_ptr()
-            client_len = tensor.numel() * tensor.element_size()
-            seed_ptr_list.append(seed_ptr)
-            client_ptr_list.append(client_ptr)
-            client_len_list.append(client_len)
-
-        # load weights from source instance through TransferEngine
-        ret = transfer_engine.batch_transfer_sync_read(
-            seed_transfer_engine_session_id,
-            client_ptr_list,
-            seed_ptr_list,
-            client_len_list,
-        )
-        if ret < 0:
-            logger.error(f"batch transfer failed, error: {ret}")
-            return False
-
-        if hasattr(model, "post_load_weights"):
-            model.post_load_weights()
-
-        return True
-
-
-class RemoteModelLoader(BaseModelLoader):
-    """Model loader that can load Tensors from remote database."""
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        # TODO @DellCurry: move to s3 connector only
-        set_runai_streamer_env(load_config)
-
-    def _get_weights_iterator_kv(
-        self,
-        client,
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights from remote storage."""
-        assert get_connector_type(client) == ConnectorType.KV
-        rank = get_tensor_model_parallel_rank()
-        return client.weight_iterator(rank)
-
-    def _get_weights_iterator_fs(
-        self,
-        client,
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights from remote storage."""
-        assert get_connector_type(client) == ConnectorType.FS
-        return client.weight_iterator()
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        pass
-
-    @staticmethod
-    def save_model(
-        model: torch.nn.Module,
-        model_path: str,
-        url: str,
-    ) -> None:
-        with create_remote_connector(url) as client:
-            assert get_connector_type(client) == ConnectorType.KV
-            model_name = parse_model_name(url)
-            rank = get_tensor_model_parallel_rank()
-            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-            for key, tensor in state_dict.items():
-                r_key = f"{model_name}/keys/rank_{rank}/{key}"
-                client.set(r_key, tensor)
-
-            for root, _, files in os.walk(model_path):
-                for file_name in files:
-                    # ignore hidden files
-                    if file_name.startswith("."):
-                        continue
-                    if os.path.splitext(file_name)[1] in (".json", ".py"):
-                        file_path = os.path.join(root, file_name)
-                        with open(file_path, encoding="utf-8") as file:
-                            file_content = file.read()
-                            f_key = f"{model_name}/files/{file_name}"
-                            client.setstr(f_key, file_content)
-
-    def _load_model_from_remote_kv(
-        self, model: nn.Module, model_config: ModelConfig, client
-    ):
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                quant_method.process_weights_after_loading(module)
-        weights_iterator = self._get_weights_iterator_kv(client)
-        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-        for key, tensor in weights_iterator:
-            # If loading with LoRA enabled, additional padding may
-            # be added to certain parameters. We only load into a
-            # narrowed view of the parameter data.
-            param_data = state_dict[key].data
-            param_shape = state_dict[key].shape
-            for dim, size in enumerate(tensor.shape):
-                if size < param_shape[dim]:
-                    param_data = param_data.narrow(dim, 0, size)
-            if tensor.shape != param_shape:
-                logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
-                    tensor.shape,
-                    key,
-                    param_shape,
-                )
-            param_data.copy_(tensor)
-            state_dict.pop(key)
-        if state_dict:
-            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
-
-        post_load_weights(model, model_config)
-
-    def _load_model_from_remote_fs(
-        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
-    ) -> nn.Module:
-
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
-            model.load_weights(self._get_weights_iterator_fs(client))
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-        logger.info("Loading weights from remote storage ...")
-        start = time.perf_counter()
-        load_config = self.load_config
-
-        assert load_config.load_format == LoadFormat.REMOTE, (
-            f"Model loader {self.load_config.load_format} is not supported for "
-            f"load format {load_config.load_format}"
-        )
-
-        model_weights = model_config.model_path
-        if hasattr(model_config, "model_weights"):
-            model_weights = model_config.model_weights
-
-        quant_config = _get_quantization_config(model_config, self.load_config)
-
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config, quant_config)
-
-            with create_remote_connector(
-                model_weights, device=device_config.device
-            ) as client:
-                connector_type = get_connector_type(client)
-                if connector_type == ConnectorType.KV:
-                    self._load_model_from_remote_kv(model, model_config, client)
-                elif connector_type == ConnectorType.FS:
-                    self._load_model_from_remote_fs(
-                        model, client, model_config, device_config
-                    )
-
-        end = time.perf_counter()
-        logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
-        return model.eval()
-
-
-def load_model_with_cpu_quantization(
-    self,
-    *,
-    model_config: ModelConfig,
-    device_config: DeviceConfig,
-) -> nn.Module:
-    target_device = torch.device(device_config.device)
-    quant_config = _get_quantization_config(model_config, self.load_config)
-    with set_default_torch_dtype(model_config.dtype):
-        model = _initialize_model(
-            model_config,
-            self.load_config,
-            quant_config,
-        )
-
-        if not isinstance(self, DummyModelLoader):
-            model.load_weights(self._get_all_weights(model_config, model))
-
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-
-        model.to(target_device)
-
-    return model.eval()
-
-
-class ModelOptModelLoader(DefaultModelLoader):
-    """
-    Model loader that applies NVIDIA Model Optimizer quantization
-    """
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        # Any ModelOpt specific initialization if needed
-
-    def _setup_modelopt_quantization(
-        self,
-        model,
-        tokenizer,
-        quant_cfg,
-        quantized_ckpt_restore_path: str | None = None,
-        quantized_ckpt_save_path: str | None = None,
-        export_path: str | None = None,
-    ) -> None:
-        """
-        Set up ModelOpt quantization for the given model.
-
-        Args:
-            model: The model to quantize
-            tokenizer: The tokenizer associated with the model
-            quant_cfg: The quantization configuration
-            quantized_ckpt_restore_path: Path to restore quantized checkpoint from
-            quantized_ckpt_save_path: Path to save quantized checkpoint to
-            export_path: Path to export the quantized model in HuggingFace format
-
-        Raises:
-            ImportError: If ModelOpt is not available
-            Exception: If quantization setup fails
-        """
-        try:
-            import modelopt.torch.opt as mto
-            import modelopt.torch.quantization as mtq
-            from modelopt.torch.quantization.utils import is_quantized
-        except ImportError as e:
-            raise ImportError(
-                "ModelOpt is not available. Please install modelopt."
-            ) from e
-
-        if is_quantized(model):
-            rank0_log("Model is already quantized, skipping quantization setup.")
-            return
-        # Restore from checkpoint if provided
-        if quantized_ckpt_restore_path:
-            try:
-                mto.restore(model, quantized_ckpt_restore_path)
-                rank0_log(
-                    f"Restored quantized model from {quantized_ckpt_restore_path}"
-                )
-
-                # Export model if path provided (even when restoring from checkpoint)
-                self._maybe_export_modelopt(model, export_path)
-                return
-            except Exception as e:
-                logger.warning(
-                    f"Failed to restore from {quantized_ckpt_restore_path}: {e}"
-                )
-                rank0_log("Proceeding with calibration-based quantization...")
-
-        # Set up calibration-based quantization
-        try:
-            # Left padding tends to work better for batched generation with decoder-only LMs
-            with suppress(Exception):
-                tokenizer.padding_side = "left"
-
-            from modelopt.torch.utils.dataset_utils import (
-                create_forward_loop,
-                get_dataset_dataloader,
-            )
-
-            # Create calibration dataloader
-            calib_dataloader = get_dataset_dataloader(
-                dataset_name="cnn_dailymail",  # TODO: Consider making this configurable
-                tokenizer=tokenizer,
-                batch_size=36,  # TODO: Consider making this configurable
-                num_samples=512,  # TODO: Consider making this configurable
-                device=model.device,
-                include_labels=False,
-            )
-
-            calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
-
-            # Apply quantization
-            mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
-
-            if (
-                not model_parallel_is_initialized()
-                or get_tensor_model_parallel_rank() == 0
-            ):
-                mtq.print_quant_summary(model)
-
-            # Save checkpoint if path provided
-            if quantized_ckpt_save_path:
-                try:
-                    mto.save(model, quantized_ckpt_save_path)
-                    rank0_log(f"Quantized model saved to {quantized_ckpt_save_path}")
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
-                    )
-
-            # Export model if path provided
-            self._maybe_export_modelopt(model, export_path)
-
-        except Exception as e:
-            raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
-
-    def _maybe_export_modelopt(self, model, export_path: str | None) -> None:
-        """Export model to HuggingFace format if export_path is provided."""
-        if export_path:
-            try:
-                # Get the original model path from the model config
-                original_model_path = getattr(self, "_original_model_path", None)
-                self._export_modelopt_checkpoint(
-                    model, export_path, original_model_path
-                )
-                rank0_log(
-                    f"Quantized model exported to HuggingFace format at {export_path}"
-                )
-            except Exception as e:
-                rank0_log(
-                    f"Warning: Failed to export quantized model to {export_path}: {e}"
-                )
-
-    def _export_modelopt_checkpoint(
-        self,
-        model,
-        export_path: str,
-        model_path: str = None,
-        trust_remote_code: bool = True,
-    ) -> None:
-        """
-        Export the quantized model to HuggingFace format using ModelOpt export API.
-
-        Args:
-            model: The quantized model to export
-            export_path: Directory path to export the model to
-            model_path: Path to the original model (for tokenizer export)
-            trust_remote_code: Whether to trust remote code for tokenizer loading
-
-        Raises:
-            ImportError: If ModelOpt export functionality is not available
-            Exception: If export fails
-        """
-        try:
-            from modelopt.torch.export import export_hf_checkpoint
-            from transformers import AutoTokenizer
-        except ImportError as e:
-            raise ImportError(
-                "ModelOpt export functionality is not available. "
-                "Please ensure you have the latest version of modelopt installed."
-            ) from e
-
-        # Create export directory if it doesn't exist
-        os.makedirs(export_path, exist_ok=True)
-
-        # Export the quantized model
-        export_hf_checkpoint(model, export_dir=export_path)
-
-        # Export the tokenizer if model_path is provided
-        if model_path:
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_path, trust_remote_code=trust_remote_code
-                )
-                tokenizer.save_pretrained(export_path)
-                rank0_log(f"Tokenizer exported to {export_path}")
-            except Exception as e:
-                rank0_log(f"Warning: Failed to export tokenizer: {e}")
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-
-        logger.info("ModelOptModelLoader: Loading base model...")
-
-        # Store the original model path for tokenizer export
-        self._original_model_path = model_config.model_path
-
-        # Check if model is already quantized
-        if model_config._is_already_quantized():
-            logger.info("Model is already quantized, loading directly...")
-            # Use default loading for pre-quantized models
-            return super().load_model(
-                model_config=model_config, device_config=device_config
-            )
-
-        # TODO: Quantize-and-serve mode has been disabled at the ModelConfig level
-        # All quantization now uses the standard workflow (quantize + export/save)
-        logger.info("Standard quantization mode: Will quantize and export/save")
-        return self._standard_quantization_workflow(model_config, device_config)
-
-    def _standard_quantization_workflow(
-        self, model_config: ModelConfig, device_config: DeviceConfig
-    ) -> nn.Module:
-        """Standard quantization workflow: quantize, save checkpoint, export, then return model."""
-        # Use shared method from parent class to load base model for quantization
-        model = self._load_modelopt_base_model(model_config)
-
-        # Import ModelOpt modules
-        try:
-            import modelopt.torch.quantization as mtq
-        except ImportError:
-            logger.error(
-                "NVIDIA Model Optimizer (modelopt) library not found. "
-                "Please install it to use ModelOpt quantization."
-            )
-            raise
-
-        # Handle both old modelopt_quant and new unified quantization flags
-        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
-            # Legacy modelopt_quant flag
-            quant_choice_str = model_config.modelopt_quant
-        else:
-            # Unified quantization flag - extract the type (fp8/fp4)
-            quant_choice_str = model_config._get_modelopt_quant_type()
-
-        quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
-        if not quant_cfg_name:
-            raise ValueError(
-                f"Invalid quantization choice: '{quant_choice_str}'. "
-                f"Available choices: {list(QUANT_CFG_CHOICES.keys())}"
-            )
-
-        try:
-            # getattr will fetch the config object, e.g., mtq.FP8_DEFAULT_CFG
-            quant_cfg = getattr(mtq, quant_cfg_name)
-        except AttributeError:
-            raise AttributeError(
-                f"ModelOpt quantization config '{quant_cfg_name}' not found. "
-                "Please verify the ModelOpt library installation."
-            )
-
-        logger.info(
-            f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"
-        )
-
-        # Get ModelOpt configuration from LoadConfig
-        modelopt_config = self.load_config.modelopt_config
-        quantized_ckpt_restore_path = (
-            modelopt_config.checkpoint_restore_path if modelopt_config else None
-        )
-        quantized_ckpt_save_path = (
-            modelopt_config.checkpoint_save_path if modelopt_config else None
-        )
-        export_path = modelopt_config.export_path if modelopt_config else None
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_config.model_path, use_fast=True
-        )
-
-        try:
-            self._setup_modelopt_quantization(
-                model,
-                tokenizer,
-                quant_cfg,
-                quantized_ckpt_restore_path=quantized_ckpt_restore_path,
-                quantized_ckpt_save_path=quantized_ckpt_save_path,
-                export_path=export_path,
-            )
-        except Exception as e:
-            logger.warning(f"ModelOpt quantization failed: {e}")
-            rank0_log("Proceeding without quantization...")
-
-        return model.eval()
-
-
-def get_model_loader(
-    load_config: LoadConfig, model_config: Optional[ModelConfig] = None
-) -> BaseModelLoader:
-    """Get a model loader based on the load format."""
-
-    if load_config.load_format == LoadFormat.DUMMY:
-        return DummyModelLoader(load_config)
-
-    if model_config and (
-        (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
-        or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
-    ):
-        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
-
-    # Use ModelOptModelLoader for unified quantization flags
-    if (
-        model_config
-        and hasattr(model_config, "quantization")
-        and model_config.quantization in ["modelopt_fp8", "modelopt_fp4"]
-    ):
-        if model_config._is_already_quantized():
-            logger.info(
-                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
-            )
-        else:
-            logger.info(
-                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
-            )
-        return ModelOptModelLoader(load_config)
-
-    if isinstance(load_config.load_format, type):
-        return load_config.load_format(load_config)
-
-    if load_config.load_format == LoadFormat.SHARDED_STATE:
-        return ShardedStateLoader(load_config)
-
-    if load_config.load_format == LoadFormat.BITSANDBYTES:
-        return BitsAndBytesModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.GGUF:
-        return GGUFModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.LAYERED:
-        return LayeredModelLoader(load_config)
-
-    # Check for FLASH_RL format early
-    # FP8 approach: BF16/FP16 model with native FP8 quantization
-    if load_config.load_format == LoadFormat.FLASH_RL:
-        logger.info(
-            "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
-        )
-        logger.info(
-            "FP8 approach: Model loads with native SGLang FP8 quantization. "
-            "Same model path for both training and inference."
-        )
-
-        # Set quantization to FP8 for native SGLang support
-        if model_config and not model_config.quantization:
-            logger.info(
-                "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
-                "Model will be loaded with FP8 infrastructure"
-            )
-            model_config.quantization = "fp8"
-
-        return QuantizedRLModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.REMOTE:
-        return RemoteModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
-        return RemoteInstanceModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.PRIVATE:
-        import importlib
-
-        try:
-            module = importlib.import_module("sglang.private.private_model_loader")
-            return module.PrivateModelLoader(load_config)
-        except ImportError:
-            raise ValueError("Failed to import sglang.private.private_model_loader")
-
-    return DefaultModelLoader(load_config)
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def post_load_weights(model: nn.Module) -> None:
-    # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
-    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
-    # would normally do it internally. NextN subclasses override the method to fill in
-    # `is_nextn=True`, so the loader doesn't need to know.
-    if hasattr(model, "post_load_weights"):
-        model.post_load_weights()
-
-
-def _modules_with_quant_method(model: nn.Module):
-    from sglang.srt.lora.layers import BaseLayerWithLoRA
-
-    for _, module in model.named_modules():
-        # LoRA wrappers forward quant_method but do not own the packed params
-        if isinstance(module, BaseLayerWithLoRA):
-            continue
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None:
-            yield module, quant_method
-
-
-def _validate_default_loader_extra_config(
-    *, extra_config: dict, load_format: LoadFormat
-) -> None:
-    allowed_keys = {"enable_multithread_load", "num_threads"}
-    if load_format == LoadFormat.FASTSAFETENSORS:
-        allowed_keys.add("enable_gds")
-        if "enable_gds" in extra_config and not isinstance(
-            extra_config["enable_gds"], bool
-        ):
-            raise ValueError(
-                "enable_gds in --model-loader-extra-config must be a boolean"
-            )
-
-    unexpected_keys = set(extra_config.keys()) - allowed_keys
-    if unexpected_keys:
-        raise ValueError(
-            f"Unexpected extra config keys for load format "
-            f"{load_format}: "
-            f"{unexpected_keys}"
-        )
 
 
 class PreshardedModelLoader(DefaultModelLoader):
@@ -3685,6 +2704,1002 @@ class PreshardedModelLoader(DefaultModelLoader):
         return model.eval()
 
 
+class BitsAndBytesModelLoader(BaseModelLoader):
+    """Model loader to load model weights with BitAndBytes quantization."""
+
+    possible_config_file_names = ["adapter_config.json"]
+
+    default_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+        ".fc1.",
+        ".fc2.",
+        ".dense.",
+        ".query_key_value.",
+        ".qkv_proj.",
+        ".dense_h_to_4h.",
+        ".dense_4h_to_h.",
+        ".out_proj.",
+    ]
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+
+        # we don't need to quantize the whole model, only the target modules
+        # that are specified in the adapter config file. If the adapter config
+        # file is not provided, we will quantize the default modules.
+        if (
+            not load_config.model_loader_extra_config
+            or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config
+        ):
+            self.target_modules = []
+            return
+
+        qlora_adapter = load_config.model_loader_extra_config[
+            "qlora_adapter_name_or_path"
+        ]
+
+        config_file_path = self._get_config_file(qlora_adapter)
+
+        with open(config_file_path, "r") as f:
+            config = json.load(f)
+            self.target_modules = config["target_modules"]
+
+    def _get_config_file(self, qlora_adapter: str) -> str:
+        is_local = os.path.isdir(qlora_adapter)
+        config_file_path = None
+        if is_local:
+            for file in self.possible_config_file_names:
+                config_file_path = os.path.join(qlora_adapter, file)
+                if os.path.exists(config_file_path):
+                    break
+        else:
+            hf_api = HfApi()
+            repo_files = hf_api.list_repo_files(repo_id=qlora_adapter)
+            for file in self.possible_config_file_names:
+                if file in repo_files:
+                    config_file_path = hf_hub_download(
+                        repo_id=qlora_adapter, filename=file
+                    )
+                    break
+
+        if not config_file_path:
+            raise ValueError(f"Cannot find adapter config file in {qlora_adapter}")
+
+        return config_file_path
+
+    def _get_weight_files(
+        self,
+        model_name_or_path: str,
+        allowed_patterns: List[str],
+        revision: Optional[str] = None,
+    ) -> Tuple[List[str], str]:
+        """Retrieve weight files. Download the files if necessary.
+
+        Return the weight files and the file pattern."""
+        is_local = os.path.isdir(model_name_or_path)
+
+        if is_local:
+            for pattern in allowed_patterns:
+                weight_files = glob.glob(os.path.join(model_name_or_path, pattern))
+                if weight_files:
+                    return weight_files, pattern
+        else:
+            hf_api = HfApi()
+            repo_files = hf_api.list_repo_files(repo_id=model_name_or_path)
+            for pattern in allowed_patterns:
+                matching_files = fnmatch.filter(repo_files, pattern)
+                if matching_files:
+                    hf_folder = download_weights_from_hf(
+                        model_name_or_path,
+                        self.load_config.download_dir,
+                        [pattern],
+                        revision,
+                        ignore_patterns=self.load_config.ignore_patterns,
+                    )
+                    return glob.glob(os.path.join(hf_folder, pattern)), pattern
+
+        raise RuntimeError(f"No model weights found in: `{model_name_or_path}`")
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str]
+    ) -> Tuple[List[str], bool]:
+        """Prepare weight files for the model."""
+
+        allowed_patterns = ["*.safetensors", "*.bin", "*.pt"]
+
+        hf_weights_files, matched_pattern = self._get_weight_files(
+            model_name_or_path, allowed_patterns, revision
+        )
+
+        if matched_pattern != "*.safetensors":
+            hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
+
+        if len(hf_weights_files) == 0:
+            raise RuntimeError(
+                f"Cannot find any model weights with `{model_name_or_path}`"
+            )
+
+        return hf_weights_files, matched_pattern == "*.safetensors"
+
+    def _hf_weight_iter(self, hf_weights_files, use_safetensors: bool):
+        if use_safetensors:
+            return safetensors_weights_iterator(hf_weights_files)
+        else:
+            return pt_weights_iterator(hf_weights_files)
+
+    def _get_quantized_weights_iterator(
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        pre_quant: bool,
+        load_8bit: bool,
+    ) -> Tuple[Generator[Tuple[str, torch.Tensor], None, None], Dict[str, Any]]:
+        """Get an iterator to the model weights with bitsandbytes quantization,
+        as well as the quantization state dictionary."""
+
+        # only load the bitsandbytes module when needed
+        try:
+            import bitsandbytes
+
+            if bitsandbytes.__version__ < "0.44.0":
+                raise ImportError(
+                    "bitsandbytes version is wrong. Please "
+                    "install bitsandbytes>=0.44.0."
+                )
+        except ImportError as err:
+            raise ImportError(
+                "Please install bitsandbytes>=0.44.0 via "
+                "`pip install bitsandbytes>=0.44.0` to use "
+                "bitsandbytes quantizer."
+            ) from err
+
+        hf_weights_files, use_safetensors = self._prepare_weights(
+            model_name_or_path, revision
+        )
+
+        quant_state_dict: Dict[str, Any] = {}
+
+        if pre_quant:
+            if load_8bit:
+                return (
+                    self._quantized_8bit_generator(
+                        hf_weights_files, use_safetensors, quant_state_dict
+                    ),
+                    quant_state_dict,
+                )
+            else:
+                return (
+                    self._quantized_4bit_generator(
+                        hf_weights_files, use_safetensors, quant_state_dict
+                    ),
+                    quant_state_dict,
+                )
+
+        return (
+            self._unquantized_generator(
+                hf_weights_files, use_safetensors, quant_state_dict
+            ),
+            quant_state_dict,
+        )
+
+    def _is_8bit_weight_name(self, weight_name: str):
+        quantized_suffix = {".scb", ".weight_format"}
+        return any(weight_name.lower().endswith(suffix) for suffix in quantized_suffix)
+
+    def _is_4bit_weight_name(self, weight_name: str):
+        quantized_suffix = {
+            "absmax",
+            "quant_map",
+            "nested_absmax",
+            "nested_quant_map",
+            "bitsandbytes",
+        }
+        suffix = weight_name.split(".")[-1]
+        return any(q_suffix in suffix for q_suffix in quantized_suffix)
+
+    def _quantized_8bit_generator(
+        self, hf_weights_files, use_safetensors, quant_state_dict
+    ) -> Generator:
+        for weight_name, weight_tensor in self._hf_weight_iter(
+            hf_weights_files, use_safetensors
+        ):
+            if not weight_name.lower().endswith(".scb"):
+                continue
+
+            weight_key = weight_name.lower().replace(".scb", ".weight")
+            quant_state_dict[weight_key] = weight_tensor
+
+        for weight_name, weight_tensor in self._hf_weight_iter(
+            hf_weights_files, use_safetensors
+        ):
+            if self._is_8bit_weight_name(weight_name):
+                continue
+
+            if weight_name in quant_state_dict:
+                set_weight_attrs(weight_tensor, {"load_in_8bit": True})
+                yield weight_name, weight_tensor
+            else:
+                yield weight_name, weight_tensor
+
+    def _quantized_4bit_generator(
+        self, hf_weights_files, use_safetensors, quant_state_dict
+    ) -> Generator:
+        from bitsandbytes.functional import QuantState
+
+        # First iterate over all quant state weights
+        weight_iterator = self._hf_weight_iter(hf_weights_files, use_safetensors)
+        temp_state_dict = {}
+        for weight_name, weight_tensor in weight_iterator:
+            if not self._is_4bit_weight_name(weight_name):
+                continue
+            # bitsandbytes library requires
+            # weight.quant_state.bitsandbytes__* in CPU
+            if "quant_state.bitsandbytes" in weight_name:
+                temp_state_dict[weight_name] = weight_tensor.cpu().data
+            else:
+                temp_state_dict[weight_name] = weight_tensor
+
+        # Closure to parse quant_state for each prequant weight
+        def _parse_quant_state(param_name: str, temp_state_dict: Dict) -> QuantState:
+            quant_state = {}
+            for k in temp_state_dict:
+                if param_name + "." in k:
+                    quant_state[k] = temp_state_dict[k]
+
+            return QuantState.from_dict(quant_state, device="cuda")
+
+        # Second iterate over all prequant and normal weights
+        # pre quantized weights would have a quant_state
+        for weight_name, weight_tensor in self._hf_weight_iter(
+            hf_weights_files, use_safetensors
+        ):
+            if self._is_4bit_weight_name(weight_name):
+                continue
+
+            if (f"{weight_name}.quant_state.bitsandbytes__nf4" in temp_state_dict) or (
+                f"{weight_name}.quant_state.bitsandbytes__fp4" in temp_state_dict
+            ):
+                quant_state = _parse_quant_state(weight_name, temp_state_dict)
+                quant_state_dict[weight_name] = quant_state
+                yield weight_name, weight_tensor
+            else:
+                yield weight_name, weight_tensor
+
+    def _unquantized_generator(
+        self, hf_weights_files, use_safetensors, quant_state_dict
+    ) -> Generator:
+        from bitsandbytes.functional import quantize_4bit
+
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
+
+        for weight_name, weight_tensor in self._hf_weight_iter(
+            hf_weights_files, use_safetensors
+        ):
+            if any(
+                target_module in weight_name for target_module in self.target_modules
+            ) and weight_name.endswith(".weight"):
+                weight_name = weight_name.replace(".weight", ".qweight")
+
+                if any(
+                    module in weight_name
+                    for module in self.column_parallel_weights_modules
+                ):
+                    total_size = weight_tensor.size(-1)
+                    start_index = total_size // tp_size * tp_rank
+                    end_index = total_size // tp_size * (tp_rank + 1)
+                    weight_sub_tensor = weight_tensor[..., start_index:end_index]
+
+                else:
+                    total_size = weight_tensor.size(0)
+                    start_index = total_size // tp_size * tp_rank
+                    end_index = total_size // tp_size * (tp_rank + 1)
+                    weight_sub_tensor = weight_tensor[start_index:end_index, ...]
+
+                # bitsandbytes requires data in GPU
+                if weight_sub_tensor.is_cuda:
+                    loaded_weight = weight_sub_tensor
+                else:
+                    loaded_weight = weight_sub_tensor.cuda()
+
+                # remove the following after the issue is fixed:
+                # https://github.com/bitsandbytes-foundation/bitsandbytes/issues/1342
+                if loaded_weight.is_contiguous() is False:
+                    loaded_weight = loaded_weight.contiguous()
+
+                with set_default_torch_dtype(torch.float32):
+                    processed_weight, quant_state = quantize_4bit(
+                        loaded_weight, compress_statistics=True, quant_type="nf4"
+                    )
+
+                quant_state_dict[weight_name] = quant_state
+            else:
+                processed_weight = weight_tensor
+
+            yield weight_name, processed_weight
+
+    def _load_weights(self, model_config: ModelConfig, model: nn.Module) -> None:
+        if not hasattr(model, "load_weights"):
+            raise AttributeError(
+                "The required method 'load_weights' is not defined in class"
+                f" {type(model).__name__}."
+            )
+
+        if not hasattr(model, "bitsandbytes_stacked_params_mapping"):
+            raise AttributeError(
+                f"Model {type(model).__name__} does not support BitsAndBytes "
+                "quantization yet."
+            )
+
+        if len(self.target_modules) == 0:
+            if hasattr(model, "default_bitsandbytes_target_modules"):
+                self.target_modules = model.default_bitsandbytes_target_modules
+            else:
+                self.target_modules = self.default_target_modules
+
+        if hasattr(model, "column_parallel_weights_modules"):
+            self.column_parallel_weights_modules = model.column_parallel_weights_modules
+        else:
+            self.column_parallel_weights_modules = []
+
+        self.model_type = type(model).__name__
+
+        logger.info(
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
+        )
+
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
+
+        pre_quant = False
+        if quant_config is not None:
+            quant_method = quant_config.get("quant_method")
+            if quant_method == "bitsandbytes":
+                pre_quant = True
+            else:
+                raise ValueError(
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
+                )
+
+        # The quant_states in pre_quantized models cannot work with a split
+        # weight tensor. So TP does not work with pre_quantized bnb models.
+        if pre_quant and get_parallel().tp_size > 1:
+            raise ValueError(
+                "Prequant BitsAndBytes models with TP is not supported."
+                "Please try with PP."
+            )
+
+        load_8bit = False
+        if pre_quant:
+            load_8bit = quant_config.get("load_in_8bit", False)
+
+        qweight_iterator, quant_state_dict = self._get_quantized_weights_iterator(
+            model_config.model_path, model_config.revision, pre_quant, load_8bit
+        )
+
+        model.load_weights(qweight_iterator)
+
+        current_platform.empty_cache()
+
+        param_dict = dict(model.named_parameters())
+        stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
+        model_type = model_config.hf_config.model_type
+        for quant_param_name in quant_state_dict:
+            non_stacked_param_name = quant_param_name
+            if model_type == "mllama" and "vision_model" in quant_param_name:
+                # adapt to VisionAttention
+                quant_param_name = quant_param_name.replace(
+                    "self_attn.o_proj", "self_attn.proj"
+                )
+            shard_index = 0
+            for shard_name, (
+                weight_name,
+                index,
+            ) in model.bitsandbytes_stacked_params_mapping.items():
+                if (
+                    model_type in ["qwen2_vl", "qwen2_5_vl"]
+                    and "visual" in quant_param_name
+                ):
+                    break
+                if shard_name in quant_param_name:
+                    shard_index = index
+                    quant_param_name = quant_param_name.replace(shard_name, weight_name)
+                    break
+
+            if (
+                model_type in ["qwen2_vl", "qwen2_5_vl"]
+                and "visual" in quant_param_name
+            ):
+                quant_param_name = quant_param_name.replace(
+                    r"attn.qkv.", r"attn.qkv_proj."
+                )
+
+            if quant_param_name not in param_dict:
+                raise ValueError(
+                    f"Parameter {quant_param_name} not found in the model."
+                )
+
+            if quant_param_name not in stacked_quant_state_dict:
+                stacked_quant_state_dict[quant_param_name] = {}
+
+            stacked_quant_state_dict[quant_param_name][shard_index] = quant_state_dict[
+                non_stacked_param_name
+            ]
+
+        # save quant_states and offsets as the attributes of the parameters
+        for param_name, param in param_dict.items():
+            if param_name in stacked_quant_state_dict:
+                quant_states = stacked_quant_state_dict[param_name]
+                set_weight_attrs(param, {"bnb_quant_state": quant_states})
+
+                pack_ratio = getattr(param, "pack_factor", -1)
+                if pack_ratio == -1:
+                    raise ValueError(f"pack_factor not set for parameter {param_name}.")
+
+                num_elements = [0] * len(quant_states)
+                for seq, quant_state in quant_states.items():
+                    num_elements[seq] = math.prod(quant_state.shape) // pack_ratio
+
+                offsets = np.concatenate(([0], np.cumsum(num_elements)))
+                # Make torch infer_schema happy(Compatible with vLLM)
+                offsets = torch.tensor(offsets).cpu()
+                set_weight_attrs(param, {"bnb_shard_offsets": offsets})
+
+                if load_8bit:
+                    set_weight_attrs(
+                        param, {"matmul_state": [None] * len(quant_states)}
+                    )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        self._prepare_weights(model_config.model_path, model_config.revision)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+
+                self._load_weights(model_config, model)
+
+        return model.eval()
+
+
+class GGUFModelLoader(BaseModelLoader):
+    """
+    Model loader that can load GGUF files. This is useful for loading models
+    that are quantized with GGUF and saved in the GGUF format. This loader
+    supports loading both full models and sharded models.
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def _prepare_weights(self, model_name_or_path: str):
+        if os.path.isfile(model_name_or_path):
+            return model_name_or_path
+        else:
+            raise ValueError(f"{model_name_or_path} is not a file.")
+
+    def _get_gguf_weights_map(self, model_config: ModelConfig):
+        """
+        GGUF uses this naming convention for their tensors from HF checkpoint:
+        `blk.N.BB.weight` and `blk.N.BB.bias`
+        where N signifies the block number of a layer, and BB signifies the
+        attention/mlp layer components.
+        See "Standardized tensor names" in
+        https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
+        """
+
+        # only load the gguf module when needed
+        try:
+            import gguf
+
+            # FIXME: add version check for gguf
+        except ImportError as err:
+            raise ImportError(
+                "Please install gguf via `pip install gguf` to use gguf quantizer."
+            ) from err
+
+        from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_NAME_MAP_BUILDERS
+
+        config = model_config.hf_config
+        model_type = config.model_type
+        name_map_builder = GGUF_HF_NAME_MAP_BUILDERS.get(model_type)
+        if name_map_builder is not None:
+            return name_map_builder(config)
+
+        # hack: ggufs have a different name than transformers
+        if model_type == "cohere":
+            model_type = "command-r"
+        elif model_type == "qwen3_moe":
+            model_type = "qwen3moe"
+        arch = None
+        for key, value in gguf.MODEL_ARCH_NAMES.items():
+            if value == model_type:
+                arch = key
+                break
+        if arch is None:
+            raise RuntimeError(f"Unknown gguf model_type: {model_type}")
+        num_layers = config.num_hidden_layers
+        name_map = gguf.get_tensor_name_map(arch, num_layers)
+        with torch.device("meta"):
+            dummy_model = AutoModelForCausalLM.from_config(config)
+        state_dict = dummy_model.state_dict()
+
+        gguf_to_hf_name_map = {}
+        for hf_name in state_dict:
+            name, suffix = hf_name.rsplit(".", 1)
+            gguf_name = name_map.get_name(name)
+            gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
+        return gguf_to_hf_name_map
+
+    def _get_weights_iterator(
+        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        self._prepare_weights(model_config.model_path)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        local_model_path = self._prepare_weights(model_config.model_path)
+        gguf_weights_map = self._get_gguf_weights_map(model_config)
+        # we can only know if tie word embeddings after mapping weights
+        if "lm_head.weight" in get_gguf_extra_tensor_names(
+            local_model_path, gguf_weights_map
+        ):
+            model_config.hf_config.update({"tie_word_embeddings": True})
+
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config, quant_config)
+            model.load_weights(
+                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            )
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+        return model
+
+
+class RemoteInstanceModelLoader(BaseModelLoader):
+    """Model loader that can load Tensors from remote sglang instance."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            if (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            ):
+                # ModelExpress falls back to a DefaultModelLoader whenever no
+                # peer holds the weights, so it consumes this config; validate
+                # the keys here so a bad one fails on every rank instead of only
+                # on the ranks that end up taking the fallback.
+                _validate_default_loader_extra_config(
+                    extra_config=load_config.model_loader_extra_config,
+                    load_format=load_config.load_format,
+                )
+            else:
+                # nccl and transfer_engine replace the native loader outright,
+                # so nothing would ever read the config.
+                raise ValueError(
+                    f"Model loader extra config is not supported for "
+                    f"load format {load_config.load_format} with "
+                    f"remote instance weight loader backend "
+                    f"{load_config.remote_instance_weight_loader_backend}"
+                )
+        self.remote_instance_transfer_engine_weight_info = None
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        raise NotImplementedError
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        logger.info("Loading weights from remote instance ...")
+        load_config = self.load_config
+
+        assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
+            f"Model loader {self.load_config.load_format} is not supported for "
+            f"load format {load_config.load_format}"
+        )
+
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config, quant_config)
+
+        if (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
+            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
+            with create_remote_connector(model_weights, device_config.device) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.INSTANCE:
+                    self.load_model_from_remote_instance_by_nccl(
+                        model, client, model_config, device_config
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported connector type {connector_type} for "
+                        f"remote tensor model loading."
+                    )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ):
+            if load_config.remote_instance_weight_loader_transfer_engine is None:
+                raise RuntimeError(
+                    "Transfer engine is not initialized for remote instance "
+                    "model loader with `transfer_engine` backend. "
+                )
+            logger.info(
+                "TransferEngine registering memory regions (this may take a few seconds)..."
+            )
+            # register memory region
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                model, load_config.remote_instance_weight_loader_transfer_engine
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
+            )
+
+            # transfer weights
+            success = self.load_model_from_remote_instance_by_transfer_engine(
+                model,
+                load_config.remote_instance_weight_loader_transfer_engine,
+                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+                load_config.tp_rank,
+            )
+            if not success:
+                raise RuntimeError(
+                    "Failed to load weights from remote instance via transfer engine."
+                )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+        ):
+            try:
+                from modelexpress.engines.sglang.loader import MxModelLoader
+            except ImportError as exc:
+                raise ImportError(
+                    "ModelExpress support requires the 'modelexpress' "
+                    "package. Install it in the SGLang image."
+                ) from exc
+
+            model = MxModelLoader(load_config).load_model(
+                model=model,
+                model_config=model_config,
+                device_config=device_config,
+            )
+        else:
+            raise ValueError("Invalid remote instance weight loader backend.")
+
+        return model.eval()
+
+    def load_model_from_remote_instance_by_nccl(
+        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        load_config = self.load_config
+        instance_ip = socket.gethostbyname(socket.gethostname())
+        start_build_group_tic = time.time()
+        client.build_group(
+            gpu_id=device_config.gpu_id,
+            tp_rank=load_config.tp_rank,
+            instance_ip=instance_ip,
+        )
+        current_platform.synchronize()
+        end_build_group_tic = time.time()
+        logger.debug(
+            f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
+        )
+
+        if load_config.tp_rank == 0:
+            t = threading.Thread(
+                target=trigger_transferring_weights_request,
+                args=(
+                    load_config.remote_instance_weight_loader_seed_instance_ip,
+                    load_config.remote_instance_weight_loader_seed_instance_service_port,
+                    load_config.remote_instance_weight_loader_send_weights_group_ports,
+                    instance_ip,
+                ),
+            )
+            t.start()
+
+        start_get_weights_tic = time.time()
+        with set_default_torch_dtype(model_config.dtype):
+            for _, tensor in model.named_parameters():
+                torch.distributed.broadcast(
+                    tensor.data,
+                    src=0,
+                    group=client._model_update_group,
+                )
+            current_platform.synchronize()
+
+            post_load_weights(model)
+        end_get_weights_tic = time.time()
+        logger.debug(
+            f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
+        )
+        # destroy the process group after loading weights
+        torch.distributed.distributed_c10d.destroy_process_group(
+            client._model_update_group
+        )
+        current_platform.empty_cache()
+
+    def load_model_from_remote_instance_by_transfer_engine(
+        self, model, transfer_engine, seed_url, tp_rank
+    ) -> bool:
+        # get remote weights metadata from source instance
+        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        )
+        if (
+            seed_transfer_engine_session_id is None
+            or seed_transfer_engine_weight_info is None
+        ):
+            logger.error("Cannot get transfer engine session or weight info.")
+            return False
+
+        # prepare local/remote RDMA keys
+        seed_ptr_list = []
+        client_ptr_list = []
+        client_len_list = []
+        for name, tensor in model.named_parameters():
+            weight_info = seed_transfer_engine_weight_info.get(name, None)
+            if weight_info is None:
+                logger.error(f"Cannot find weight info for {name}.")
+                return False
+
+            seed_ptr, seed_numel, seed_element_size = weight_info
+            if (
+                seed_numel != tensor.numel()
+                or seed_element_size != tensor.element_size()
+            ):
+                logger.error(
+                    f"Weight info does not match for {name}, "
+                    f"expected ({seed_numel}, {seed_element_size}), "
+                    f"got ({tensor.numel()}, {tensor.element_size()})"
+                )
+                return False
+            client_ptr = tensor.data_ptr()
+            client_len = tensor.numel() * tensor.element_size()
+            seed_ptr_list.append(seed_ptr)
+            client_ptr_list.append(client_ptr)
+            client_len_list.append(client_len)
+
+        # load weights from source instance through TransferEngine
+        ret = transfer_engine.batch_transfer_sync_read(
+            seed_transfer_engine_session_id,
+            client_ptr_list,
+            seed_ptr_list,
+            client_len_list,
+        )
+        if ret < 0:
+            logger.error(f"batch transfer failed, error: {ret}")
+            return False
+
+        post_load_weights(model)
+
+        return True
+
+
+class RemoteModelLoader(BaseModelLoader):
+    """Model loader that can load Tensors from remote database."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        # TODO @DellCurry: move to s3 connector only
+        set_runai_streamer_env(load_config)
+
+    def _get_weights_iterator_kv(
+        self,
+        client,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights from remote storage."""
+        assert get_connector_type(client) == ConnectorType.KV
+        rank = get_parallel().tp_rank
+        return client.weight_iterator(rank)
+
+    def _get_weights_iterator_fs(
+        self,
+        client,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights from remote storage."""
+        assert get_connector_type(client) == ConnectorType.FS
+        return client.weight_iterator()
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        pass
+
+    @staticmethod
+    def save_model(
+        model: torch.nn.Module,
+        model_path: str,
+        url: str,
+    ) -> None:
+        with create_remote_connector(url) as client:
+            assert get_connector_type(client) == ConnectorType.KV
+            model_name = parse_model_name(url)
+            rank = get_parallel().tp_rank
+            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+            for key, tensor in state_dict.items():
+                r_key = f"{model_name}/keys/rank_{rank}/{key}"
+                client.set(r_key, tensor)
+
+            for root, _, files in os.walk(model_path):
+                for file_name in files:
+                    # ignore hidden files
+                    if file_name.startswith("."):
+                        continue
+                    if os.path.splitext(file_name)[1] in (".json", ".py"):
+                        file_path = os.path.join(root, file_name)
+                        with open(file_path, encoding="utf-8") as file:
+                            file_content = file.read()
+                            f_key = f"{model_name}/files/{file_name}"
+                            client.setstr(f_key, file_content)
+
+    def _load_model_from_remote_kv(
+        self, model: nn.Module, model_config: ModelConfig, client
+    ):
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
+        weights_iterator = self._get_weights_iterator_kv(client)
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        for key, tensor in weights_iterator:
+            # If loading with LoRA enabled, additional padding may
+            # be added to certain parameters. We only load into a
+            # narrowed view of the parameter data.
+            param_data = state_dict[key].data
+            param_shape = state_dict[key].shape
+            for dim, size in enumerate(tensor.shape):
+                if size < param_shape[dim]:
+                    param_data = param_data.narrow(dim, 0, size)
+            if tensor.shape != param_shape:
+                logger.warning(
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
+                    tensor.shape,
+                    key,
+                    param_shape,
+                )
+            param_data.copy_(tensor)
+            state_dict.pop(key)
+        if state_dict:
+            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        post_load_weights(model)
+
+    def _load_model_from_remote_fs(
+        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            model.load_weights(self._get_weights_iterator_fs(client))
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        logger.info("Loading weights from remote storage ...")
+        start = time.perf_counter()
+        load_config = self.load_config
+
+        assert load_config.load_format == LoadFormat.REMOTE, (
+            f"Model loader {self.load_config.load_format} is not supported for "
+            f"load format {load_config.load_format}"
+        )
+
+        model_weights = model_config.model_path
+        if hasattr(model_config, "model_weights"):
+            model_weights = model_config.model_weights
+
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config, quant_config)
+
+            with create_remote_connector(
+                model_weights, device=device_config.device
+            ) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.KV:
+                    self._load_model_from_remote_kv(model, model_config, client)
+                elif connector_type == ConnectorType.FS:
+                    self._load_model_from_remote_fs(
+                        model, client, model_config, device_config
+                    )
+
+        end = time.perf_counter()
+        logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
+        return model.eval()
+
+
+def load_model_with_cpu_quantization(
+    self,
+    *,
+    model_config: ModelConfig,
+    device_config: DeviceConfig,
+) -> nn.Module:
+    target_device = torch.device(device_config.device)
+    quant_config = _get_quantization_config(model_config, self.load_config)
+    with set_default_torch_dtype(model_config.dtype):
+        model = _initialize_model(
+            model_config,
+            self.load_config,
+            quant_config,
+        )
+
+        if not isinstance(self, DummyModelLoader):
+            model.load_weights(self._get_all_weights(model_config, model))
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        model.to(target_device)
+
+    return model.eval()
+
+
 class IncModelLoader(DefaultModelLoader):
     """
     Model loader that applies Intel AutoRound quantization
@@ -3787,6 +3802,275 @@ class IncModelLoader(DefaultModelLoader):
                 return model
         except Exception as e:
             raise ValueError(f"AutoRound quantization failed: {e}")
+
+
+class ModelOptModelLoader(DefaultModelLoader):
+    """
+    Model loader that applies NVIDIA Model Optimizer quantization
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        # Any ModelOpt specific initialization if needed
+
+    def _setup_modelopt_quantization(
+        self,
+        model,
+        tokenizer,
+        quant_cfg,
+        quantized_ckpt_restore_path: str | None = None,
+        quantized_ckpt_save_path: str | None = None,
+        export_path: str | None = None,
+    ) -> None:
+        """
+        Set up ModelOpt quantization for the given model.
+
+        Args:
+            model: The model to quantize
+            tokenizer: The tokenizer associated with the model
+            quant_cfg: The quantization configuration
+            quantized_ckpt_restore_path: Path to restore quantized checkpoint from
+            quantized_ckpt_save_path: Path to save quantized checkpoint to
+            export_path: Path to export the quantized model in HuggingFace format
+
+        Raises:
+            ImportError: If ModelOpt is not available
+            Exception: If quantization setup fails
+        """
+        try:
+            import modelopt.torch.opt as mto
+            import modelopt.torch.quantization as mtq
+            from modelopt.torch.quantization.utils import is_quantized
+        except ImportError as e:
+            raise ImportError(
+                "ModelOpt is not available. Please install modelopt."
+            ) from e
+
+        if is_quantized(model):
+            rank0_log("Model is already quantized, skipping quantization setup.")
+            return
+        # Restore from checkpoint if provided
+        if quantized_ckpt_restore_path:
+            try:
+                mto.restore(model, quantized_ckpt_restore_path)
+                rank0_log(
+                    f"Restored quantized model from {quantized_ckpt_restore_path}"
+                )
+
+                # Export model if path provided (even when restoring from checkpoint)
+                self._maybe_export_modelopt(model, export_path)
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Failed to restore from {quantized_ckpt_restore_path}: {e}"
+                )
+                rank0_log("Proceeding with calibration-based quantization...")
+
+        # Set up calibration-based quantization
+        try:
+            # Left padding tends to work better for batched generation with decoder-only LMs
+            with suppress(Exception):
+                tokenizer.padding_side = "left"
+
+            from modelopt.torch.utils.dataset_utils import (
+                create_forward_loop,
+                get_dataset_dataloader,
+            )
+
+            # Create calibration dataloader
+            calib_dataloader = get_dataset_dataloader(
+                dataset_name="cnn_dailymail",  # TODO: Consider making this configurable
+                tokenizer=tokenizer,
+                batch_size=36,  # TODO: Consider making this configurable
+                num_samples=512,  # TODO: Consider making this configurable
+                device=model.device,
+                include_labels=False,
+            )
+
+            calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
+
+            # Apply quantization
+            mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+
+            if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
+                mtq.print_quant_summary(model)
+
+            # Save checkpoint if path provided
+            if quantized_ckpt_save_path:
+                try:
+                    mto.save(model, quantized_ckpt_save_path)
+                    rank0_log(f"Quantized model saved to {quantized_ckpt_save_path}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
+                    )
+
+            # Export model if path provided
+            self._maybe_export_modelopt(model, export_path)
+
+        except Exception as e:
+            raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
+
+    def _maybe_export_modelopt(self, model, export_path: str | None) -> None:
+        """Export model to HuggingFace format if export_path is provided."""
+        if export_path:
+            try:
+                # Get the original model path from the model config
+                original_model_path = getattr(self, "_original_model_path", None)
+                self._export_modelopt_checkpoint(
+                    model, export_path, original_model_path
+                )
+                rank0_log(
+                    f"Quantized model exported to HuggingFace format at {export_path}"
+                )
+            except Exception as e:
+                rank0_log(
+                    f"Warning: Failed to export quantized model to {export_path}: {e}"
+                )
+
+    def _export_modelopt_checkpoint(
+        self,
+        model,
+        export_path: str,
+        model_path: str = None,
+        trust_remote_code: bool = True,
+    ) -> None:
+        """
+        Export the quantized model to HuggingFace format using ModelOpt export API.
+
+        Args:
+            model: The quantized model to export
+            export_path: Directory path to export the model to
+            model_path: Path to the original model (for tokenizer export)
+            trust_remote_code: Whether to trust remote code for tokenizer loading
+
+        Raises:
+            ImportError: If ModelOpt export functionality is not available
+            Exception: If export fails
+        """
+        try:
+            from modelopt.torch.export import export_hf_checkpoint
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise ImportError(
+                "ModelOpt export functionality is not available. "
+                "Please ensure you have the latest version of modelopt installed."
+            ) from e
+
+        # Create export directory if it doesn't exist
+        os.makedirs(export_path, exist_ok=True)
+
+        # Export the quantized model
+        export_hf_checkpoint(model, export_dir=export_path)
+
+        # Export the tokenizer if model_path is provided
+        if model_path:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=trust_remote_code
+                )
+                tokenizer.save_pretrained(export_path)
+                rank0_log(f"Tokenizer exported to {export_path}")
+            except Exception as e:
+                rank0_log(f"Warning: Failed to export tokenizer: {e}")
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        logger.info("ModelOptModelLoader: Loading base model...")
+
+        # Store the original model path for tokenizer export
+        self._original_model_path = model_config.model_path
+
+        # Check if model is already quantized
+        if model_config._is_already_quantized():
+            logger.info("Model is already quantized, loading directly...")
+            # Use default loading for pre-quantized models
+            return super().load_model(
+                model_config=model_config, device_config=device_config
+            )
+
+        # TODO: Quantize-and-serve mode has been disabled at the ModelConfig level
+        # All quantization now uses the standard workflow (quantize + export/save)
+        logger.info("Standard quantization mode: Will quantize and export/save")
+        return self._standard_quantization_workflow(model_config, device_config)
+
+    def _standard_quantization_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Standard quantization workflow: quantize, save checkpoint, export, then return model."""
+        # Use shared method from parent class to load base model for quantization
+        model = self._load_modelopt_base_model(model_config)
+
+        # Import ModelOpt modules
+        try:
+            import modelopt.torch.quantization as mtq
+        except ImportError:
+            logger.error(
+                "NVIDIA Model Optimizer (modelopt) library not found. "
+                "Please install it to use ModelOpt quantization."
+            )
+            raise
+
+        # Handle both old modelopt_quant and new unified quantization flags
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Legacy modelopt_quant flag
+            quant_choice_str = model_config.modelopt_quant
+        else:
+            # Unified quantization flag - extract the type (fp8/fp4)
+            quant_choice_str = model_config._get_modelopt_quant_type()
+
+        quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
+        if not quant_cfg_name:
+            raise ValueError(
+                f"Invalid quantization choice: '{quant_choice_str}'. "
+                f"Available choices: {list(QUANT_CFG_CHOICES.keys())}"
+            )
+
+        try:
+            # getattr will fetch the config object, e.g., mtq.FP8_DEFAULT_CFG
+            quant_cfg = getattr(mtq, quant_cfg_name)
+        except AttributeError:
+            raise AttributeError(
+                f"ModelOpt quantization config '{quant_cfg_name}' not found. "
+                "Please verify the ModelOpt library installation."
+            )
+
+        logger.info(
+            f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"
+        )
+
+        # Get ModelOpt configuration from LoadConfig
+        modelopt_config = self.load_config.modelopt_config
+        quantized_ckpt_restore_path = (
+            modelopt_config.checkpoint_restore_path if modelopt_config else None
+        )
+        quantized_ckpt_save_path = (
+            modelopt_config.checkpoint_save_path if modelopt_config else None
+        )
+        export_path = modelopt_config.export_path if modelopt_config else None
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_config.model_path, use_fast=True
+        )
+
+        try:
+            self._setup_modelopt_quantization(
+                model,
+                tokenizer,
+                quant_cfg,
+                quantized_ckpt_restore_path=quantized_ckpt_restore_path,
+                quantized_ckpt_save_path=quantized_ckpt_save_path,
+                export_path=export_path,
+            )
+        except Exception as e:
+            logger.warning(f"ModelOpt quantization failed: {e}")
+            rank0_log("Proceeding without quantization...")
+
+        return model.eval()
 
 
 class RunaiModelStreamerLoader(BaseModelLoader):
@@ -4036,3 +4320,140 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             )
 
         return model.eval()
+
+
+def get_model_loader(
+    load_config: LoadConfig, model_config: Optional[ModelConfig] = None
+) -> BaseModelLoader:
+    """Get a model loader based on the load format."""
+
+    if load_config.load_format == LoadFormat.DUMMY:
+        return DummyModelLoader(load_config)
+
+    if isinstance(load_config.load_format, type):
+        return load_config.load_format(load_config)
+
+    if model_config and model_config.quantization in ["auto-round-int8"]:
+        logger.info("Using IncModelLoader due to AutoRound quantization config.")
+        return IncModelLoader(load_config)
+
+    modelopt_config = load_config.modelopt_config
+    modelopt_workflow_requested = modelopt_config is not None and any(
+        (
+            modelopt_config.checkpoint_restore_path,
+            modelopt_config.checkpoint_save_path,
+            modelopt_config.export_path,
+        )
+    )
+
+    # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
+    # caller explicitly requests ModelOpt calibration/checkpoint/export work.
+    # Non-local loaders still own their weight transport path.
+    modelopt_fp4_online = (
+        model_config
+        and model_config.quantization == "modelopt_fp4"
+        and not model_config._is_already_quantized()
+        and not modelopt_workflow_requested
+    )
+    model_optloader_allowed = (
+        model_config
+        and not modelopt_fp4_online
+        and load_config.load_format
+        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
+    )
+
+    if model_optloader_allowed and (
+        (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
+        or model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
+    ):
+        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
+        return ModelOptModelLoader(load_config)
+
+    # Use ModelOptModelLoader for unified quantization flags
+    if (
+        model_optloader_allowed
+        and hasattr(model_config, "quantization")
+        and model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
+    ):
+        if model_config._is_already_quantized():
+            logger.info(
+                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
+            )
+        else:
+            logger.info(
+                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
+            )
+        return ModelOptModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.SHARDED_STATE:
+        return ShardedStateLoader(load_config)
+
+    if load_config.load_format == LoadFormat.PRESHARDED:
+        return PreshardedModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.BITSANDBYTES:
+        return BitsAndBytesModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.GGUF:
+        return GGUFModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.EXPERT_PACK:
+        from sglang.srt.model_loader.expert_pack_loader import ExpertPackModelLoader
+
+        return ExpertPackModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.LAYERED:
+        return LayeredModelLoader(load_config)
+
+    # Check for FLASH_RL format early
+    # FP8 approach: BF16/FP16 model with native FP8 quantization
+    if load_config.load_format == LoadFormat.FLASH_RL:
+        logger.info(
+            "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
+        )
+        logger.info(
+            "FP8 approach: Model loads with native SGLang FP8 quantization. "
+            "Same model path for both training and inference."
+        )
+
+        # Set quantization to FP8 for native SGLang support
+        if model_config and not model_config.quantization:
+            logger.info(
+                "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
+                "Model will be loaded with FP8 infrastructure"
+            )
+            model_config.quantization = "fp8"
+
+        return QuantizedRLModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.REMOTE:
+        return RemoteModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
+        return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.PRIVATE:
+        import importlib
+
+        try:
+            module = importlib.import_module("sglang.private.private_model_loader")
+            return module.PrivateModelLoader(load_config)
+        except ImportError:
+            raise ValueError("Failed to import sglang.private.private_model_loader")
+
+    if load_config.load_format == LoadFormat.RUNAI_STREAMER:
+        return RunaiModelStreamerLoader(load_config)
+
+    if load_config.load_format == LoadFormat.IPC_CACHE:
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        return IpcModelLoader(
+            load_config=load_config,
+            socket_path=load_config.weight_cache_socket,
+            weight_cache_mode=load_config.weight_cache_mode,
+            fallback_load_format=load_config.fallback_load_format,
+        )
+
+    return DefaultModelLoader(load_config)

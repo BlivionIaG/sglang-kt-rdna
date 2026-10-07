@@ -1,4 +1,3 @@
-from __future__ import annotations
 import asyncio
 import concurrent.futures
 import ctypes
@@ -78,7 +77,6 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
-import copy
 
 logger = logging.getLogger(__name__)
 

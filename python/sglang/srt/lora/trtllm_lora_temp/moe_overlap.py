@@ -9,7 +9,6 @@ Batches that don't qualify for two-stream (prefill / non-virtual-lora /
 batch without active LoRA) fall through to the saved-original function so
 their behavior is byte-identical to the unpatched code path.
 """
-from __future__ import annotations
 
 import torch
 
@@ -20,7 +19,6 @@ from sglang.srt.lora.trtllm_lora_temp import (
     get_original_moe_lora_func,
     is_two_stream_active,
 )
-import copy
 
 # GEMM1-LoRA overlap: keep LoRA-ready events recorded during cuda-graph capture alive so the
 # captured cross-stream wait (resolved inside the trtllm op before activation) isn't torn down

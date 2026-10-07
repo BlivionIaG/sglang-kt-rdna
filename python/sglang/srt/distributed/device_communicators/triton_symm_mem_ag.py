@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """Symmetric-memory ``multimem.st`` all-gather along the hidden (last) dim.
 

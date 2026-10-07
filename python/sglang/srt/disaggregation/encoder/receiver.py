@@ -1,4 +1,3 @@
-from __future__ import annotations
 import asyncio
 import itertools
 import logging
@@ -58,7 +57,6 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
-import copy
 
 logger = logging.getLogger(__name__)
 

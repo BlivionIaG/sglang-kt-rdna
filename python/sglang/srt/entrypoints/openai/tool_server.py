@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
@@ -20,9 +19,10 @@ logger = logging.getLogger(__name__)
 
 async def list_server_and_tools(server_url: str):
 
-    async with sse_client(url=server_url) as streams, ClientSession(
-        *streams
-    ) as session:
+    async with (
+        sse_client(url=server_url) as streams,
+        ClientSession(*streams) as session,
+    ):
         initialize_response = await session.initialize()
         list_tools_response = await session.list_tools()
         return initialize_response, list_tools_response
@@ -72,7 +72,6 @@ def post_process_tools_description(
 
 
 class ToolServer(ABC):
-
     @abstractmethod
     def has_tool(self, tool_name: str):
         pass
@@ -86,7 +85,6 @@ class ToolServer(ABC):
 
 
 class MCPToolServer(ToolServer):
-
     def __init__(self):
         self.harmony_tool_descriptions = {}
 
@@ -132,9 +130,10 @@ class MCPToolServer(ToolServer):
     async def get_tool_session(self, tool_name: str):
         url = self.urls.get(tool_name)
         if url:
-            async with sse_client(url=url) as streams, ClientSession(
-                *streams
-            ) as session:
+            async with (
+                sse_client(url=url) as streams,
+                ClientSession(*streams) as session,
+            ):
                 await session.initialize()
                 yield session
         else:
@@ -142,8 +141,7 @@ class MCPToolServer(ToolServer):
 
 
 class DemoToolServer(ToolServer):
-
-    def __init__(self):
+    def __init__(self, *, enable_python: bool = True):
         from sglang.srt.entrypoints.tool import (
             HarmonyBrowserTool,
             HarmonyPythonTool,
@@ -154,9 +152,10 @@ class DemoToolServer(ToolServer):
         browser_tool = HarmonyBrowserTool()
         if browser_tool.enabled:
             self.tools["browser"] = browser_tool
-        python_tool = HarmonyPythonTool()
-        if python_tool.enabled:
-            self.tools["python"] = python_tool
+        if enable_python:
+            python_tool = HarmonyPythonTool()
+            if python_tool.enabled:
+                self.tools["python"] = python_tool
 
     def has_tool(self, tool_name: str):
         return tool_name in self.tools
@@ -175,8 +174,11 @@ class DemoToolServer(ToolServer):
     async def get_tool_session(self, tool_name: str):
         yield self.tools[tool_name]
 
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+    async def aclose(self):
+        browser = self.tools.get("browser")
+        exa_client = getattr(browser, "exa_client", None) if browser else None
+        if exa_client is not None:
+            await exa_client.close()
 
 
 class NativeToolServer(DemoToolServer):

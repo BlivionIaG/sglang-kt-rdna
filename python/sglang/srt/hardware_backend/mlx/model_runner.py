@@ -22,7 +22,6 @@ GPU execution.  The lazy API is a thin split of the synchronous API:
 ``*_finalize`` blocks on the lazy token(s) and commits per-request
 state.
 """
-from __future__ import annotations
 
 import logging
 import time

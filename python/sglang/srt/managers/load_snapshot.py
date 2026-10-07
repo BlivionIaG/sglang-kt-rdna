@@ -54,8 +54,6 @@ import msgspec.structs
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.utils.network import is_zmq_endpoint_ipv6
-import types
-import socket
 
 logger = logging.getLogger(__name__)
 

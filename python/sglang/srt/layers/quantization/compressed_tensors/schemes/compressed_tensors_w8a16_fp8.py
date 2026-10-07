@@ -1,11 +1,11 @@
-from __future__ import annotations
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Callable, List, Optional
 
 import torch
-from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
+from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -20,7 +20,6 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
-from compressed_tensors.quantization import QuantizationStrategy
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 

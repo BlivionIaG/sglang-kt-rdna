@@ -1,4 +1,3 @@
-from __future__ import annotations
 import functools
 import logging
 from typing import Iterable, Tuple

@@ -5,7 +5,6 @@ PyTorch exposes ROCm through the same ``torch.cuda.*`` API surface as CUDA
 ``RocmDeviceMixin`` inherits all device ops from ``CudaDeviceMixin`` and
 only overrides identity (``_enum``, ``device_name``).
 """
-from __future__ import annotations
 
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import PlatformEnum

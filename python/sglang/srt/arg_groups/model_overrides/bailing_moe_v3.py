@@ -1,5 +1,4 @@
 """Config-time override declarations for bailing_moe_v3."""
-from __future__ import annotations
 
 import logging
 from typing import Any

@@ -6,7 +6,6 @@ after the expert computation. A generic TP‑all‑gather wrapper is provided
 to transparently gather the hidden dimension when needed (e.g. GGUF with
 full weights).
 """
-from __future__ import annotations
 
 from abc import ABC, abstractmethod
 

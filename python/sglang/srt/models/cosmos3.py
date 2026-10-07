@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +33,6 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model
-import time
 
 
 class Cosmos3ForConditionalGeneration(Qwen3VLForConditionalGeneration):

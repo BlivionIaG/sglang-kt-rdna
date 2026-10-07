@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,9 +58,9 @@ completion_templates: dict[str, CompletionTemplate] = {}
 def register_completion_template(template: CompletionTemplate, override: bool = False):
     """Register a new completion template."""
     if not override:
-        assert (
-            template.name not in completion_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in completion_templates, (
+            f"{template.name} has been registered."
+        )
 
     completion_templates[template.name] = template
 

@@ -1,4 +1,3 @@
-from __future__ import annotations
 import logging
 from enum import Enum
 
@@ -20,7 +19,6 @@ from sglang.srt.models.inkling_common.util import (
 )
 from sglang.srt.models.llama import LlamaMLP
 from sglang.srt.runtime_context import get_exec, get_model
-import time
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,6 @@ Ollama-compatible API protocol definitions.
 These models match the Ollama API format:
 https://github.com/ollama/ollama/blob/main/docs/api.md
 """
-from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional, Union
 

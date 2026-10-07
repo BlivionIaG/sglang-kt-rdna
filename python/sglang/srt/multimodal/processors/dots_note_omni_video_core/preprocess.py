@@ -1,5 +1,4 @@
 """Train-compatible v2 preprocessing for dots video serving."""
-from __future__ import annotations
 
 import base64
 import io

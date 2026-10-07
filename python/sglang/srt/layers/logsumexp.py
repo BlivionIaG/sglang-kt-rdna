@@ -12,7 +12,6 @@ large common offset.
 need both the normalizer and the top-k tokens pay for a single read of the
 input.
 """
-from __future__ import annotations
 
 import torch
 import triton

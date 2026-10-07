@@ -14,7 +14,6 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
 )
 from sglang.srt.utils.common import human_readable_int
-import time
 
 
 class Schedule(msgspec.Struct):

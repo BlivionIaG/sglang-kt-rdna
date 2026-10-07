@@ -20,7 +20,6 @@ Usage:
         HookType.AROUND,
     )
 """
-from __future__ import annotations
 
 import contextvars
 import functools
@@ -32,7 +31,6 @@ from collections import defaultdict
 from collections.abc import Callable
 from enum import Enum
 from typing import NamedTuple
-import time
 
 logger = logging.getLogger(__name__)
 

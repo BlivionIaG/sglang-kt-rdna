@@ -1,124 +1,29 @@
-from __future__ import annotations
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Literal
+
+import torch
 
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
+    SpecTokensDetails,
+    StreamOptions,
 )
-from typing import Literal
 
 logger = logging.getLogger(__name__)
 
+# GPT-2 style byte-level BPE decoder table (char -> raw byte). Byte-level BPE
+# vocab tokens are stored as a printable-char mapping of the raw UTF-8 bytes
+# (see openai/gpt-2 bytes_to_unicode); converting a token id back to its raw
+# bytes must go through this table, NOT through `token.encode()` on the
+# detokenized display string (that loses fragmentary bytes as U+FFFD).
+_BYTE_DECODER: dict[str, int] = {}
 
-def to_openai_style_logprobs(
-    input_token_logprobs=None,
-    output_token_logprobs=None,
-    input_top_logprobs=None,
-    output_top_logprobs=None,
-):
-    ret_logprobs = LogProbs()
-
-    def append_token_logprobs(token_logprobs):
-        for logprob, _, token_text in token_logprobs:
-            ret_logprobs.tokens.append(token_text)
-            ret_logprobs.token_logprobs.append(logprob)
-
-            # Not supported yet
-            ret_logprobs.text_offset.append(-1)
-
-    def append_top_logprobs(top_logprobs):
-        for tokens in top_logprobs:
-            if tokens is not None:
-                ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
-                )
-            else:
-                ret_logprobs.top_logprobs.append(None)
-
-    if input_token_logprobs is not None:
-        append_token_logprobs(input_token_logprobs)
-    if output_token_logprobs is not None:
-        append_token_logprobs(output_token_logprobs)
-    if input_top_logprobs is not None:
-        append_top_logprobs(input_top_logprobs)
-    if output_top_logprobs is not None:
-        append_top_logprobs(output_top_logprobs)
-
-    return ret_logprobs
-
-
-def process_hidden_states_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[List]:
-    """Process hidden states from a ret item in non-streaming response.
-
-    Args:
-        ret_item: Response item containing meta_info
-        request: The original request object
-
-    Returns:
-        Processed hidden states for the last token, or None
-    """
-    if not request.return_hidden_states:
-        return None
-
-    hidden_states = ret_item["meta_info"].get("hidden_states", None)
-    if hidden_states is not None:
-        hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
-    return hidden_states
-
-
-def process_routed_experts_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[str]:
-    """Process routed experts from a ret item in non-streaming response."""
-    if not getattr(request, "return_routed_experts", False):
-        return None
-    return ret_item["meta_info"].get("routed_experts", None)
-
-
-def process_cached_tokens_details_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[CachedTokensDetails]:
-    """Process cached tokens details from a ret item in non-streaming response."""
-    if not getattr(request, "return_cached_tokens_details", False):
-        return None
-
-    details = ret_item["meta_info"].get("cached_tokens_details", None)
-    if details is None:
-        return None
-
-    # Check if L3 storage fields are present
-    if "storage" in details:
-        return CachedTokensDetails(
-            device=details.get("device", 0),
-            host=details.get("host", 0),
-            storage=details.get("storage", 0),
-            storage_backend=details.get("storage_backend"),
-        )
-    else:
-        return CachedTokensDetails(
-            device=details.get("device", 0),
-            host=details.get("host", 0),
-        )
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+# Tokenizer-level cache: once verified, we know whether *all* tokens from a
+# given tokenizer can safely use the byte decoder. Avoids per-token checks.
+_BYTE_LEVEL_TOKENIZERS: set = set()
 
 
 def _build_byte_decoder() -> dict[str, int]:
@@ -218,6 +123,57 @@ def token_id_to_bytes(tokenizer, token_id) -> list[int] | None:
     return list(out)
 
 
+def to_openai_style_logprobs(
+    input_token_logprobs=None,
+    output_token_logprobs=None,
+    input_top_logprobs=None,
+    output_top_logprobs=None,
+    tokenizer=None,
+):
+    """Convert engine logprob triples to an OpenAI ``LogProbs`` object.
+
+    Each engine logprob item is a ``(logprob, token_id, token_text)`` triple.
+    ``token_text`` is a detokenized *display* string that loses fragmentary
+    byte-level tokens (a lone byte of a 4-byte char decodes to U+FFFD).  The
+    legacy completions surface has no per-token ``bytes`` field, so when
+    ``tokenizer`` is provided we render fragments losslessly as latin-1
+    (one char per raw byte), keeping the string channel reversible.
+    """
+    ret_logprobs = LogProbs()
+
+    def append_token_logprobs(token_logprobs):
+        for logprob, token_id, token_text in token_logprobs:
+            token_text = _lossless_token_text(tokenizer, token_id, token_text)
+            ret_logprobs.tokens.append(token_text)
+            ret_logprobs.token_logprobs.append(logprob)
+
+            # Not supported yet
+            ret_logprobs.text_offset.append(-1)
+
+    def append_top_logprobs(top_logprobs):
+        for tokens in top_logprobs:
+            if tokens is not None:
+                ret_logprobs.top_logprobs.append(
+                    {
+                        _lossless_token_text(tokenizer, token_id, token_text): logprob
+                        for logprob, token_id, token_text in tokens
+                    }
+                )
+            else:
+                ret_logprobs.top_logprobs.append(None)
+
+    if input_token_logprobs is not None:
+        append_token_logprobs(input_token_logprobs)
+    if output_token_logprobs is not None:
+        append_token_logprobs(output_token_logprobs)
+    if input_top_logprobs is not None:
+        append_top_logprobs(input_top_logprobs)
+    if output_top_logprobs is not None:
+        append_top_logprobs(output_top_logprobs)
+
+    return ret_logprobs
+
+
 def _lossless_token_text(tokenizer, token_id, token_text):
     """Return a lossless display string for one engine logprob triple.
 
@@ -257,6 +213,28 @@ def _lossless_token_text(tokenizer, token_id, token_text):
         return token_text if token_text is not None else ""
 
 
+def process_hidden_states_from_ret(
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> list | None:
+    """Process hidden states from a ret item in non-streaming response.
+
+    Args:
+        ret_item: Response item containing meta_info
+        request: The original request object
+
+    Returns:
+        Processed hidden states for the last token, or None
+    """
+    if not request.return_hidden_states:
+        return None
+
+    hidden_states = ret_item["meta_info"].get("hidden_states", None)
+    return process_hidden_states_for_response(
+        hidden_states, request.return_hidden_states
+    )
+
+
 def process_hidden_states_for_response(
     hidden_states: list | None,
     return_hidden_states: bool | Literal["last"],
@@ -286,6 +264,16 @@ def should_include_usage(
     return include_usage, continuous_usage_stats
 
 
+def process_routed_experts_from_ret(
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> str | None:
+    """Process routed experts from a ret item in non-streaming response."""
+    if not getattr(request, "return_routed_experts", False):
+        return None
+    return ret_item["meta_info"].get("routed_experts", None)
+
+
 def cached_tokens_details_from_dict(
     details: dict[str, Any],
 ) -> CachedTokensDetails:
@@ -302,6 +290,21 @@ def cached_tokens_details_from_dict(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def process_cached_tokens_details_from_ret(
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> CachedTokensDetails | None:
+    """Process cached tokens details from a ret item in non-streaming response."""
+    if not request.return_cached_tokens_details:
+        return None
+
+    details = ret_item["meta_info"].get("cached_tokens_details", None)
+    if details is None:
+        return None
+
+    return cached_tokens_details_from_dict(details)
 
 
 def spec_tokens_details_from_meta_info(

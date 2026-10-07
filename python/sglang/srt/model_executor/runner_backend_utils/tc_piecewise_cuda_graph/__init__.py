@@ -11,7 +11,6 @@ The torch.compile-warmup flag (is_in_torch_compile_warmup) lives in
 sglang.srt.compilation.compile_phase — it is torch.compile-internal,
 not piecewise-shared.
 """
-from __future__ import annotations
 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (  # noqa: F401
     TCPCG_FAILURE_HINT,

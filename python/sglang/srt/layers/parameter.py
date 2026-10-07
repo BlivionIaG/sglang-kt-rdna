@@ -1,5 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
-from __future__ import annotations
 
 import logging
 from fractions import Fraction
@@ -8,9 +9,9 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
-import copy
 
 __all__ = [
     "BasevLLMParameter",
@@ -47,41 +48,15 @@ def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
     return None
 
 
-def copy_scalar_per_tensor_scale(
-    target: torch.Tensor, loaded_weight: torch.Tensor
-) -> bool:
-    """Copy a scalar per-tensor scale into a one-element parameter.
-
-    ModelOpt stores a per-tensor scale as a scalar, shape `()`, while a sharded
-    parameter holds one entry per output shard, so a single-shard projection has
-    shape `(1,)` and a fused one has more. The loaders assert an exact shape
-    match, which rejects the copy even though broadcasting a single value into
-    one entry per shard is exactly the intent.
-
-    Returns True when it handled the copy. Callers keep their own assert,
-    misplaced-parameter and dtype handling for every other case.
-    """
-    if target.numel() != 1 or loaded_weight.numel() != 1:
-        return False
-    if target.shape == loaded_weight.shape:
-        return False
-    target.copy_(loaded_weight.reshape(target.shape))
-    return True
-
-
 def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
     """
     Copy `loaded_weight` into `target` while forbidding downcasts.
     bf16/fp16 share the same rank, and all fp8 variants share the same rank.
     """
 
-    if target.dtype == loaded_weight.dtype and copy_scalar_per_tensor_scale(
-        target, loaded_weight
-    ):
-        return
-    assert (
-        target.shape == loaded_weight.shape
-    ), f"{target.shape=}, {loaded_weight.shape=}"
+    assert target.shape == loaded_weight.shape, (
+        f"{target.shape=}, {loaded_weight.shape=}"
+    )
 
     if target.dtype == loaded_weight.dtype:
         target.copy_(loaded_weight)
@@ -94,7 +69,7 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Unsupported copy between dtypes: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if target_rank < loaded_rank:
+    if target_rank < loaded_rank and not envs.SGLANG_QUANT_ALLOW_DOWNCASTING.get():
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
@@ -293,9 +268,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=}, {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=}, {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 
@@ -615,8 +590,8 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor, marlin_tile_size
 ):
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     if marlin_tile_size is not None:
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,

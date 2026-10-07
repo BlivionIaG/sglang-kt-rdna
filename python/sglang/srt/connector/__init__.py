@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
@@ -23,7 +22,18 @@ class ConnectorType(str, enum.Enum):
     INSTANCE = "instance"
 
 
-def create_remote_connector(url, device, **kwargs) -> BaseConnector:
+def _is_azure_blob_url(url: str, connector_type: str) -> bool:
+    """Detect Azure Blob Storage URLs.
+
+    Matches ``az://...`` URLs and ``https://<account>.blob.core.windows.net/...``
+    URLs, which are the two forms accepted by the ``blobfile`` library.
+    """
+    if connector_type == "az":
+        return True
+    return connector_type == "https" and ".blob.core.windows.net" in url
+
+
+def create_remote_connector(url, device=None, **kwargs) -> BaseConnector:
     connector_type = parse_connector_type(url)
     if connector_type == "redis":
         return RedisConnector(url)
@@ -31,6 +41,12 @@ def create_remote_connector(url, device, **kwargs) -> BaseConnector:
         return S3Connector(url)
     elif connector_type == "instance":
         return RemoteInstanceConnector(url, device)
+    elif _is_azure_blob_url(url, connector_type):
+        # Imported lazily so the optional ``blobfile`` dependency is only
+        # required when an Azure URL is actually used.
+        from sglang.srt.connector.azure import AzureBlobConnector
+
+        return AzureBlobConnector(url)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
@@ -57,17 +73,3 @@ __all__ = [
     "create_remote_connector",
     "get_connector_type",
 ]
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def _is_azure_blob_url(url: str, connector_type: str) -> bool:
-    """Detect Azure Blob Storage URLs.
-
-    Matches ``az://...`` URLs and ``https://<account>.blob.core.windows.net/...``
-    URLs, which are the two forms accepted by the ``blobfile`` library.
-    """
-    if connector_type == "az":
-        return True
-    return connector_type == "https" and ".blob.core.windows.net" in url

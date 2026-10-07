@@ -1,7 +1,7 @@
 import torch
-import time
 
 cmo_stream = None
+share_stream = None
 
 
 def get_cmo_stream():
@@ -53,9 +53,6 @@ def wait_cmo_stream():
     if stream is not None:
         cur_stream = torch.npu.current_stream()
         cur_stream.wait_stream(stream)
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
 
 
 def get_share_stream():

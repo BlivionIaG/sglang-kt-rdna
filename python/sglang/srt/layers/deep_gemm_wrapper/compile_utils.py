@@ -1,8 +1,11 @@
-from __future__ import annotations
+import fcntl
 import logging
+import math
 import os
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -14,17 +17,18 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory
-import time
-from contextlib import contextmanager, nullcontext
-from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
-import fcntl
-import math
-from pathlib import Path
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_parallel,
+    get_schedule,
+)
+from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
+
+_is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -37,10 +41,9 @@ _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
-# Force redirect deep_gemm cache_dir
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm")
-)
+# Force redirect deep_gemm cache_dir. Defaults under SGLANG_CACHE_DIR so it
+# sits with the other compiled-kernel caches; SGLANG_DG_CACHE_DIR still wins.
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.
@@ -48,7 +51,7 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
@@ -70,9 +73,10 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         #   8192, 9008, ... 16384 (step 16)
         # Totally 1024 + 1024 / 2 + 2048 / 4 + 4096 / 8 + 8192 / 16 = 3072 kernels
         next_m, sample_step = 1024, 2
+        chunked_prefill_size = get_schedule().chunked_prefill_size
         max_prefill_bs = (
-            min(server_args.chunked_prefill_size, 32 * 1024)
-            if server_args.chunked_prefill_size >= 1
+            min(chunked_prefill_size, 32 * 1024)
+            if chunked_prefill_size >= 1
             else 16 * 1024
         )
         while next_m < max_prefill_bs:
@@ -84,14 +88,15 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     else:
         # When fast warmup isn't enabled, generate m_max and compile all the covered Ms.
         m_max = 1024 * 16
-        if server_args.chunked_prefill_size < 1:
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if chunked_prefill_size < 1:
             m_max = 1024 * 64
-        elif server_args.chunked_prefill_size > 8192:
-            m_max = server_args.chunked_prefill_size * 2
+        elif chunked_prefill_size > 8192:
+            m_max = chunked_prefill_size * 2
         m_max = min(1024 * 128, m_max)
         _BUILTIN_M_LIST += list(range(1, m_max + 1))
 
-    _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
+    _IS_FIRST_RANK_ON_NODE = get_device().base_gpu_id == gpu_id
 
     # Check if is the first rank on node.
     # Default each rank will try compile all Ms to
@@ -103,11 +108,36 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_BF16_MASKED = auto()
+    GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_BF16BF16F32 = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+
+@contextmanager
+def _local_rank_compile_lock(
+    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
+):
+    """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
+
+    Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
+    the same order, so without a lock N local ranks nvcc-compile N identical
+    copies of every kernel. The lock holder compiles into the shared cache;
+    waiters then find the cubins already present and their pass over the M
+    list is execution warmup only.
+    """
+    lock_dir = Path(os.environ["DG_JIT_CACHE_DIR"]) / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{kernel_type.name}_n{n}_k{k}_g{num_groups}.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 # TODO improve code
@@ -146,13 +176,14 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        _compile_deep_gemm_one_type_all(
-            kernel_type=kernel_type,
-            n=n,
-            k=k,
-            num_groups=num_groups,
-            m_list=_BUILTIN_M_LIST,
-        )
+        with _local_rank_compile_lock(kernel_type, n, k, num_groups):
+            _compile_deep_gemm_one_type_all(
+                kernel_type=kernel_type,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                m_list=_BUILTIN_M_LIST,
+            )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
@@ -170,9 +201,14 @@ def _compile_deep_gemm_one_type_all(
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
+            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+        memory_budget = get_available_gpu_memory(
+            device="cuda", gpu_id=torch.cuda.current_device()
+        )
 
         # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
         max_m = max(m_list)
@@ -189,7 +225,7 @@ def _compile_deep_gemm_one_type_all(
                     kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
                 )
                 > memory_budget
-                and max_m > 4096
+                and max_m > 2048
             ):
                 max_m = max_m // 2
             logger.warning(
@@ -202,12 +238,18 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
+        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
+            deep_gemm, "set_compile_mode"
+        )
+        if has_compile_mode_api:
+            old_compile_mode = deep_gemm.get_compile_mode()
+            deep_gemm.set_compile_mode(1)
+
         # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
+        for m in tqdm(m_list, desc="DeepGEMM warmup"):
             executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        if has_compile_mode_api:
+            deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -226,6 +268,8 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -238,6 +282,10 @@ class _BaseWarmupExecutor:
             return (max_m * k + n * k + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
+            return (
+                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
             return (
                 num_groups * max_m * k
@@ -248,6 +296,13 @@ class _BaseWarmupExecutor:
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
+            return (
+                num_groups * max_m * k * 2
+                + num_groups * n * k * 2
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
 
@@ -259,7 +314,7 @@ def _empty_token_fp8(size):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
         ),
     )
@@ -269,7 +324,7 @@ def _empty_block_fp8(size):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
             device="cuda",
             dtype=torch.float32,
@@ -306,7 +361,23 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
+        )
+
+
+class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            self.a[:m],
+            self.b,
+            self.out[:m],
+            self.m_indices[:m],
         )
 
 
@@ -340,57 +411,6 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
         deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
 
 
-@contextmanager
-def deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
-):
-    if m > 0:
-        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
-    yield
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-@contextmanager
-def _local_rank_compile_lock(
-    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
-):
-    """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
-
-    Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
-    the same order, so without a lock N local ranks nvcc-compile N identical
-    copies of every kernel. The lock holder compiles into the shared cache;
-    waiters then find the cubins already present and their pass over the M
-    list is execution warmup only.
-    """
-    lock_dir = Path(os.environ["DG_JIT_CACHE_DIR"]) / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{kernel_type.name}_n{n}_k{k}_g{num_groups}.lock"
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
-        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
-        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
-        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
-
-    def execute(self, m):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
-            self.a[:m],
-            self.b,
-            self.out[:m],
-            self.m_indices[:m],
-        )
-
-
 class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty(
@@ -411,6 +431,15 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
+
+
+def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    if _is_musa:
+        return nullcontext()
+
+    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type)
 
 
 @contextmanager

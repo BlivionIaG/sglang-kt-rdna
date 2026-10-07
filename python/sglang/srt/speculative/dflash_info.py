@@ -14,7 +14,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_npu
-import copy
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker

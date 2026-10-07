@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Adapted from https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/encoding/encoding_dsv32.py
 import copy
 import json
@@ -47,9 +46,7 @@ user_msg_template: str = "<｜User｜>{content}<｜Assistant｜>"
 assistant_msg_template: str = "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"
 thinking_template = "{reasoning_content}"
 
-response_format_template: str = (
-    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
-)
+response_format_template: str = "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
 tool_call_template: str = (
     '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
 )
@@ -98,7 +95,14 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
     P_dsml_strs = []
 
-    arguments = json.loads(tool_call["arguments"])
+    raw_arguments = tool_call["arguments"]
+    arguments = (
+        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    )
+    if not isinstance(arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

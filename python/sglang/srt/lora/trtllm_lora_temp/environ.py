@@ -15,7 +15,6 @@ Default policy (applies only when ``SGLANG_EXPERIMENTAL_LORA_OPTI=1``):
 C++-getenv flags (read via ``getenv`` in the JIT launcher, not in Python) are
 listed at the bottom for documentation only; set them in the launch env.
 """
-from __future__ import annotations
 
 import os
 

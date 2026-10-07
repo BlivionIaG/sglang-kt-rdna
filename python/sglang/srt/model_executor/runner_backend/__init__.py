@@ -12,7 +12,6 @@ Public API:
   - TcPiecewiseCudaGraphBackend — torch.compile-driven piecewise
     capture; FX-splits the model at attention layers.
 """
-from __future__ import annotations
 
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (  # noqa: F401
     BaseCudaGraphBackend,

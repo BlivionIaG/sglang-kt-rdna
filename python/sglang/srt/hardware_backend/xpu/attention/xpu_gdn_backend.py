@@ -1,4 +1,3 @@
-from __future__ import annotations
 import torch
 from sgl_kernel import gdn_attention as sgl_kernel_gdn_attention
 

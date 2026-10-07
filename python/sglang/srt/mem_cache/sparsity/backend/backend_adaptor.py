@@ -1,4 +1,3 @@
-from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
@@ -47,8 +46,8 @@ class BackendAdaptor(ABC):
         pass
 
 
-class NSABackendAdaptor(BackendAdaptor):
-    """Adaptor for NSA (Native Sparse Attention) backend."""
+class DSABackendAdaptor(BackendAdaptor):
+    """Adaptor for DSA (DeepSeek Sparse Attention) backend."""
 
     def __init__(
         self,
@@ -71,9 +70,9 @@ class NSABackendAdaptor(BackendAdaptor):
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """
-        Transform logical page indices to physical device indices for NSA backend.
+        Transform logical page indices to physical device indices for DSA backend.
         """
-        # TODO: Implement NSA backend adaptor logic
+        # TODO: Implement DSA backend adaptor logic
         pass
 
 
@@ -175,36 +174,3 @@ class FlashAttentionAdaptor(BackendAdaptor):
         )
 
         return physical_pages.to(torch.int32)
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-class DSABackendAdaptor(BackendAdaptor):
-    """Adaptor for DSA (DeepSeek Sparse Attention) backend."""
-
-    def __init__(
-        self,
-        device: torch.device,
-        req_to_token_pool,
-    ):
-        super().__init__(device)
-        self.req_to_token_pool = req_to_token_pool
-
-    def adapt_for_attn_metadata(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
-        layer_id: int,
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        """
-        Transform logical page indices to physical device indices for DSA backend.
-        """
-        # TODO: Implement DSA backend adaptor logic
-        pass

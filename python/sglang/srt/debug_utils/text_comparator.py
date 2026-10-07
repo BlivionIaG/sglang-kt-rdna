@@ -1,4 +1,3 @@
-from __future__ import annotations
 import argparse
 import hashlib
 import json
@@ -10,7 +9,7 @@ _DESCRIPTION = """Compare and find differences to benchmark outputs.
 
 Supported inputs:
 * The samples jsonl from `lm_eval --log_samples --output_path FOLDER_NAME`
-* The output from `gsm8k/bench_sglang.py --raw-result-file FILE_NAME` (or mmlu)
+* Legacy benchmark JSONL with prompt_id, prompt, output, and correct fields
 """
 
 

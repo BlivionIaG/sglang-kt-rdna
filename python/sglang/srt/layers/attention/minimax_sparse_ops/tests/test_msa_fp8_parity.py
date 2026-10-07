@@ -12,7 +12,6 @@ cover two independent P-quantization errors (~1e-1 worst-case elementwise).
 Requires SM100 + fmha_sm100 (first run JIT-compiles the fp8 variants).
 Run: pytest python/sglang/srt/layers/attention/minimax_sparse_ops/tests/test_msa_fp8_parity.py -v
 """
-from __future__ import annotations
 
 import pytest
 import torch

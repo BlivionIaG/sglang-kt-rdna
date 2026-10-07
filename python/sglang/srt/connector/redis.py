@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
@@ -15,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 
 class RedisConnector(BaseKVConnector):
-
     def __init__(self, url: str):
         import redis
 

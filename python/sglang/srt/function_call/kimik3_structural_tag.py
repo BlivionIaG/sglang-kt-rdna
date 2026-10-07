@@ -1,9 +1,9 @@
-from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from xgrammar import StructuralTag
 from xgrammar.structural_tag import (
     AnyTextFormat,
+    AnyTokensFormat,
     ConstStringFormat,
     ExcludeTokenFormat,
     Format,
@@ -20,17 +20,6 @@ from xgrammar.structural_tag import (
 )
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
-
-try:
-    from xgrammar.structural_tag import AnyTokensFormat
-except ImportError:  # xgrammar < the release that added it (this env: 0.1.27)
-    # Added with the qwen4 subsystem (sgl-project/sglang), whose tree imports
-    # xgrammar's `AnyTokensFormat` at module scope; this environment's xgrammar
-    # exposes `AnyTextFormat` but not that name, so the module failed to import
-    # and took the whole model-import path down with it. `AnyTextFormat` is the
-    # closest available format and keeps this builder working; the Kimi-K3
-    # structural-tag path is not used by Qwen4-Exp.
-    AnyTokensFormat = AnyTextFormat
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,

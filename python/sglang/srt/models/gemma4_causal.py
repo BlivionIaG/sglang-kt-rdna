@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,7 +69,6 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_pp_layers
-import time
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/configuration_kimi_vl.py
 from typing import Optional, Union
@@ -19,7 +18,7 @@ class KimiVLConfig(PretrainedConfig):
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
-        **kwargs
+        **kwargs,
     ):
         if vision_config is None:
             vision_config = MoonViTConfig()

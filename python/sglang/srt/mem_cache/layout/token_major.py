@@ -12,7 +12,6 @@ so every per-layer view is ``(num_slots, *row_shape)`` with slot stride
 (``build_mamba_entry_views``) uses the same per-slot entry. ``anchor_bytes``
 is the pool region's offset inside the raw buffer.
 """
-from __future__ import annotations
 
 from typing import List, Sequence, Tuple
 

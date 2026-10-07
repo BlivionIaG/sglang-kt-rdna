@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import re
 
@@ -53,30 +55,6 @@ def strict_contiguous(x: torch.Tensor) -> torch.Tensor:
     return x.clone(memory_format=torch.contiguous_format)
 
 
-class PPMissingLayer(torch.nn.Identity):
-    # Adapted from
-    # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
-    """
-    A placeholder layer for missing layers in a pipeline parallel model.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.return_tuple = kwargs.get("return_tuple", False)
-
-    def forward(self, *args, **kwargs):
-        """
-        Return the first arg from args or the first value from kwargs.
-
-        Wraps the input in a tuple if `self.return_tuple` is True.
-        """
-        input = args[0] if args else next(iter(kwargs.values()))
-        return (input,) if self.return_tuple else input
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
 def copy_or_rebind_param(
     module: torch.nn.Module, name: str, new_value: torch.Tensor
 ) -> None:
@@ -126,3 +104,24 @@ def alias_or_bind_derived_param(
             setattr(module, derived_name, source)
             return
     copy_or_rebind_param(module, derived_name, derived_value)
+
+
+class PPMissingLayer(torch.nn.Identity):
+    # Adapted from
+    # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
+    """
+    A placeholder layer for missing layers in a pipeline parallel model.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.return_tuple = kwargs.get("return_tuple", False)
+
+    def forward(self, *args, **kwargs):
+        """
+        Return the first arg from args or the first value from kwargs.
+
+        Wraps the input in a tuple if `self.return_tuple` is True.
+        """
+        input = args[0] if args else next(iter(kwargs.values()))
+        return (input,) if self.return_tuple else input

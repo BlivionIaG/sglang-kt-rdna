@@ -21,7 +21,6 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
-from dataclasses import field
 
 logger = logging.getLogger(__name__)
 

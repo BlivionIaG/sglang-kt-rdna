@@ -3,7 +3,6 @@
 Skips PyTorch weight loading.  Creates only the CPU-side bookkeeping
 (req_to_token_pool, token_to_kv_pool_allocator) the scheduler needs.
 """
-from __future__ import annotations
 
 import logging
 from typing import Tuple
@@ -27,7 +26,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-import inspect
 
 logger = logging.getLogger(__name__)
 

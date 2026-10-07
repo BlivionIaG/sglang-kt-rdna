@@ -1,5 +1,4 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
-from __future__ import annotations
 
 from typing import Optional
 

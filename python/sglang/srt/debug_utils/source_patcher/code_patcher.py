@@ -1,4 +1,3 @@
-from __future__ import annotations
 import __future__
 
 import importlib

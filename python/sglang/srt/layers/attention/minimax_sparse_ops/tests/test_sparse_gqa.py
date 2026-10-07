@@ -4,18 +4,18 @@ Tests the Triton sparse GQA kernel against a PyTorch reference that computes
 attention only on the topk blocks via standard softmax, covering GQA ratios,
 sink tokens, paged KV (randperm), variable seq_lens, and edge cases.
 """
-from __future__ import annotations
 
 import sys
 
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
+from sglang.srt.utils import get_device
 
-DEVICE = "cuda"
+DEVICE = get_device()
 RTOL = 5e-3
 ATOL = 5e-3
 
@@ -246,9 +246,9 @@ def test_sparse_gqa_vs_reference(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat, 
     )
     o_ref = o_ref.to(o_kernel.dtype)
 
-    assert torch.allclose(
-        o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL
-    ), f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    assert torch.allclose(o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL), (
+        f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -301,9 +301,9 @@ def test_sparse_gqa_topk_exceeds_blocks(
     )
     o_ref = o_ref.to(o_kernel.dtype)
 
-    assert torch.allclose(
-        o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL
-    ), f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    assert torch.allclose(o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL), (
+        f"max abs diff {(o_kernel.float() - o_ref.float()).abs().max().item():.4e}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -354,9 +354,9 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
         topk_idx,
     )
 
-    assert torch.equal(
-        o1, o2
-    ), f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
+    assert torch.equal(o1, o2), (
+        f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
+    )
 
 
 if __name__ == "__main__":

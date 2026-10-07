@@ -9,7 +9,6 @@ forward pass are delegated to an NPUMXFP8LinearMethod kernel (self.kernel). Its
 process_weights_after_loading detects the pre-quantized float8_e4m3fn weight and
 takes the offline (transpose-only) branch.
 """
-from __future__ import annotations
 
 from typing import Dict, List, Optional
 

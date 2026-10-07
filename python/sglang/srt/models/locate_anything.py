@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://huggingface.co/nvidia/LocateAnything-3B/blob/main/modeling_locateanything.py
 # and from vllm-project/vllm PR #44182.
@@ -44,7 +43,6 @@ from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import add_prefix
-import msgspec
 
 logger = logging.getLogger(__name__)
 

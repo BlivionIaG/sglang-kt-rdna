@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Optional
+from multiprocessing import Process
+from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.common import pyspy_dump_schedulers
-from typing import Callable, List, Optional
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
-import os
-from multiprocessing import Process
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +26,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert test_stuck_time == 0, (
+                f"stuck tester can be enabled only if soft watchdog is enabled."
+            )
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
@@ -163,9 +161,6 @@ class WatchdogRaw:
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
 
 
 class SubprocessWatchdog:

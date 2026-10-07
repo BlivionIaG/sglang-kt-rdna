@@ -8,7 +8,6 @@ Subpackages:
 
 Backends in cuda_graph_backend/ import from here. Runners do not.
 """
-from __future__ import annotations
 
 # Generic failure-message hint for decode-style CUDA graph capture paths
 # (Full backend used by decode + EAGLE draft runners).

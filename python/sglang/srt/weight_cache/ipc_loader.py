@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """IPC Model Loader — loads model weights from a Weight Cache Daemon.
 
@@ -37,7 +36,6 @@ from .protocol import (
     send_msg,
 )
 from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
-import socket
 
 logger = logging.getLogger(__name__)
 

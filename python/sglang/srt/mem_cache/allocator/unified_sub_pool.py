@@ -67,7 +67,6 @@ import atexit
 import signal
 import time as _time_mod  # local alias so tests can patch
 import weakref
-import copy
 
 _LAZY_COMPACTION_STATS_ENABLED = envs.SGLANG_LOG_LAZY_COMPACTION_STATS.get()
 _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(

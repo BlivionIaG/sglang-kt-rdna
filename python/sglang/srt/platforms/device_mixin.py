@@ -24,7 +24,6 @@ Method status annotations:
   (e.g. ``torch.cuda.empty_cache()``). OOT implementations will NOT take
   effect until the core is migrated in a future PR.
 """
-from __future__ import annotations
 
 import enum
 import random
@@ -36,7 +35,6 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-import types
 
 
 class PlatformEnum(enum.Enum):

@@ -1,5 +1,4 @@
 """Standalone UNLIMITED-OCR model (SAM + CLIP vision encoders, Deepseek backbone)."""
-from __future__ import annotations
 
 import logging
 from array import array

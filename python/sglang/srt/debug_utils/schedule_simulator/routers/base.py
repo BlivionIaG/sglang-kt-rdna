@@ -1,4 +1,3 @@
-from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest

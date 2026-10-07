@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +20,6 @@ import torch
 
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
-import time
 
 
 @dataclass

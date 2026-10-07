@@ -7,7 +7,6 @@ from typing import Any
 
 import msgspec
 from pydantic_core import core_schema
-from dataclasses import fields
 
 
 class Base64Bytes:

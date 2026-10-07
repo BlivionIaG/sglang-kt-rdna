@@ -1,4 +1,3 @@
-from __future__ import annotations
 # modified from https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/tool_parser/internlm2_parser.py
 
 import json
@@ -114,7 +113,7 @@ class InternlmDetector(BaseFormatDetector):
                         parameters = {}
 
                     logger.info(
-                        f"[InternLM Tool Call] Parsed tool call #{idx+1}: name={name}, "
+                        f"[InternLM Tool Call] Parsed tool call #{idx + 1}: name={name}, "
                         f"parameters={json.dumps(parameters, ensure_ascii=False)}"
                     )
 
@@ -137,7 +136,7 @@ class InternlmDetector(BaseFormatDetector):
 
                 except json.JSONDecodeError as e:
                     logger.error(
-                        f"[InternLM Tool Call] Failed to parse JSON for tool call #{idx+1}: {e}"
+                        f"[InternLM Tool Call] Failed to parse JSON for tool call #{idx + 1}: {e}"
                     )
                     continue
 

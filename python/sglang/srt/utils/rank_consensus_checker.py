@@ -13,8 +13,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-import time
-import sys
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator

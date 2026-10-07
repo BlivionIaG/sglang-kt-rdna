@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 """Protocol definitions for the weight cache daemon.
 
@@ -18,7 +17,6 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import safe_pickle_loads
-import socket
 
 logger = logging.getLogger(__name__)
 

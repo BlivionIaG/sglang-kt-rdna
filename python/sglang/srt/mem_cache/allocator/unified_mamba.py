@@ -35,7 +35,6 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
-import copy
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/inductor_pass.py
@@ -15,7 +14,6 @@ from typing import Any, Optional, Union
 import torch
 from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
-import uuid
 
 logger = logging.getLogger(__name__)
 

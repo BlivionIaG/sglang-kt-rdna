@@ -34,7 +34,6 @@ from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
 from sglang.srt.utils import add_prefix
-import time
 
 logger = logging.getLogger(__name__)
 

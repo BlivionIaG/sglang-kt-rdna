@@ -4,7 +4,6 @@ All probes are gated on SGLANG_ENABLE_ASYNC_ASSERT (default off in prod).
 When the gate is on, a violation surfaces as an assertion at the next CUDA
 sync point instead of as a silent NaN cascade or illegal-address crash.
 """
-from __future__ import annotations
 
 import logging
 from typing import Optional

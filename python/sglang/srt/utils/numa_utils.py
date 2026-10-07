@@ -1,34 +1,80 @@
-from __future__ import annotations
+import ctypes
+import glob
 import logging
+import math
 import multiprocessing
 import os
 import random
+import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-import traceback
-import math
-from typing import Optional
-from sglang.srt.utils import get_cpu_ids_by_node
+from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
+
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
-    if (
-        numa_nodes := server_args.numa_node
-    ) is not None and envs.SGLANG_NUMA_BIND_V2.get():
-        numa_node = numa_nodes[gpu_id]
-        numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
-        executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
-        with _mp_set_executable(executable=executable, debug_str=debug_str):
-            yield
-    else:
-        yield
+    if envs.SGLANG_NUMA_BIND_V2.get():
+        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        if numa_node is not None:
+            # _numactl_cpu_mem_args returns None (warn/raise) on empty CPU intersection (#26983).
+            numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+            if numactl_args is not None:
+                # Verify numactl can actually apply the binding before we exec it
+                # in front of the interpreter; relax the memory policy if not.
+                numactl_args, probe_err = _probe_numactl_args(numactl_args)
+                if numactl_args is None:
+                    # numactl could not apply even a CPU-only binding (e.g.
+                    # set_mempolicy(2)/sched_setaffinity(2) blocked by seccomp,
+                    # which the read-only get_mempolicy(2) probe in
+                    # _can_set_mempolicy cannot detect). Reuse #26983's failure
+                    # semantics (warn-and-continue, or raise when
+                    # SGLANG_CRASH_ON_NUMA_BIND_FAILURE) with an explicit reason
+                    # carrying the captured stderr: the CPU intersection already
+                    # succeeded here, so the default "no CPU cores allowed"
+                    # message would mislead operators toward the wrong cause.
+                    probe_suffix = f": {probe_err}" if probe_err else ""
+                    _handle_numa_bind_failure(
+                        numa_node,
+                        reason=(
+                            f"numactl could not apply NUMA binding for node "
+                            f"{numa_node} (e.g. set_mempolicy/sched_setaffinity "
+                            f"blocked by seccomp, or cpuset rejects the policy)"
+                            f"{probe_suffix}; skipping NUMA binding for GPU {gpu_id}."
+                        ),
+                    )
+                    yield
+                    return
+                executable, debug_str = _create_numactl_executable(
+                    numactl_args=numactl_args
+                )
+                if _is_xpu:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK', '')}"
+                    )
+                else:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                    )
+                with _mp_set_executable(executable=executable, debug_str=debug_str):
+                    yield
+                    return
+    yield
 
 
 def _create_numactl_executable(numactl_args: str):
@@ -50,18 +96,15 @@ def _mp_set_executable(executable: str, debug_str: str):
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
-    logger.info(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
+    logger.debug(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
     try:
         yield
     finally:
-        assert (
-            os.fsdecode(multiprocessing.spawn.get_executable()) == executable
-        ), f"{multiprocessing.spawn.get_executable()=}"
+        assert os.fsdecode(multiprocessing.spawn.get_executable()) == executable, (
+            f"{multiprocessing.spawn.get_executable()=}"
+        )
         multiprocessing.spawn.set_executable(old_executable)
-        logger.info(f"mp.set_executable revert to {old_executable}")
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+        logger.debug(f"mp.set_executable revert to {old_executable}")
 
 
 def _get_nvml_device_index(device_id: int) -> int:

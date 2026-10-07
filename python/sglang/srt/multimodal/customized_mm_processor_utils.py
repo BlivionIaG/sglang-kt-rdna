@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Dict, Type
 
 from transformers import PretrainedConfig, ProcessorMixin

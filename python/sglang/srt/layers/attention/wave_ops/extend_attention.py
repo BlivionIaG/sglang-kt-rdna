@@ -2,7 +2,6 @@
 Memory-efficient attention for prefill.
 It support page size = 1.
 """
-from __future__ import annotations
 
 import functools
 import os

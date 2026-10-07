@@ -1,15 +1,13 @@
-from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import polars as pl
 import torch
-from typing import Any, Callable, Dict, Optional, Tuple
 
-_TYPED_FIELDS: list[tuple[str, type]] = [("rank", int)]
+LOAD_FAILED: object = object()
 
 
 def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
@@ -19,9 +17,9 @@ def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
         if "=" in kv:
             k, v = kv.split("=", 1)
             result[k] = v
-    for field, converter in _TYPED_FIELDS:
-        if field in result:
-            result[field] = converter(result[field])
+    for field_name, converter in _TYPED_FIELDS:
+        if field_name in result:
+            result[field_name] = converter(result[field_name])
     return result
 
 
@@ -40,7 +38,7 @@ class ValueWithMeta:
         except Exception as e:
             print(f"Skip load {path} since error {e}")
             return ValueWithMeta(
-                value=None, meta={**meta_from_filename, "filename": path.name}
+                value=LOAD_FAILED, meta={**meta_from_filename, "filename": path.name}
             )
 
         value, meta_from_embedded = _unwrap_dict_format(raw)
@@ -79,9 +77,9 @@ class DumpLoader:
         step = dumper._state.step
         conditions = dict(name=name, step=step, **kwargs)
         row = find_row(self._df, conditions=conditions)
-        assert (
-            row is not None
-        ), f"DumpLoader cannot find row given query {name=} {kwargs=} {self._directory=}"
+        assert row is not None, (
+            f"DumpLoader cannot find row given query {name=} {kwargs=} {self._directory=}"
+        )
 
         path = self._directory / row["filename"]
         output = torch.load(path, weights_only=False)
@@ -165,6 +163,21 @@ def _cast_to_polars_dtype(value, target_dtype):
         return str(value)
     else:
         return value
+
+
+def read_tokenizer_path(directory: Path) -> Optional[str]:
+    """Read tokenizer_path from any .pt file's embedded metadata in a dump directory."""
+    for p in directory.glob("*.pt"):
+        item: ValueWithMeta = ValueWithMeta.load(p)
+        tokenizer_path: Optional[str] = item.meta.get("tokenizer_path")
+        if tokenizer_path is not None:
+            return str(tokenizer_path)
+    return None
+
+
+_TYPED_FIELDS: list[tuple[str, Callable[[str], Any]]] = [
+    ("rank", int),
+]
 
 
 dump_loader = DumpLoader()

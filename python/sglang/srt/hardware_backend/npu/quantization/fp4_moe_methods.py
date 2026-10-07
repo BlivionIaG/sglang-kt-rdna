@@ -4,7 +4,6 @@ DeepSeek-V4's FP4 expert checkpoint stores block-32 MXFP4 weights with E8M0
 scales. This module adapts those checkpoint weights to the shared Ascend MoE
 runner and A5 grouped-matmul kernels.
 """
-from __future__ import annotations
 
 from typing import TYPE_CHECKING
 

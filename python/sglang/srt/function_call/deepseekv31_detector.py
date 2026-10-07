@@ -1,4 +1,3 @@
-from __future__ import annotations
 import json
 import logging
 import re
@@ -166,9 +165,9 @@ class DeepSeekV31Detector(BaseFormatDetector):
                             )
                         )
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
                     if _is_complete_json(func_args_raw):
                         # Update the stored arguments

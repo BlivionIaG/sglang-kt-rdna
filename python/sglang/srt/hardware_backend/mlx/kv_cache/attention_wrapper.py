@@ -24,7 +24,6 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     ContiguousAttentionKVCache,
     WindowedAttentionKVCache,
 )
-import time
 
 _thread_local = threading.local()
 

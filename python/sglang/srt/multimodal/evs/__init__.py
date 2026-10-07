@@ -1,5 +1,4 @@
 """https://arxiv.org/abs/2510.14624: Efficient Video Sampling: Pruning Temporally Redundant Tokens for Faster VLM Inference"""
-from __future__ import annotations
 
 from .evs_module import EVS, EVSConfig, EVSEmbeddingResult
 from .evs_processor import EVSProcessor

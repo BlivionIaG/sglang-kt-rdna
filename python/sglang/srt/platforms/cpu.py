@@ -1,5 +1,4 @@
 """CPU device operations for the SRT platform layer."""
-from __future__ import annotations
 
 import gc
 import platform as _platform

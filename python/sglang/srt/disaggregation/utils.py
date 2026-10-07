@@ -1,37 +1,89 @@
 from __future__ import annotations
 
-import os
 import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional, Type, overload, List, Tuple, Iterable
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
-from functools import reduce
-from copy import copy
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_spec,
+)
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.disaggregation.base.conn import KVArgs
+    from sglang.srt.disaggregation.base.conn import KVArgs, StateType
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
         CommonKVReceiver,
         CommonKVSender,
     )
-    
+    from sglang.srt.managers.schedule_batch import Req
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+    )
+
 #########################
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+
+def poll_and_all_reduce_pp(
+    rids: Iterable[str],
+    ready_poll: int,
+    pp_good_rids: Optional[List[str]] = None,
+    pp_bad_rids: Optional[List[str]] = None,
+) -> List[Optional[int]]:
+    """Map authoritative PP consensus to poll states without polling again."""
+    if pp_good_rids is None or pp_bad_rids is None:
+        raise ValueError("PP consensus is required")
+
+    good_rids = set(pp_good_rids)
+    bad_rids = set(pp_bad_rids)
+    return [
+        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
+        for rid in rids
+    ]
+
+
+def get_dsa_seed_metadata_dim(hf_config) -> int:
+    """Return the model-defined PD seed width, independent of local spec mode."""
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    # QSA models reuse the same flag for their draft-side index sharing but
+    # carry no DSA seed metadata over PD.
+    if not is_deepseek_dsa(hf_config):
+        return 0
+    return get_dsa_mtp_topk_width(hf_config)
+
+
+def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
+    """Return the request-pool row that owns a QSA pending-state ring."""
+    req_pool_idx = req.kv.req_pool_idx
+    if req_pool_idx is None:
+        raise ValueError("QSA pending-state transfer requires an allocated request row")
+    return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
 class DisaggregationMode(Enum):
@@ -39,29 +91,175 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+    @staticmethod
+    def to_engine_type(mode: str) -> str:
+        if mode == DisaggregationMode.PREFILL.value:
+            return "prefill"
+        elif mode == DisaggregationMode.DECODE.value:
+            return "decode"
+        return "unified"
+
+
+def unified_memory_disagg_move_gate(scheduler):
+    """Compaction move gate for a PD node running the unified memory pool.
+
+    Returns a predicate that is True only when no transfer can be in flight, so
+    compaction never relocates a page the RDMA engine is reading or writing.
+    Safe to read this state from here: every mover runs on the scheduler thread.
+
+    A page is exposed from the moment its address reaches the peer until the
+    transfer concludes, and for part of that lifetime the request is in NEITHER
+    end's queue -- so queue emptiness alone is not enough:
+
+    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
+      chunks may still be draining, and the request only reaches the inflight
+      queue later, in the result path.
+    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
+      allocating for the next, whose allocation can urgently flush the peer
+      sub-allocator; the batch reaches the transfer queue only after the loop.
+    """
+    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+
+        def prefill_gate() -> bool:
+            return not (
+                scheduler.disagg_prefill_inflight_queue
+                or scheduler.disagg_prefill_pending_chunk_rids
+            )
+
+        return prefill_gate
+
+    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+
+        def decode_gate() -> bool:
+            decode_offload_manager = scheduler.decode_offload_manager
+            return not (
+                scheduler.disagg_decode_transfer_queue.queue
+                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                or (
+                    decode_offload_manager is not None
+                    and decode_offload_manager.has_inflight_device_transfer()
+                )
+            )
+
+        return decode_gate
+
+    raise ValueError(
+        "unified_memory_disagg_move_gate: scheduler is not a PD node "
+        f"(mode={scheduler.disaggregation_mode})"
+    )
+
 
 #########################
 # Synchronization
 #########################
 
-# env var for testing failure, convert to float explicitly
-FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
-
-def poll_and_all_reduce(pollers, gloo_group):
-    # at a certain prob, the poll is failed to simulate failure
-    if FAILURE_PROB > 0:
-        from sglang.srt.disaggregation.base import KVPoll
-
-        polls = [
-            int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
+def _poll_with_failure_injection(pollers) -> List[int]:
+    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
+        return [
+            int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
         ]
-    else:
-        polls = [int(poller.poll()) for poller in pollers]
+    return [int(poller.poll()) for poller in pollers]
+
+
+def _is_fake_transfer(req: Req) -> bool:
+    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        req.bootstrap_host is None
+        and get_disagg().disaggregation_transfer_backend == "fake"
+    )
+
+
+def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
+    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+
+    Mutates `polls` in-place. Called before all-reduce so that MIN across TP
+    ranks naturally prevents any rank from committing before all ranks are ready.
+    """
+    for i, poll_val in enumerate(polls):
+        if poll_val == int(KVPoll.Success):
+            decode_req = decode_reqs[i]
+            if _is_fake_transfer(decode_req.req):
+                continue
+            actual_room = metadata_buffers.bootstrap_room[
+                decode_req.metadata_buffer_index, 0
+            ].item()
+            if actual_room == 0:
+                polls[i] = int(KVPoll.Transferring)
+
+
+def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
+    """MIN-reduce poll states so no rank commits ahead of its peers."""
+    if dist.get_world_size(group) == 1:
+        return polls
+
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
     return tensor_to_reduce.tolist()
+
+
+def poll_and_all_reduce(
+    pollers,
+    gloo_group: dist.ProcessGroup,
+    decode_reqs=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+):
+    # at a certain prob, the poll is failed to simulate failure
+    polls = _poll_with_failure_injection(pollers)
+
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    if decode_reqs is not None and metadata_buffers is not None:
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+    return _all_reduce_polls(polls, gloo_group)
+
+
+def poll_and_all_reduce_attn_cp_tp_group(
+    pollers,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+):
+    # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
+    # shard observe the same status transitions.
+    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
+
+    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
+    # converge to the same global status.
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
+
+
+def poll_and_all_reduce_with_staging(
+    decode_reqs,
+    staging_handler,
+    gloo_group: dist.ProcessGroup,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+):
+    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    for decode_req in decode_reqs:
+        if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
+            decode_req
+        ):
+            staging_handler.advance_scatter(decode_req)
+
+    # allow test injection of failure probability at runtime
+    receivers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(receivers)
+    for i, decode_req in enumerate(decode_reqs):
+        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
+            decode_req
+        ):
+            # Staging completion timed out; KVPoll.Failed == 0 propagates
+            # through the MIN all_reduce.
+            raw_polls[i] = int(KVPoll.Failed)
+            continue
+        if raw_polls[i] == int(KVPoll.Success):
+            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
+                decode_req
+            ):
+                raw_polls[i] = int(KVPoll.Transferring)
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    if metadata_buffers is not None:
+        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
+    return _all_reduce_polls(raw_polls, gloo_group)
 
 
 #########################
@@ -98,14 +296,23 @@ class MetadataBuffers:
         size: int,
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
+        max_sampling_mask_tokens: int,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        output_dsa_topk_indices_dim: int = 0,
+        *,
+        kv_checksum_enabled: bool = False,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
+        self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
+        bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
+            # TODO: Fix me when npu backend supports torch.uint64
+            bootstrap_room_dtype = torch.int64
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
@@ -136,6 +343,21 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_token_sampling_mask_len = None
+            self.output_token_sampling_mask_idx = None
+            self.output_token_sampling_logprobs = None
+            if self.enable_sampling_mask:
+                self.output_token_sampling_mask_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_mask_idx = torch.zeros(
+                    (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, max_sampling_mask_tokens),
+                    dtype=torch.float32,
+                    device=device,
+                )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
@@ -146,90 +368,167 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            if self.output_dsa_topk_indices_dim > 0:
+                self.output_dsa_topk_indices = torch.full(
+                    (size, self.output_dsa_topk_indices_dim),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                self.output_dsa_topk_indices = None
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
-                (size, 8), dtype=torch.uint64, device=device
+                (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
+        self.kv_checksum: torch.Tensor | None = None
+        if kv_checksum_enabled:
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # Width 8 (uint64) keeps the per-row size at the 64 B RDMA minimum.
+                self.kv_checksum = torch.zeros(
+                    (self.output_ids.shape[0], 8),
+                    dtype=self.bootstrap_room.dtype,
+                    device=self.bootstrap_room.device,
+                )
+
+    def set_kv_checksum(self, req: Req, value: int) -> None:
+        self.kv_checksum[req.metadata_buffer_index, 0] = value
+
+    def get_kv_checksum(self, idx: int) -> int:
+        return int(self.kv_checksum[idx, 0].item())
+
     def get_buf_infos(self):
-        ptrs = [
-            self.output_ids.data_ptr(),
-            self.cached_tokens.data_ptr(),
-            self.output_token_logprobs_val.data_ptr(),
-            self.output_token_logprobs_idx.data_ptr(),
-            self.output_top_logprobs_val.data_ptr(),
-            self.output_top_logprobs_idx.data_ptr(),
-            self.output_topk_p.data_ptr(),
-            self.output_topk_index.data_ptr(),
-            self.output_hidden_states.data_ptr(),
-            self.bootstrap_room.data_ptr(),
+        bufs = [
+            self.output_ids,
+            self.cached_tokens,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
+            self.output_token_sampling_mask_len,
+            self.output_token_sampling_mask_idx,
+            self.output_token_sampling_logprobs,
+            self.output_topk_p,
+            self.output_topk_index,
+            self.output_hidden_states,
         ]
-        data_lens = [
-            self.output_ids.nbytes,
-            self.cached_tokens.nbytes,
-            self.output_token_logprobs_val.nbytes,
-            self.output_token_logprobs_idx.nbytes,
-            self.output_top_logprobs_val.nbytes,
-            self.output_top_logprobs_idx.nbytes,
-            self.output_topk_p.nbytes,
-            self.output_topk_index.nbytes,
-            self.output_hidden_states.nbytes,
-            self.bootstrap_room.nbytes,
-        ]
-        item_lens = [
-            self.output_ids[0].nbytes,
-            self.cached_tokens[0].nbytes,
-            self.output_token_logprobs_val[0].nbytes,
-            self.output_token_logprobs_idx[0].nbytes,
-            self.output_top_logprobs_val[0].nbytes,
-            self.output_top_logprobs_idx[0].nbytes,
-            self.output_topk_p[0].nbytes,
-            self.output_topk_index[0].nbytes,
-            self.output_hidden_states[0].nbytes,
-            self.bootstrap_room[0].nbytes,
-        ]
+        if self.output_dsa_topk_indices is not None:
+            bufs.append(self.output_dsa_topk_indices)
+        bufs.append(self.bootstrap_room)
+        if self.kv_checksum is not None:
+            bufs.append(self.kv_checksum)
+        bufs = [buf for buf in bufs if buf is not None]
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx],
-            self.cached_tokens[idx],
-            self.output_token_logprobs_val[idx],
-            self.output_token_logprobs_idx[idx],
-            self.output_top_logprobs_val[idx],
-            self.output_top_logprobs_idx[idx],
-            self.output_topk_p[idx],
-            self.output_topk_index[idx],
-            self.output_hidden_states[idx],
-            self.bootstrap_room[idx],
+            self.output_ids[idx].clone(),
+            self.cached_tokens[idx].clone(),
+            self.output_token_logprobs_val[idx].clone(),
+            self.output_token_logprobs_idx[idx].clone(),
+            self.output_top_logprobs_val[idx].clone(),
+            self.output_top_logprobs_idx[idx].clone(),
+            (
+                self.output_token_sampling_mask_len[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_mask_idx[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_logprobs[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            self.output_topk_p[idx].clone(),
+            self.output_topk_index[idx].clone(),
+            self.output_hidden_states[idx].clone(),
+            (
+                self.output_dsa_topk_indices[idx].clone()
+                if self.output_dsa_topk_indices is not None
+                else None
+            ),
+            self.bootstrap_room[idx].clone(),
         )
 
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
+        # counts and slots 4-6 are reused for multimodal prompt token counts
+        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
+        self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
+        self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
+        self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+
+        # Compute multimodal prompt token counts on the prefill node so decode
+        # can report them in usage.
+        if req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.cached_tokens[req.metadata_buffer_index][4] = image_t
+        self.cached_tokens[req.metadata_buffer_index][5] = audio_t
+        self.cached_tokens[req.metadata_buffer_index][6] = video_t
         if req.return_logprob:
-            if req.output_token_logprobs_val:  # not none or empty list
+            if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
+                    req.logprob.output_token_logprobs_val[0]
                 )
-            if req.output_token_logprobs_idx:  # not none or empty list
+            if req.logprob.output_token_logprobs_idx:  # not none or empty list
                 self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
+                    req.logprob.output_token_logprobs_idx[0]
                 )
 
-            if req.output_top_logprobs_val:  # not none or empty list
+            if req.logprob.output_top_logprobs_val:  # not none or empty list
+                top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
+                max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
+                if top_logprobs_len > max_top_logprobs_len:
+                    raise RuntimeError(
+                        f"top_logprobs_num {top_logprobs_len} exceeds "
+                        f"disaggregation metadata capacity {max_top_logprobs_len}. "
+                        "Lower top_logprobs_num or increase the metadata buffer."
+                    )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
+                    : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                    req.logprob.output_top_logprobs_val[0],
+                    dtype=torch.float32,
+                    device="cpu",
                 )
-            if req.output_top_logprobs_idx:  # not none or empty list
+            if req.logprob.output_top_logprobs_idx:  # not none or empty list
                 self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
+                    : len(req.logprob.output_top_logprobs_idx[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                    req.logprob.output_top_logprobs_idx[0],
+                    dtype=torch.int32,
+                    device="cpu",
                 )
+        if req.return_sampling_mask:
+            # Prefill streams a request only once its KV transfer ends or it aborts,
+            # so the first token's row is the only one queued here.
+            chunk = req.sampling_mask_rows.view()
+            mask_len = len(chunk.token_ids)
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = mask_len
+            self.output_token_sampling_mask_idx[
+                req.metadata_buffer_index, :mask_len
+            ].copy_(torch.from_numpy(chunk.token_ids))
+            self.output_token_sampling_logprobs[
+                req.metadata_buffer_index, : len(chunk.logprobs)
+            ].copy_(torch.from_numpy(chunk.logprobs))
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
@@ -244,6 +543,14 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+            if self.output_dsa_topk_indices is not None:
+                dsa_topk_indices = req.output_dsa_topk_indices
+                if dsa_topk_indices is not None:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
+                        dsa_topk_indices
+                    )
+                else:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
@@ -296,10 +603,13 @@ def get_kv_class(
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: KVClassType
 ) -> Optional[Type]:
-    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+    from sglang.srt.disaggregation.base import KVArgs
+
+    # Every backend shares the same KVArgs container.
+    if class_type == KVClassType.KVARGS:
+        return KVArgs
 
     if transfer_backend == TransferBackend.MOONCAKE:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
@@ -308,15 +618,12 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MooncakeKVManager,
             KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: (MooncakeKVReceiver),
+            KVClassType.RECEIVER: MooncakeKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.MORI:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mori import (
             MoriKVBootstrapServer,
             MoriKVManager,
@@ -325,13 +632,11 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MoriKVManager,
             KVClassType.SENDER: MoriKVSender,
-            KVClassType.RECEIVER: (MoriKVReceiver),
+            KVClassType.RECEIVER: MoriKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MoriKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
         from sglang.srt.disaggregation.ascend import (
             AscendKVBootstrapServer,
@@ -339,18 +644,14 @@ def get_kv_class(
             AscendKVReceiver,
             AscendKVSender,
         )
-        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: AscendKVManager,
             KVClassType.SENDER: AscendKVSender,
-            KVClassType.RECEIVER: (AscendKVReceiver),
+            KVClassType.RECEIVER: AscendKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.NIXL:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.nixl import (
             NixlKVBootstrapServer,
             NixlKVManager,
@@ -359,262 +660,28 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: NixlKVManager,
             KVClassType.SENDER: NixlKVSender,
-            KVClassType.RECEIVER: (NixlKVReceiver),
+            KVClassType.RECEIVER: NixlKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import (
             FakeKVManager,
             FakeKVReceiver,
             FakeKVSender,
         )
 
+        # No bootstrap server: the fake backend never registers one.
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
-            KVClassType.RECEIVER: (FakeKVReceiver),
+            KVClassType.RECEIVER: FakeKVReceiver,
         }
-        return class_mapping.get(class_type)
+    else:
+        raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
-    raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
-
-
-#########################
-# KV Pages
-#########################
-
-
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaranteed to be full except the last page.
-    # 2. page index = kv_index // page_size
-    # The return vector is kv_indices[::page_size] // page_size
-    if page_size == 1:  # shortcut
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
-
-
-def kv_to_page_num(num_kv_indices: int, page_size: int):
-    # ceil(num_kv_indices / page_size)
-    return (num_kv_indices + page_size - 1) // page_size
-
-
-#########################
-# Misc
-#########################
-
-
-def is_mla_backend(target_kv_pool) -> bool:
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-
-    # Duck-type check for DSV4 pool — avoids importing
-    # deepseekv4_memory_pool when DSV4 archs are disabled.
-    return isinstance(target_kv_pool, MLATokenToKVPool) or getattr(
-        target_kv_pool, "_is_v4_token_pool", False
-    )
-
-
-def prepare_abort(req: Req, error_message: str, status_code=None):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-    # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
-
-    if req.return_logprob:
-        req.input_token_logprobs_val = []
-        req.input_token_logprobs_idx = []
-        req.input_top_logprobs_val = []
-        req.input_top_logprobs_idx = []
-        req.input_token_ids_logprobs_val = []
-        req.input_token_ids_logprobs_idx = []
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def poll_and_all_reduce_pp(
-    rids: Iterable[str],
-    ready_poll: int,
-    pp_good_rids: Optional[List[str]] = None,
-    pp_bad_rids: Optional[List[str]] = None,
-) -> List[Optional[int]]:
-    """Map authoritative PP consensus to poll states without polling again."""
-    if pp_good_rids is None or pp_bad_rids is None:
-        raise ValueError("PP consensus is required")
-
-    good_rids = set(pp_good_rids)
-    bad_rids = set(pp_bad_rids)
-    return [
-        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
-        for rid in rids
-    ]
-
-
-def get_dsa_seed_metadata_dim(hf_config) -> int:
-    """Return the model-defined PD seed width, independent of local spec mode."""
-    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
-        return 0
-    # QSA models reuse the same flag for their draft-side index sharing but
-    # carry no DSA seed metadata over PD.
-    if not is_deepseek_dsa(hf_config):
-        return 0
-    return get_dsa_mtp_topk_width(hf_config)
-
-
-def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
-    """Return the request-pool row that owns a QSA pending-state ring."""
-    req_pool_idx = req.kv.req_pool_idx
-    if req_pool_idx is None:
-        raise ValueError("QSA pending-state transfer requires an allocated request row")
-    return np.array([int(req_pool_idx)], dtype=np.int32)
-
-
-def unified_memory_disagg_move_gate(scheduler):
-    """Compaction move gate for a PD node running the unified memory pool.
-
-    Returns a predicate that is True only when no transfer can be in flight, so
-    compaction never relocates a page the RDMA engine is reading or writing.
-    Safe to read this state from here: every mover runs on the scheduler thread.
-
-    A page is exposed from the moment its address reaches the peer until the
-    transfer concludes, and for part of that lifetime the request is in NEITHER
-    end's queue -- so queue emptiness alone is not enough:
-
-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
-      chunks may still be draining, and the request only reaches the inflight
-      queue later, in the result path.
-    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
-      allocating for the next, whose allocation can urgently flush the peer
-      sub-allocator; the batch reaches the transfer queue only after the loop.
-    """
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-
-        def prefill_gate() -> bool:
-            return not (
-                scheduler.disagg_prefill_inflight_queue
-                or scheduler.disagg_prefill_pending_chunk_rids
-            )
-
-        return prefill_gate
-
-    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-
-        def decode_gate() -> bool:
-            decode_offload_manager = scheduler.decode_offload_manager
-            return not (
-                scheduler.disagg_decode_transfer_queue.queue
-                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
-                or (
-                    decode_offload_manager is not None
-                    and decode_offload_manager.has_inflight_device_transfer()
-                )
-            )
-
-        return decode_gate
-
-    raise ValueError(
-        "unified_memory_disagg_move_gate: scheduler is not a PD node "
-        f"(mode={scheduler.disaggregation_mode})"
-    )
-
-
-def _poll_with_failure_injection(pollers) -> List[int]:
-    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
-        return [
-            int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
-            for poller in pollers
-        ]
-    return [int(poller.poll()) for poller in pollers]
-
-
-def _is_fake_transfer(req: Req) -> bool:
-    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-        req.bootstrap_host is None
-        and get_disagg().disaggregation_transfer_backend == "fake"
-    )
-
-
-def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
-    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
-
-    Mutates `polls` in-place. Called before all-reduce so that MIN across TP
-    ranks naturally prevents any rank from committing before all ranks are ready.
-    """
-    for i, poll_val in enumerate(polls):
-        if poll_val == int(KVPoll.Success):
-            decode_req = decode_reqs[i]
-            if _is_fake_transfer(decode_req.req):
-                continue
-            actual_room = metadata_buffers.bootstrap_room[
-                decode_req.metadata_buffer_index, 0
-            ].item()
-            if actual_room == 0:
-                polls[i] = int(KVPoll.Transferring)
-
-
-def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
-    """MIN-reduce poll states so no rank commits ahead of its peers."""
-    if dist.get_world_size(group) == 1:
-        return polls
-
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
-
-
-def poll_and_all_reduce_attn_cp_tp_group(
-    pollers,
-    attn_cp_cpu_group: dist.ProcessGroup,
-    attn_tp_cpu_group: dist.ProcessGroup,
-):
-    # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
-    # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
-
-    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
-    # converge to the same global status.
-    return _all_reduce_polls(polls, attn_cp_cpu_group)
-
-
-def poll_and_all_reduce_with_staging(
-    decode_reqs,
-    staging_handler,
-    gloo_group: dist.ProcessGroup,
-    metadata_buffers: Optional[MetadataBuffers] = None,
-):
-    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
-    for decode_req in decode_reqs:
-        if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-            decode_req
-        ):
-            staging_handler.advance_scatter(decode_req)
-
-    # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
-    for i, decode_req in enumerate(decode_reqs):
-        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
-            decode_req
-        ):
-            # Staging completion timed out; KVPoll.Failed == 0 propagates
-            # through the MIN all_reduce.
-            raw_polls[i] = int(KVPoll.Failed)
-            continue
-        if raw_polls[i] == int(KVPoll.Success):
-            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-                decode_req
-            ):
-                raw_polls[i] = int(KVPoll.Transferring)
-    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
-    if metadata_buffers is not None:
-        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
+    return class_mapping.get(class_type)
 
 
 def _get_cp_rank_page_bounds(
@@ -658,6 +725,18 @@ def filter_kv_indices_for_cp_rank(
             chunk_start + last_pos,
         )
     return new_kv_indices, new_index_slice
+
+
+#########################
+# Misc
+#########################
+
+
+def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
 def should_send_replicated_state(
@@ -1652,6 +1731,21 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+
+
+def prepare_abort(req: Req, error_message: str, status_code=None):
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    # populate finish metadata and stream output
+    req.finished_reason = FINISH_ABORT(error_message, status_code)
+
+    if req.return_logprob:
+        req.logprob.input_token_logprobs_val = []
+        req.logprob.input_token_logprobs_idx = []
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
+        req.logprob.input_token_ids_logprobs_val = []
+        req.logprob.input_token_ids_logprobs_idx = []
 
 
 def is_unadmitted_reject(req: Req) -> bool:

@@ -1,5 +1,4 @@
 """Inference-only Qwen4-Exp MTP speculative decoding."""
-from __future__ import annotations
 
 import copy
 import logging

@@ -12,7 +12,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-import time
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

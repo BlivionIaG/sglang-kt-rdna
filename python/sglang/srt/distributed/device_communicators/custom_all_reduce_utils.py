@@ -1,4 +1,5 @@
-from __future__ import annotations
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce_utils.py
 
 import ctypes
@@ -19,8 +20,9 @@ import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.utils import is_cuda, is_hip, is_musa
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs as sglang_envs
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 from sglang.srt.utils.cuda_vmm_utils import _gpu_fabric_clique
 
 logger = logging.getLogger(__name__)
@@ -61,7 +63,7 @@ def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -261,12 +263,22 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
 
     # VLLM_CACHE_ROOT -> SGLANG_CACHE_ROOT
-    # "~/.cache/vllm" -> "~/.cache/sglang"
-    SGLANG_CACHE_ROOT = os.path.expanduser("~/.cache/sglang")
+    # "~/.cache/vllm" -> envs.SGLANG_CACHE_DIR
+    SGLANG_CACHE_ROOT = os.path.expanduser(sglang_envs.SGLANG_CACHE_DIR.get())
     path = os.path.join(
         SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
     )
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cache_dir = os.path.dirname(path)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except (FileExistsError, NotADirectoryError):
+        if not os.path.isdir(cache_dir):
+            # Path exists as a file (stale cache/lock). Remove and retry.
+            try:
+                os.remove(cache_dir)
+            except OSError:
+                pass
+            os.makedirs(cache_dir, exist_ok=True)
     from sglang.srt.distributed.parallel_state import get_world_group
 
     if (not is_distributed or get_world_group().local_rank == 0) and (
@@ -380,25 +392,6 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         return True
 
 
-def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
-
-
-__all__ = ["gpu_p2p_access_check"]
-
-if __name__ == "__main__":
-    batch_src, batch_tgt, output_file = pickle.loads(sys.stdin.buffer.read())
-    result = can_actually_p2p(batch_src, batch_tgt)
-    with open(output_file, "wb") as f:
-        f.write(pickle.dumps(result))
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
 @with_nvml_context
 def is_one_nvlink_clique(
     group: torch.distributed.ProcessGroup, device: torch.device
@@ -423,6 +416,13 @@ def is_one_nvlink_clique(
     if any(c is None for c in gathered):
         return False
     return len(set(gathered)) == 1
+
+
+def is_weak_contiguous(inp: torch.Tensor):
+    return inp.is_contiguous() or (
+        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
+        == inp.numel() * inp.element_size()
+    )
 
 
 def can_p2p(rank: int, world_size: int) -> bool:
@@ -510,3 +510,10 @@ def can_use_custom_all_reduce_with_nvlink(
         return
 
     return full_nvlink
+
+
+if __name__ == "__main__":
+    batch_src, batch_tgt, output_file = pickle.loads(sys.stdin.buffer.read())
+    result = can_actually_p2p(batch_src, batch_tgt)
+    with open(output_file, "wb") as f:
+        f.write(pickle.dumps(result))

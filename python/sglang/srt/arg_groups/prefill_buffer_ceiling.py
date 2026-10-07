@@ -1,5 +1,4 @@
 """Dependency-free hook shared by pre- and post-publish prefill-buffer sizing."""
-from __future__ import annotations
 
 from typing import Any, Callable, Optional
 

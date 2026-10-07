@@ -49,8 +49,6 @@ import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
-import time
-import math
 
 logger = logging.getLogger(__name__)
 

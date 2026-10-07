@@ -36,7 +36,6 @@ from __future__ import annotations
 
 from array import array
 from typing import Any
-import pydantic
 
 
 def validate_list_i64_1d(v: Any) -> list[int]:

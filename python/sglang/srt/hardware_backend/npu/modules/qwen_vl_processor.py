@@ -1,4 +1,3 @@
-from __future__ import annotations
 import torch
 import torchvision.transforms.v2.functional as tvF
 from transformers.image_processing_utils import BatchFeature

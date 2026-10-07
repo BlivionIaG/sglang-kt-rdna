@@ -1,13 +1,15 @@
 """
 Common utilities for torch model parallelism.
 """
-from __future__ import annotations
 
+import logging
 from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+
+logger = logging.getLogger(__name__)
 
 try:
     import torch.distributed.tensor as dt
@@ -154,9 +156,6 @@ def tensor_parallel(
     # `apply` is a native method of `nn.Module` that recursively applies a
     # function to every submodule.
     module.apply(tplize)
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
 
 
 def apply_torch_tp(

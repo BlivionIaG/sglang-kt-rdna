@@ -1,4 +1,3 @@
-from __future__ import annotations
 # This file also references Slime :: fp8_cast_bf16.py
 import json
 import os

@@ -59,7 +59,6 @@ from sglang.srt.models.inkling_common.util import (
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
-import copy
 
 _FP32_GEMM_UPCAST = is_hip()
 

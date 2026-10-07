@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,11 +40,12 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
+        device = next(self.language_model.parameters()).device
         self.vision_tower = CLIPVisionModel.from_pretrained(
             self.config._name_or_path,
             torch_dtype=torch.float16,
             subfolder=self.vision_tower_subfolder,
-        ).to("cuda")
+        ).to(device)
 
         self.vision_tower.eval()
 
@@ -74,6 +74,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             "model.mm_projector.3": "multi_modal_projector.linear_2",
             "model.mm_projector.4": "multi_modal_projector.ln_2",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            # transformers 5.6.0 flattened CLIPVisionModel/SiglipVisionModel,
+            # dropping the `vision_model` intermediate wrapper.
+            "vision_tower.vision_model.": "vision_tower.",
         }
         params_dict = dict(self.named_parameters())
         weights = list(weights)

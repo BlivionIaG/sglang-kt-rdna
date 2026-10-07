@@ -3,7 +3,6 @@
 Handles add/remove/list operations and async background loading.
 Used by the Scheduler — not a mixin, a standalone manager object.
 """
-from __future__ import annotations
 
 import logging
 import threading

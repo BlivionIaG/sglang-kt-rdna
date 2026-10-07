@@ -1,5 +1,4 @@
 """Multimodal processor for Voxtral (speech-to-text) models."""
-from __future__ import annotations
 
 import math
 import re

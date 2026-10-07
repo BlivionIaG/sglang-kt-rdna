@@ -1,5 +1,4 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
-from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass

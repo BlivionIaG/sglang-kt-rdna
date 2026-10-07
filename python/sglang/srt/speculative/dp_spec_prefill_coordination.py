@@ -1,5 +1,4 @@
 """Plan token counts for prefill and speculative decoding across DP ranks."""
-from __future__ import annotations
 
 from typing import List
 

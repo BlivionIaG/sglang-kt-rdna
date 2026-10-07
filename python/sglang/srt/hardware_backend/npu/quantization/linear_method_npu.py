@@ -1,21 +1,59 @@
-from __future__ import annotations
-from typing import TYPE_CHECKING, Optional
+import logging
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-from sglang.srt.layers.quantization.base_config import LinearMethodBase
-from typing import TYPE_CHECKING, List, Optional, Tuple
-from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
-import time
 from torch.nn.parameter import Parameter
+
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
+from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+MXFP8_BLOCK_SIZE = 32
+# W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
+MXFP4_BLOCK_SIZE = 32
+
+
+# NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
+# by the runtime), so this module needs no top-level `import torch_npu` and stays
+# importable on CUDA/CPU/AMD/XPU CI.
+def _get_float8_e8m0fnu_dtype():
+    # Resolve lazily rather than as a module-level constant: this module is
+    # imported early (during quant-scheme registration), so reading the dtype at
+    # call time keeps it correct regardless of import order / platform.
+    return getattr(torch, "float8_e8m0fnu", None)
+
+
+def _get_float4_e2m1fn_x2_dtype():
+    # The packed-FP4 dtype MUST come from torch_npu (an int enum, e.g. 296), not
+    # from torch. The NPU ops that consume it -- npu_dynamic_mx_quant(dst_type=),
+    # npu_quant_matmul(x2_dtype=), npu_format_cast(input_dtype=) -- REJECT the
+    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
+    # builds (it raises, or with None gives "output y must be same shape as input
+    # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
+    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
+    # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
+    # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
+    #
+    # Lazy import so this NPU-only path keeps the module importable on
+    # CUDA/CPU/AMD/XPU CI (no top-level torch_npu; see AGENTS.md known pitfalls).
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        import torch_npu
+
+        npu_dtype = getattr(torch_npu, "float4_e2m1fn_x2", None)
+        if npu_dtype is not None:
+            return npu_dtype
+    return getattr(torch, "float4_e2m1fn_x2", None)
+
 
 class _NPULinearMethodBase(LinearMethodBase):
-
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
@@ -24,7 +62,6 @@ class _NPULinearMethodBase(LinearMethodBase):
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -82,7 +119,6 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -110,76 +146,10 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             quant_out,
             layer.weight,
             layer.weight_scale,
-            pertoken_scale=dynamic_scale,
+            pertoken_scale=dynamic_scale.flatten(),
             bias=bias,
             output_dtype=original_dtype,
         )
-
-
-class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
-
-    def process_weights_after_loading(self, layer):
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
-        layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
-            layer.weight.data.to(torch.int32)
-        )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-        tp_rank: Optional[int] = 0,
-    ) -> torch.Tensor:
-        original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-            x, dst_type=torch.quint4x2
-        )
-        return torch.ops.npu.npu_quant_matmul(
-            quant_out,
-            layer.weight,
-            layer.weight_scale,
-            pertoken_scale=dynamic_scale,
-            bias=bias,
-            output_dtype=original_dtype,
-        )
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-def _get_float8_e8m0fnu_dtype():
-    # Resolve lazily rather than as a module-level constant: this module is
-    # imported early (during quant-scheme registration), so reading the dtype at
-    # call time keeps it correct regardless of import order / platform.
-    return getattr(torch, "float8_e8m0fnu", None)
-
-
-def _get_float4_e2m1fn_x2_dtype():
-    # The packed-FP4 dtype MUST come from torch_npu (an int enum, e.g. 296), not
-    # from torch. The NPU ops that consume it -- npu_dynamic_mx_quant(dst_type=),
-    # npu_quant_matmul(x2_dtype=), npu_format_cast(input_dtype=) -- REJECT the
-    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
-    # builds (it raises, or with None gives "output y must be same shape as input
-    # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
-    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
-    # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
-    # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
-    #
-    # Lazy import so this NPU-only path keeps the module importable on
-    # CUDA/CPU/AMD/XPU CI (no top-level torch_npu; see AGENTS.md known pitfalls).
-    from sglang.srt.utils import is_npu
-
-    if is_npu():
-        import torch_npu
-
-        npu_dtype = getattr(torch_npu, "float4_e2m1fn_x2", None)
-        if npu_dtype is not None:
-            return npu_dtype
-    return getattr(torch, "float4_e2m1fn_x2", None)
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
@@ -396,6 +366,40 @@ def npu_w8a8_mxfp8_linear(
     )
 
     return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+
+
+class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
+    def process_weights_after_loading(self, layer):
+        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        layer.weight_scale.data = layer.weight_scale.data.flatten()
+        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
+        if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+            layer.weight.data = layer.weight.data.view(torch.int32).contiguous()
+        else:
+            layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
+                layer.weight.data.to(torch.int32)
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        tp_rank: Optional[int] = 0,
+    ) -> torch.Tensor:
+        original_dtype = x.dtype
+        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+            x, dst_type=torch.quint4x2
+        )
+        return torch.ops.npu.npu_quant_matmul(
+            quant_out,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=dynamic_scale.flatten(),
+            bias=bias,
+            output_dtype=original_dtype,
+        )
 
 
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):

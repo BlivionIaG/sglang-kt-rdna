@@ -1,188 +1,56 @@
-"""Pydantic models for Anthropic Messages API protocol"""
-from __future__ import annotations
+"""Pydantic models for Anthropic Messages API protocol.
+
+Mirrors the shape of the official Anthropic Python SDK
+(``anthropic-sdk-python``): ``ContentBlock``, ``Tool``, ``MessageStreamEvent``
+and ``ContentBlockDelta`` are discriminated unions over the ``type`` field,
+so each variant carries only the fields it actually uses.
+"""
 
 import uuid
-from typing import Any, Literal, Optional
-
-from pydantic import BaseModel, Field, field_validator
-from typing import Union
-from pydantic import model_validator
 from typing import Annotated, Any, Literal, Optional, Union
+
+from pydantic import (
+    BaseModel,
+    Discriminator,
+    Field,
+    NonNegativeInt,
+    Tag,
+    field_validator,
+    model_validator,
+)
+
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
 
 
 class AnthropicError(BaseModel):
-    """Error structure for Anthropic API"""
+    """Error structure for Anthropic API."""
 
     type: str
     message: str
 
 
 class AnthropicErrorResponse(BaseModel):
-    """Error response structure for Anthropic API"""
+    """Error response structure for Anthropic API."""
 
     type: Literal["error"] = "error"
     error: AnthropicError
 
 
 class AnthropicUsage(BaseModel):
-    """Token usage information"""
+    """Token usage information.
 
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: Optional[int] = None
-    cache_read_input_tokens: Optional[int] = None
+    ``input_tokens``/``output_tokens`` are ``Optional`` because Anthropic's
+    streaming ``message_delta`` event omits ``input_tokens`` (the spec
+    requires it only on ``message_start``). Non-streaming responses set both.
+    """
 
-
-class AnthropicContentBlock(BaseModel):
-    """Content block in message"""
-
-    type: Literal[
-        "text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"
-    ]
-    text: Optional[str] = None
-    # For image content
-    source: Optional[dict[str, Any]] = None
-    # For tool use/result
-    id: Optional[str] = None
-    tool_use_id: Optional[str] = None
-    name: Optional[str] = None
-    input: Optional[dict[str, Any]] = None
-    content: Optional[str | list[dict[str, Any]]] = None
-    is_error: Optional[bool] = None
-    # For thinking content
-    thinking: Optional[str] = None
-    signature: Optional[str] = None
+    input_tokens: Optional[NonNegativeInt] = None
+    output_tokens: Optional[NonNegativeInt] = None
+    cache_creation_input_tokens: Optional[NonNegativeInt] = None
+    cache_read_input_tokens: Optional[NonNegativeInt] = None
 
 
-class AnthropicMessage(BaseModel):
-    """Message structure"""
-
-    role: Literal["user", "assistant"]
-    content: str | list[AnthropicContentBlock]
-
-
-class AnthropicTool(BaseModel):
-    """Tool definition"""
-
-    name: str
-    description: Optional[str] = None
-    input_schema: dict[str, Any]
-
-    @field_validator("input_schema")
-    @classmethod
-    def validate_input_schema(cls, v):
-        if not isinstance(v, dict):
-            raise ValueError("input_schema must be a dictionary")
-        if "type" not in v:
-            v["type"] = "object"
-        return v
-
-
-class AnthropicToolChoice(BaseModel):
-    """Tool Choice definition"""
-
-    type: Literal["auto", "any", "tool", "none"]
-    name: Optional[str] = None
-
-
-class AnthropicCountTokensRequest(BaseModel):
-    """Anthropic Count Tokens API request"""
-
-    model: str
-    messages: list[AnthropicMessage]
-    system: Optional[str | list[AnthropicContentBlock]] = None
-    tool_choice: Optional[AnthropicToolChoice] = None
-    tools: Optional[list[AnthropicTool]] = None
-
-
-class AnthropicCountTokensResponse(BaseModel):
-    """Anthropic Count Tokens API response"""
-
-    input_tokens: int
-
-
-class AnthropicMessagesRequest(BaseModel):
-    """Anthropic Messages API request"""
-
-    model: str
-    messages: list[AnthropicMessage]
-    max_tokens: int
-    metadata: Optional[dict[str, Any]] = None
-    stop_sequences: Optional[list[str]] = None
-    stream: Optional[bool] = False
-    system: Optional[str | list[AnthropicContentBlock]] = None
-    temperature: Optional[float] = None
-    tool_choice: Optional[AnthropicToolChoice] = None
-    tools: Optional[list[AnthropicTool]] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-
-    @field_validator("model")
-    @classmethod
-    def validate_model(cls, v):
-        if not v:
-            raise ValueError("Model is required")
-        return v
-
-    @field_validator("max_tokens")
-    @classmethod
-    def validate_max_tokens(cls, v):
-        if v <= 0:
-            raise ValueError("max_tokens must be positive")
-        return v
-
-
-class AnthropicDelta(BaseModel):
-    """Delta for streaming responses"""
-
-    type: Optional[Literal["text_delta", "input_json_delta"]] = None
-    text: Optional[str] = None
-    partial_json: Optional[str] = None
-
-    # Message delta fields
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
-    stop_sequence: Optional[str] = None
-
-
-class AnthropicStreamEvent(BaseModel):
-    """Streaming event"""
-
-    type: Literal[
-        "message_start",
-        "message_delta",
-        "message_stop",
-        "content_block_start",
-        "content_block_delta",
-        "content_block_stop",
-        "ping",
-        "error",
-    ]
-    message: Optional["AnthropicMessagesResponse"] = None
-    delta: Optional[AnthropicDelta] = None
-    content_block: Optional[AnthropicContentBlock] = None
-    index: Optional[int] = None
-    error: Optional[AnthropicError] = None
-    usage: Optional[AnthropicUsage] = None
-
-
-class AnthropicMessagesResponse(BaseModel):
-    """Anthropic Messages API response"""
-
-    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
-    type: Literal["message"] = "message"
-    role: Literal["assistant"] = "assistant"
-    content: list[AnthropicContentBlock]
-    model: str
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
-    stop_sequence: Optional[str] = None
-    usage: Optional[AnthropicUsage] = None
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+# ---------- Content blocks (discriminated by ``type``) ----------
 
 
 class TextBlock(BaseModel):
@@ -240,6 +108,29 @@ class ThinkingBlock(BaseModel):
 class RedactedThinkingBlock(BaseModel):
     type: Literal["redacted_thinking"] = "redacted_thinking"
     data: Optional[str] = None
+
+
+AnthropicContentBlock = Annotated[
+    Union[
+        TextBlock,
+        ImageBlock,
+        ToolUseBlock,
+        ToolResultBlock,
+        ToolReferenceBlock,
+        SearchResultBlock,
+        ThinkingBlock,
+        RedactedThinkingBlock,
+    ],
+    Field(discriminator="type"),
+]
+
+
+class AnthropicMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: Union[str, list[AnthropicContentBlock]]
+
+
+# ---------- Tools (discriminated by ``type`` family) ----------
 
 
 class AnthropicCustomTool(BaseModel):
@@ -331,6 +222,18 @@ def _tool_discriminator(v) -> str:
     return "custom"
 
 
+AnthropicTool = Annotated[
+    Union[
+        Annotated[AnthropicCustomTool, Tag("custom")],
+        Annotated[AnthropicWebSearchTool, Tag("web_search")],
+        Annotated[AnthropicComputerTool, Tag("computer")],
+        Annotated[AnthropicBashTool, Tag("bash")],
+        Annotated[AnthropicTextEditorTool, Tag("text_editor")],
+    ],
+    Discriminator(_tool_discriminator),
+]
+
+
 def is_server_tool(tool) -> bool:
     """Return True for Anthropic built-in server-side tools."""
     return isinstance(
@@ -342,6 +245,13 @@ def is_server_tool(tool) -> bool:
             AnthropicTextEditorTool,
         ),
     )
+
+
+class AnthropicToolChoice(BaseModel):
+    """Tool choice strategy."""
+
+    type: Literal["auto", "any", "tool", "none"]
+    name: Optional[str] = None
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -429,6 +339,67 @@ class AnthropicOutputConfig(BaseModel):
     task_budget: Optional[AnthropicTaskBudget] = None
 
 
+class AnthropicCountTokensRequest(BaseModel):
+    """Anthropic count_tokens API request."""
+
+    model: str
+    messages: list[AnthropicMessage]
+    system: Optional[Union[str, list[AnthropicContentBlock]]] = None
+    thinking: Optional[AnthropicThinkingParam] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+    tools: Optional[list[AnthropicTool]] = None
+    # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: Optional[list[str]] = None
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    """Anthropic count_tokens API response."""
+
+    input_tokens: int
+
+
+class AnthropicMessagesRequest(PDRoutingFields):
+    """Anthropic Messages API request."""
+
+    model: str
+    messages: list[AnthropicMessage]
+    max_tokens: int
+    metadata: Optional[dict[str, Any]] = None
+    stop_sequences: Optional[list[str]] = None
+    stream: Optional[bool] = False
+    system: Optional[Union[str, list[AnthropicContentBlock]]] = None
+    temperature: Optional[float] = None
+    thinking: Optional[AnthropicThinkingParam] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+    tools: Optional[list[AnthropicTool]] = None
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
+    # when targeting non-Anthropic backends, so the schema must accept them.
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: Optional[list[str]] = None
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v):
+        if not v:
+            raise ValueError("Model is required")
+        return v
+
+    @field_validator("max_tokens")
+    @classmethod
+    def _validate_max_tokens(cls, v):
+        if v <= 0:
+            raise ValueError("max_tokens must be positive")
+        return v
+
+
+# ---------- Stream deltas ----------
+# Content-block deltas (discriminated by ``type``) vs message-end delta
+# (separate model; the wire format does not put ``type`` inside its payload).
+
+
 class TextDelta(BaseModel):
     type: Literal["text_delta"] = "text_delta"
     text: str
@@ -449,6 +420,12 @@ class SignatureDelta(BaseModel):
     signature: str
 
 
+AnthropicContentDelta = Annotated[
+    Union[TextDelta, InputJsonDelta, ThinkingDelta, SignatureDelta],
+    Field(discriminator="type"),
+]
+
+
 class AnthropicMessageEndDelta(BaseModel):
     """Delta carried on ``message_delta`` events.
 
@@ -461,6 +438,9 @@ class AnthropicMessageEndDelta(BaseModel):
         Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
     ] = None
     stop_sequence: Optional[str] = None
+
+
+# ---------- Stream events (discriminated by ``type``) ----------
 
 
 class MessageStartEvent(BaseModel):
@@ -487,12 +467,7 @@ class ContentBlockStartEvent(BaseModel):
 class ContentBlockDeltaEvent(BaseModel):
     type: Literal["content_block_delta"] = "content_block_delta"
     index: int
-    # `AnthropicContentDelta` is referenced here but defined nowhere -- not in this
-    # file, not in upstream's copy either (upstream's own ContentBlockDeltaEvent
-    # names a class its module never defines). The delta model this file DOES
-    # define, and the one whose fields match a content-block delta, is
-    # `AnthropicDelta`. Bound to that so the event model can be created.
-    delta: AnthropicDelta
+    delta: AnthropicContentDelta
 
 
 class ContentBlockStopEvent(BaseModel):
@@ -507,3 +482,38 @@ class PingEvent(BaseModel):
 class ErrorEvent(BaseModel):
     type: Literal["error"] = "error"
     error: AnthropicError
+
+
+AnthropicStreamEvent = Annotated[
+    Union[
+        MessageStartEvent,
+        MessageDeltaEvent,
+        MessageStopEvent,
+        ContentBlockStartEvent,
+        ContentBlockDeltaEvent,
+        ContentBlockStopEvent,
+        PingEvent,
+        ErrorEvent,
+    ],
+    Field(discriminator="type"),
+]
+
+
+class AnthropicMessagesResponse(BaseModel):
+    """Anthropic Messages API response."""
+
+    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    content: list[AnthropicContentBlock]
+    model: str
+    stop_reason: Optional[
+        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+    ] = None
+    stop_sequence: Optional[str] = None
+    usage: Optional[AnthropicUsage] = None
+
+
+# Resolve forward references for nested types.
+ToolResultBlock.model_rebuild()
+MessageStartEvent.model_rebuild()

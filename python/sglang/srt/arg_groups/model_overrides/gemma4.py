@@ -1,5 +1,4 @@
 """Config-time override declarations for gemma4."""
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict

@@ -2,7 +2,6 @@
 Configuration argument parser for command-line applications.
 Handles merging of YAML configuration files with command-line arguments.
 """
-from __future__ import annotations
 
 import argparse
 import json

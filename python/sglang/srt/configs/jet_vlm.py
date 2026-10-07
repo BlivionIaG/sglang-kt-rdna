@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig

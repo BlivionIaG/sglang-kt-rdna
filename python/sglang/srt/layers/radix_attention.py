@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -22,10 +24,57 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils.custom_op import register_custom_op
-from contextlib import contextmanager
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
+from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
+
+# When set, RadixAttention.forward runs the attention backend eagerly instead of
+# routing through the tc-piecewise split op. A caller already inside a
+# breakable-CUDA-graph eager break (e.g. Inkling wrapping norm+attn+sconv in one eager
+# region for multi-seq-correct short-conv metadata) sets this so the attn does not
+# start a nested break (which would assert on the ended segment). Default off.
+_force_eager_attn: ContextVar[bool] = ContextVar("_force_eager_attn", default=False)
+
+
+@contextmanager
+def force_eager_attention():
+    token = _force_eager_attn.set(True)
+    try:
+        yield
+    finally:
+        _force_eager_attn.reset(token)
+
+
+def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
+    """Zero the padded tail ``buf`` leaves as torch.empty garbage under PCG
+    replay, so NaN/Inf cannot reach residual / MoE routing / allreduce."""
+    pcg_static_tokens = context.num_tokens
+    actual_tokens = context.raw_num_tokens
+    if (
+        pcg_static_tokens is not None
+        and actual_tokens is not None
+        and pcg_static_tokens > actual_tokens
+    ):
+        first_dim = buf.shape[0]
+        elems_per_token = buf.numel() // first_dim
+        buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+
+
+def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
+    """Zero outputs when an idle DP rank skips attention work."""
+    for buf in bufs:
+        if buf is not None:
+            buf.zero_()
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -68,6 +117,7 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        use_prefill_attention_wrapper: bool = True,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -82,10 +132,18 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.use_prefill_attention_wrapper = use_prefill_attention_wrapper
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
         self.v_scale_float = None
+        # MiniMax-M3 fp8 attention-GEMM scales (fp8 attn-GEMM mode): main q and
+        # lightning-indexer q/k/v. No checkpoint loader populates them yet;
+        # None means unit scale.
+        self.q_scale_float = None
+        self.idx_q_scale_float = None
+        self.idx_k_scale_float = None
+        self.idx_v_scale_float = None
         self.quant_method = None
 
         if quant_config is not None:
@@ -105,6 +163,7 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
         **kwargs,
     ):
         if k is not None:
@@ -116,17 +175,123 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        context = get_tc_piecewise_forward_context()
+        if (
+            self.use_prefill_attention_wrapper
+            and forward_batch.forward_mode.is_extend()
+            and context is not None
+            # ``_force_eager_attn`` is only set inside Inkling's eager
+            # norm+attn+sconv region, never during tc-piecewise capture. Reading
+            # the ContextVar under the fullgraph torch.compile trace is
+            # untraceable ("Unsupported method call: ContextVar.get"), so
+            # short-circuit it while compiling -- force-eager is always off there.
+            and (torch.compiler.is_compiling() or not _force_eager_attn.get())
+        ):
+            if kwargs.get("idx_q") is not None:
+                if is_in_breakable_cuda_graph():
+                    return get_attn_backend().forward(
+                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                    )
+                idx_q = kwargs["idx_q"]
+                idx_k = kwargs["idx_k"]
+                idx_v = kwargs.get("idx_v")
+                attn_out = q.new_empty(
+                    (q.shape[0], self.tp_q_head_num * self.v_head_dim)
+                )
+                idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
+                unified_sparse_attention_with_output(
+                    q,
+                    k,
+                    v,
+                    attn_out,
+                    idx_out,
+                    idx_q,
+                    idx_k,
+                    save_kv_cache,
+                    self.layer_id,
+                    idx_v=idx_v,
+                )
+                return idx_out, attn_out
+            # Output dtype follows v (the model dtype) when available: qk-norm
+            # may emit q in a different dtype without changing the dtype the
+            # backend writes. FP8 q/v (e.g. mxfp8 KV-cache attention) still
+            # produce a bf16 attention output; sizing the buffer off an fp8
+            # dtype would silently cast-copy the result to fp8.
+            out_dtype = v.dtype if v is not None else q.dtype
+            if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                out_dtype = torch.bfloat16
             if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+                output = q.new_empty(
+                    (q.shape[0], self.tp_q_head_num * self.v_head_dim),
+                    dtype=out_dtype,
+                )
             else:
-                output = torch.empty_like(q)
-            unified_attention_with_output(
-                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                output = torch.empty_like(q, dtype=out_dtype)
+            if any(
+                key in kwargs
+                for key in (
+                    "score_mod",
+                    "aux_tensors",
+                    "rel_bias",
+                    "return_lse",
+                    "q_descale",
+                    "k_descale",
+                    "v_descale",
+                    "mxfp8_norm_rope_positions",
+                )
+            ):
+                # A score_mod callable, aux_tensors, rel_bias, mxfp8 descale
+                # tensors, or the mxfp8 deferred norm/RoPE operands can't cross
+                # the unified_attention_with_output custom-op schema; route this
+                # backend's extend attention through the plain eager path.
+                if is_in_breakable_cuda_graph():
+                    lse = breakable_attention_with_output_extra_kwargs(
+                        q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                    )
+                else:
+                    lse = attention_with_output_extra_kwargs(
+                        q, k, v, output, save_kv_cache, self.layer_id, kwargs
+                    )
+                if kwargs.get("return_lse") or forward_batch.mha_return_lse:
+                    assert lse is not None
+                    return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
+                return output
+            # Chunked-prefix MHA needs LSE to merge independently normalized
+            # suffix and cached-prefix attention states.
+            return_lse = bool(forward_batch.mha_return_lse)
+            mha_companion_layers = context.mha_companion_layers
+            use_mha_companion = (
+                mha_companion_layers is not None
+                and mha_companion_layers[self.layer_id] is self
             )
+            if is_in_breakable_cuda_graph():
+                op = (
+                    breakable_unified_attention_with_output_and_lse
+                    if return_lse
+                    else breakable_unified_attention_with_output
+                )
+            else:
+                op = (
+                    unified_attention_with_output_and_lse
+                    if return_lse
+                    else unified_attention_with_output
+                )
+            lse = op(
+                q,
+                k,
+                v,
+                output,
+                save_kv_cache,
+                self.layer_id,
+                use_mha_companion=use_mha_companion,
+                key_value_num_tokens=key_value_num_tokens,
+                **kwargs,
+            )
+            if return_lse:
+                return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            return get_attn_backend().forward(
                 q,
                 k,
                 v,
@@ -135,78 +300,6 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_attention_with_output(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    *,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-
-    kwargs = {}
-    if q_rope is not None:
-        kwargs["q_rope"] = q_rope
-    if k_rope is not None:
-        kwargs["k_rope"] = k_rope
-    if sinks is not None:
-        kwargs["sinks"] = sinks
-
-    ret = forward_batch.attn_backend.forward(
-        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
-    )
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return
-
-
-# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
-
-
-@contextmanager
-def force_eager_attention():
-    token = _force_eager_attn.set(True)
-    try:
-        yield
-    finally:
-        _force_eager_attn.reset(token)
-
-
-def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
-    """Zero the padded tail ``buf`` leaves as torch.empty garbage under PCG
-    replay, so NaN/Inf cannot reach residual / MoE routing / allreduce."""
-    pcg_static_tokens = context.num_tokens
-    actual_tokens = context.raw_num_tokens
-    if (
-        pcg_static_tokens is not None
-        and actual_tokens is not None
-        and pcg_static_tokens > actual_tokens
-    ):
-        first_dim = buf.shape[0]
-        elems_per_token = buf.numel() // first_dim
-        buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
-
-
-def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
-    """Zero outputs when an idle DP rank skips attention work."""
-    for buf in bufs:
-        if buf is not None:
-            buf.zero_()
 
 
 def _unified_attention_with_output_impl(
@@ -337,12 +430,57 @@ def _unified_attention_with_output_impl(
     return lse
 
 
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    use_mha_companion: bool = False,
+    key_value_num_tokens: Optional[int] = None,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> None:
+    _unified_attention_with_output_impl(
+        query,
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        use_mha_companion,
+        False,
+        key_value_num_tokens=key_value_num_tokens,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        sinks=sinks,
+        attn_sink=attn_sink,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+
+
 def _unified_attention_with_output_and_lse_fake(
     query: torch.Tensor, *args, **kwargs
 ) -> torch.Tensor:
     return query.new_empty((query.shape[0], query.shape[1]), dtype=torch.float32)
 
 
+@register_custom_op(
+    mutates_args=["output"], fake_impl=_unified_attention_with_output_and_lse_fake
+)
 @register_split_op()
 def unified_attention_with_output_and_lse(
     query: torch.Tensor,
@@ -447,6 +585,14 @@ def unified_sparse_attention_with_output(
     return
 
 
+breakable_unified_attention_with_output = eager_on_graph(True)(
+    unified_attention_with_output
+)
+breakable_unified_attention_with_output_and_lse = eager_on_graph(True)(
+    unified_attention_with_output_and_lse
+)
+
+
 def attention_with_output_extra_kwargs(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
@@ -523,3 +669,8 @@ def attention_with_output_extra_kwargs(
         padded_lse[:real_num_tokens].copy_(lse)
         lse = padded_lse
     return lse
+
+
+breakable_attention_with_output_extra_kwargs = eager_on_graph(True)(
+    attention_with_output_extra_kwargs
+)

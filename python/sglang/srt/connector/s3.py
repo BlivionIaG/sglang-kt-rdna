@@ -1,4 +1,3 @@
-from __future__ import annotations
 # SPDX-License-Identifier: Apache-2.0
 
 import fnmatch
@@ -68,7 +67,6 @@ def list_files(
 
 
 class S3Connector(BaseFileConnector):
-
     def __init__(self, url: str) -> None:
         import boto3
 

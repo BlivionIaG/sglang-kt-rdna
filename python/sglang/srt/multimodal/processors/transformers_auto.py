@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Optional
 
 import torch
@@ -13,7 +12,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils import load_image
-import base64
 
 
 def _first_attr(obj, names: tuple[str, ...], default=None):

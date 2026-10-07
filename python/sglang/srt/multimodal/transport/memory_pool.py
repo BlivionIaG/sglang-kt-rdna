@@ -1,5 +1,4 @@
 """Shared stream-ordered lifecycle for GPU multimodal feature pools."""
-from __future__ import annotations
 
 import logging
 import threading
