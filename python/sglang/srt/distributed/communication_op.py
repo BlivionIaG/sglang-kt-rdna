@@ -5,7 +5,12 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group
+from .parallel_state import (
+    get_attn_tp_group,
+    get_moe_ep_group,
+    get_moe_tp_group,
+    get_tp_group,
+)
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -66,3 +71,13 @@ def attention_tensor_model_parallel_quant_all_reduce(
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().quant_all_reduce(input_)
+
+
+def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe expert parallel group."""
+    return get_moe_ep_group().all_reduce(input_)
+
+
+def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe parallel group."""
+    return get_moe_tp_group().all_reduce(input_)
