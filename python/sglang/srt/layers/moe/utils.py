@@ -5,7 +5,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
@@ -817,3 +817,167 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+# --- imported with the qwen4 subsystem ---
+def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
+    """Check whether this layer has fused shared experts in per-rank slots."""
+    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+
+
+# --- imported with the qwen4 subsystem ---
+class DispatcherOutputDtype(Enum):
+    """
+    Describes the dispatch output data type for DeepEP.
+
+    - BF16: dispatch hidden states in bf16
+    - FP8: dispatch hidden states in fp8
+    - INT8: dispatch hidden states in int8
+    - NVFP4: dispatch hidden states in nvfp4
+    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
+    - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+    INT8 = "int8"
+    NVFP4 = "nvfp4"
+    MXFP4 = "mxfp4"
+    MXFP8 = "mxfp8"
+
+
+# --- imported with the qwen4 subsystem ---
+def get_ascend_dispatcher_output_dtype(dispatcher):
+    """
+    Automatically choose the dispatch output dtype for Ascend.
+    """
+
+    # 1. Parse quant config to determine the output dtype of dispatcher
+    if dispatcher.quant_config is not None:
+        dispatcher_output_dtype = dispatcher.quant_config.get(
+            "dispatcher_output_dtype", None
+        )
+        if dispatcher_output_dtype is not None:
+            return DispatcherOutputDtype(dispatcher_output_dtype)
+
+    # 2. Ascend dispatch defaults to BF16
+    return DispatcherOutputDtype.BF16
+
+
+# --- imported with the qwen4 subsystem ---
+def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
+    """
+    Automatically choose the dispatch output dtype for DeepEP.
+
+    The decision follows several checks in priority order:
+    0. Parse server argument.
+    1. Parse deprecated environment variables.
+    2. If quant_config contains input_global_scale → NVFP4 path.
+    3. Parse a mode-specific dtype from quant_config.
+    4. Parse a generic dtype from quant_config.
+    5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
+    6. Otherwise default for NPU → BF16 (the default for NPU).
+    7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    """
+
+    # 0. Parse server argument.
+    server_args = get_server_args()
+    if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":
+        return DispatcherOutputDtype(get_exec().moe.deepep_dispatcher_output_dtype)
+
+    # 1. Parse deprecated environment variables.
+    if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        logger.warning_once(
+            "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
+            "and will be removed in future releases. Please use a new "
+            "`--deepep-dispatcher-output-dtype bf16` argument instead."
+        )
+        return DispatcherOutputDtype.BF16
+
+    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
+    if self.quant_config is not None:
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            return DispatcherOutputDtype.NVFP4
+
+        # 3. Some MoE kernels require different wire formats for prefill and
+        # decode. Prefer a mode-specific override when the dispatcher exposes
+        # its concrete mode (normal or low_latency).
+        dispatch_mode = getattr(self, "dispatch_mode", None)
+        if dispatch_mode is not None:
+            mode_dispatcher_output_dtype = self.quant_config.get(
+                f"{dispatch_mode.value}_dispatcher_output_dtype", None
+            )
+            if mode_dispatcher_output_dtype is not None:
+                return DispatcherOutputDtype(mode_dispatcher_output_dtype)
+
+        # 4. Parse quant config to determine the output dtype of dispatcher
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return DispatcherOutputDtype(dispatcher_output_dtype)
+
+    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
+    if (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        or get_moe_runner_backend().is_cutlass()
+        or get_moe_runner_backend().is_humming()
+    ):
+        return DispatcherOutputDtype.BF16
+
+    # 6. Default on NPU → BF16
+    if _is_npu:
+        return DispatcherOutputDtype.BF16
+
+    # 7. Default → FP8
+    return DispatcherOutputDtype.FP8
+
+
+# --- imported with the qwen4 subsystem ---
+class DeepEPv2Fp8ScaleFormat(NamedTuple):
+    """DeepGEMM FP8 activation-scale layout expected from DeepEP v2."""
+
+    tma_aligned: bool
+    ue8m0: bool
+
+
+# --- imported with the qwen4 subsystem ---
+def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return DeepEPv2Fp8ScaleFormat(
+        tma_aligned=(
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ),
+        ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+
+# --- imported with the qwen4 subsystem ---
+class FlashinferA2ADispatchType(Enum):
+    BF16 = "bf16"
+    NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
+
+
+# --- imported with the qwen4 subsystem ---
+def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
+    dispatch_type = get_exec().moe.flashinfer_a2a_dispatch_type
+
+    if dispatch_type is None:
+        if envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            return (
+                FlashinferA2ADispatchType.NVFP4
+                if envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+                else FlashinferA2ADispatchType.BF16
+            )
+        return FlashinferA2ADispatchType.BF16
+
+    if dispatch_type != "auto":
+        return FlashinferA2ADispatchType(dispatch_type)
+
+    raise RuntimeError(
+        "flashinfer_a2a_dispatch_type='auto' reached the published runtime "
+        "configuration; ServerArgs must resolve it before publication"
+    )

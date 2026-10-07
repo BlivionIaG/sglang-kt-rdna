@@ -56,7 +56,8 @@ from io import BytesIO
 from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import (
+from typing import (  # noqa: E501
+    NamedTuple,
     TYPE_CHECKING,
     Any,
     Callable,
@@ -4449,3 +4450,13 @@ def get_nvidia_driver_version() -> tuple:
         return tuple(int(x) for x in version_str.split("."))
     except ValueError:
         return (0,)
+
+
+# --- imported with the qwen4 subsystem ---
+class Range(NamedTuple):
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start

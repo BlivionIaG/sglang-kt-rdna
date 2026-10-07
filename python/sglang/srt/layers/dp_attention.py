@@ -4,7 +4,7 @@ import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Set
 
 import torch
 import triton
@@ -668,3 +668,61 @@ def can_use_dp_reduce_scatter() -> bool:
 
 def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
     _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
+
+
+# --- imported with the qwen4 subsystem ---
+def get_dp_local_slice_cpu(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
+    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = dp_slot_in(global_num_tokens)
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
+    else:
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_num_tokens
+
+
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.srt.distributed.utils import all_gather_single
+
+
+# TODO: write c++ kernel for cpu
+
+
+# --- imported with the qwen4 subsystem ---
+def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
+    """Set MAX_LEN pad rows' (post-translation, local) topk_ids to -1 in place.
+
+    Under dp-attention MAX_LEN padding the gathered MoE buffer is
+    [num_dp_ranks * max_len, hidden] with rank r's real rows at
+    [r*max_len, r*max_len + global_num_tokens[r]); the pad rows carry stale
+    hidden values, run the router, and get dispatched into experts whose
+    outputs are then discarded by the post-reorder scatter — pure wasted
+    compute, and a masked-grouped-GEMM workspace blow-up when they collide
+    on the same top-k.  -1 is the drop sentinel both the triton fused_moe
+    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
+    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
+    the mapping table's last entry).  Capture-safe: per-batch state is read
+    only from the replay-updated global_num_tokens_gpu tensor.
+    """
+    counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+    if counts is None:
+        return
+    max_len = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+    rows, topk = topk_ids.shape
+    if max_len <= 0 or rows != counts.shape[0] * max_len:
+        # Layout mismatch (e.g. non-DP or logits-path caller): do nothing.
+        return
+    _mask_dp_pad_topk_ids_kernel[(rows,)](
+        topk_ids,
+        counts,
+        max_len,
+        TOPK=topk,
+        BLOCK=triton.next_power_of_2(topk),
+    )
