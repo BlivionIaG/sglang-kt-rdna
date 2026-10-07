@@ -1000,9 +1000,34 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         group_size: int = None,
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        use_per_token_activation: Optional[bool] = None,
+        is_awq: bool = False,
     ) -> None:
+        # Parameters added with the qwen4 subsystem (sgl-project/sglang):
+        # `ModelOptMixedPrecisionConfig.from_config` builds the NVFP4 and
+        # NVFP4A16 slots with these, and upstream's signature carries both.
+        # `use_per_token_activation=None` means "read the environment", which is
+        # what the NVFP4A16 slot in a mixed checkpoint relies on; passing False
+        # forces the per-tensor path. It is honoured only for a serialized
+        # checkpoint, matching upstream, because the non-serialized path is
+        # per-tensor by construction.
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
+        self.is_awq = is_awq
+        if not is_checkpoint_nvfp4_serialized:
+            if use_per_token_activation:
+                raise ValueError(
+                    "Non-serialized modelopt_fp4 uses per-tensor FP32 "
+                    "activation scales. Use nvfp4_online for online per-token "
+                    "FP32 activation scales."
+                )
+            self.use_per_token_activation = False
+        else:
+            self.use_per_token_activation = (
+                envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+                if use_per_token_activation is None
+                else use_per_token_activation
+            )
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
                 "Detected nvfp4 checkpoint. Please note that the "

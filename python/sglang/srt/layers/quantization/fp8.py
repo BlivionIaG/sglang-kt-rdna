@@ -122,8 +122,25 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
+        is_fp4_experts: bool = False,
+        kv_cache_quant_algo: Optional[str] = None,
+        scale_fmt: Optional[str] = None,
     ) -> None:
+        # Parameters added with the qwen4 subsystem (sgl-project/sglang), which
+        # constructs Fp8Config for the MXFP8 and block-FP8 slots of a
+        # ModelOpt MIXED_PRECISION checkpoint. Upstream carries these five;
+        # this fork's signature stopped at use_mxfp8, so
+        # `ModelOptMixedPrecisionConfig.from_config` raised
+        # "Fp8Config.__init__() got an unexpected keyword argument
+        # 'packed_modules_mapping'". Accepted and stored rather than ignored:
+        # packed_modules_mapping is what the fused-name lookup consults, and
+        # is_fp4_experts/kv_cache_quant_algo/scale_fmt describe the slot.
+        self.packed_modules_mapping = packed_modules_mapping
+        self.is_fp4_experts = is_fp4_experts
+        self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.scale_fmt = scale_fmt
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
