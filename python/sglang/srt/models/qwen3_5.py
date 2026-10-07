@@ -1024,6 +1024,14 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    # Subclasses override this to substitute their own decoder layers; the qwen4
+    # subsystem's Qwen4ExpModel sets it to the PLE-aware Qwen4Exp* layers. Upstream
+    # reads it as a class attribute in `get_layer`; this fork read the module-global
+    # ALL_DECODER_LAYER_TYPES directly, so a subclass could not change the layer
+    # class and Qwen4ExpModel ended up with plain Qwen3.5 layers that have no `ple`
+    # attribute.
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     # Imported with the qwen4 subsystem (sgl-project/sglang): qwen4_exp declares
     # `packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping`, so the
     # attribute has to exist on this class. The four entries are the fused
@@ -1069,7 +1077,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = self.decoder_layer_types[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:
