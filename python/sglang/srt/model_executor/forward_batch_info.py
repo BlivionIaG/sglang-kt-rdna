@@ -56,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
@@ -1193,3 +1194,58 @@ def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
     if mode == "full" or features.enable_return_hidden_states:
         return CaptureHiddenMode.FULL
     return CaptureHiddenMode.NULL
+
+
+def compute_local_num_token_non_padded_cpu(
+    global_num_token_non_padded: int,
+    num_tokens_per_dp: int,
+    *,
+    sharded: bool,
+) -> int:
+    """Int-scalar twin of ``compute_local_num_token_non_padded`` for replay-time
+    hooks that hold the global count as a host int."""
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(
+        num_tokens_per_dp, sharded=sharded
+    )
+    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
+
+
+def get_required_capture_hidden_mode(
+    capture_hidden_mode: CaptureHiddenMode,
+    spec_info: Optional[SpecInput],
+) -> CaptureHiddenMode:
+    spec_capture_hidden_mode = (
+        getattr(spec_info, "capture_hidden_mode", None) or CaptureHiddenMode.NULL
+    )
+    return max(capture_hidden_mode, spec_capture_hidden_mode)
+
+
+def prefill_graph_tolerates_sum_len() -> bool:
+    """Whether MegaMoE may replay prefill graphs with per-rank SUM_LEN buckets.
+
+    The graph body is captured with MAX_LEN geometry, so a graph that recorded
+    a DP gather/scatter only replays correctly when every rank uses one bucket.
+    """
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+    from sglang.srt.layers.cp.utils import is_mla_cp_enabled
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_megamoe():
+        return False
+    if get_flags().dp.prefill_graph_has_dp_gather:
+        return False
+    return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
+
+
+def _attn_tp_local_shard_bounds(
+    num_tokens_per_dp: int, *, sharded: bool
+) -> Tuple[int, int]:
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's slice of the sequence.
+
+    A replicated (non-sharded) forward keeps the full range on every rank.
+    """
+    if not sharded:
+        return num_tokens_per_dp, 0
+    parallel = get_parallel()
+    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
