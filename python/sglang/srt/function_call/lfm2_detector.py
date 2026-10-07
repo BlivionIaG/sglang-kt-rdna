@@ -33,6 +33,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import safe_ast_parse
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +387,387 @@ class Lfm2Detector(BaseFormatDetector):
             end=")]<|tool_call_end|>",
             trigger="<|tool_call_start|>",
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _rename_reserved_kwargs(text: str) -> Tuple[str, bool]:
+    """Rename Python-keyword parameter names so the text parses.
+
+    Tools legitimately name parameters ``from``/``in``/``class``, but
+    ``memory_get(from=1)`` is a Python ``SyntaxError``. Rename ``from=`` to
+    ``from_pyreservedkw_=`` (outside string literals, keyword-argument
+    position only), parse, then restore via
+    :func:`_restore_reserved_kwarg_names`. Returns (rewritten_text, changed).
+    """
+    out: List[str] = []
+    quote: Optional[str] = None
+    changed = False
+    last_sig = ""
+    index, length = 0, len(text)
+    while index < length:
+        char = text[index]
+        if quote is not None:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            out.append(char)
+            last_sig = char
+            index += 1
+            continue
+        if char.isalpha() or char == "_":
+            end = index
+            while end < length and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            name = text[index:end]
+            look = end
+            while look < length and text[look].isspace():
+                look += 1
+            if (
+                _python_keyword.iskeyword(name)
+                and look < length
+                and text[look] == "="
+                and (look + 1 >= length or text[look + 1] != "=")
+                and last_sig in {"(", ","}
+            ):
+                out.append(name + _RESERVED_KW_SUFFIX)
+                changed = True
+            else:
+                out.append(name)
+            last_sig = name[-1]
+            index = end
+            continue
+        out.append(char)
+        if not char.isspace():
+            last_sig = char
+        index += 1
+    return "".join(out), changed
+
+
+def _restore_reserved_kwarg_names(arguments: dict) -> dict:
+    """Exact inverse of :func:`_rename_reserved_kwargs` on a decoded dict."""
+    restored = {}
+    for key, value in arguments.items():
+        if (
+            isinstance(key, str)
+            and key.endswith(_RESERVED_KW_SUFFIX)
+            and _python_keyword.iskeyword(key[: -len(_RESERVED_KW_SUFFIX)])
+        ):
+            restored[key[: -len(_RESERVED_KW_SUFFIX)]] = value
+        else:
+            restored[key] = value
+    return restored
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    """Whether the char at ``index`` follows an odd run of backslashes."""
+    backslashes = 0
+    j = index - 1
+    while j >= 0 and text[j] == "\\":
+        backslashes += 1
+        j -= 1
+    return backslashes % 2 == 1
+
+
+def _escape_nested_quotes_in_strings(text: str) -> Tuple[str, bool]:
+    """Close a broken string literal at the only closing quote that works.
+
+    Shell commands nest unescaped same-style quotes inside a string argument
+    (``command='sed -n '360,450p' f.py'`` or a quoted ``python3 -c`` payload),
+    which Python reads as juxtaposed garbage, so the call is dropped even
+    though the intent is unambiguous. A string is broken when its first
+    unescaped quote cannot syntactically close it (what follows is none of
+    ``,)]}:``). For a broken string, every syntactically plausible closing
+    quote is tried — interior quotes escaped, the rest kept verbatim — and
+    the result validated with ``ast.parse``. Exactly one parsing candidate
+    means recovery; zero or several means genuine ambiguity and the text is
+    returned unchanged rather than guessed at.
+
+    Returns (rewritten_text, changed).
+    """
+
+    def unescaped_quotes(start: int, quote: str) -> List[int]:
+        positions = []
+        j = start
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == quote:
+                positions.append(j)
+            j += 1
+        return positions
+
+    def is_closer(pos: int) -> bool:
+        k = pos + 1
+        while k < len(text) and text[k].isspace():
+            k += 1
+        return k < len(text) and text[k] in _QUOTE_FOLLOWERS
+
+    # A late-closing reading can swallow a whole sibling call into the
+    # string value (``f(a='x 'y'), g(...)`` parsing as one call with
+    # ``g(...)`` inside ``a``) — worse than dropping it, since the tool then
+    # runs with corrupted arguments. Counting brackets is immune to the
+    # broken quote, so the block's call count is the invariant.
+    expected_calls = len(_split_top_level_calls(text, respect_strings=False))
+    prefix: List[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char not in {"'", '"'}:
+            prefix.append(char)
+            index += 1
+            continue
+        quotes = unescaped_quotes(index + 1, char)
+        if not quotes:
+            return text, False
+        if is_closer(quotes[0]):
+            prefix.append(text[index : quotes[0] + 1])
+            index = quotes[0] + 1
+            continue
+        winners = []
+        for close in (j for j in quotes if is_closer(j)):
+            interior: List[str] = []
+            for j in range(index + 1, close):
+                if text[j] == char and not _is_escaped(text, j):
+                    interior.append("\\")
+                interior.append(text[j])
+            candidate = "".join(
+                ["".join(prefix), char, "".join(interior), char, text[close + 1 :]]
+            )
+            try:
+                module = safe_ast_parse(_escape_ctrl_chars_in_strings(candidate))
+            except (SyntaxError, ValueError):
+                continue
+            if expected_calls > 1 and _top_level_call_count(module) < expected_calls:
+                continue
+            winners.append(candidate)
+        if len(winners) == 1:
+            return winners[0], True
+        return text, False
+    return text, False
+
+
+def _escape_ctrl_chars_in_strings(text: str) -> str:
+    """Escape raw control chars inside string literals of pythonic text.
+
+    Models frequently place raw newlines inside a string argument (multi-line
+    shell commands), which is invalid Python, and a NUL byte anywhere makes
+    ``ast.parse`` raise ``ValueError``. Escaping ``\\n``/``\\r``/``\\t``/
+    ``\\x00`` only inside string literals makes the text parseable while the
+    escape sequences evaluate back to the exact original value.
+    """
+    out: List[str] = []
+    quote: Optional[str] = None
+    index, length = 0, len(text)
+    while index < length:
+        char = text[index]
+        if quote is None:
+            if char in {"'", '"'}:
+                quote = char
+            out.append(char)
+        elif char == "\\" and index + 1 < length:
+            out.append(char)
+            out.append(text[index + 1])
+            index += 2
+            continue
+        elif char == quote:
+            quote = None
+            out.append(char)
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\t":
+            out.append("\\t")
+        elif char == "\x00":
+            out.append("\\x00")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _normalize_leading_zero_ints(text: str) -> str:
+    """Strip leading zeros from decimal int literals (``month=07`` -> ``7``).
+
+    Zero-padded integers are a ``SyntaxError`` no other rewrite recovers.
+    Only rewrites outside string literals; tokens that are already valid
+    Python (``0x``/``0o``/``0b``, floats, exponents, all-zero literals,
+    fractional parts like ``1.07``) are left untouched.
+    """
+    out: List[str] = []
+    quote: Optional[str] = None
+    index, length = 0, len(text)
+    while index < length:
+        char = text[index]
+        if quote is not None:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char.isalpha() or char == "_":
+            end = index
+            while end < length and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            out.append(text[index:end])
+            index = end
+            continue
+        if char.isdigit():
+            end = index
+            while end < length and (text[end].isdigit() or text[end] == "_"):
+                end += 1
+            token = text[index:end]
+            digits = token.replace("_", "")
+            follower = text[end] if end < length else ""
+            preceded_by_dot = index > 0 and text[index - 1] == "."
+            if (
+                digits[0] == "0"
+                and digits.strip("0")
+                and not preceded_by_dot
+                and follower not in {".", "e", "E", "j", "J"}
+            ):
+                out.append(str(int(digits)))
+            else:
+                out.append(token)
+            index = end
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _recovery_candidates(content: str) -> List[Tuple[str, bool]]:
+    """Progressive rewrites for content that failed to parse.
+
+    Each rewrite is a no-op on already-valid text; the first candidate whose
+    result parses wins. Nested-quote recovery is re-escaped, since requoting
+    can move raw newlines inside the string. The flag marks candidates that
+    went through reserved-keyword renaming; only their decoded arguments get
+    the original parameter names restored.
+    """
+    escaped = _escape_ctrl_chars_in_strings(_normalize_leading_zero_ints(content))
+    candidates: List[Tuple[str, bool]] = [(escaped, False)]
+    requoted, requote_changed = _escape_nested_quotes_in_strings(escaped)
+    if requote_changed:
+        candidates.append((_escape_ctrl_chars_in_strings(requoted), False))
+    for text, _ in list(candidates):
+        renamed, kw_renamed = _rename_reserved_kwargs(text)
+        if kw_renamed:
+            candidates.append((renamed, True))
+            # A call can stack both quirks; renaming first lets requote
+            # validate candidates the keyword SyntaxError otherwise blocks.
+            requoted_after, requote_after_changed = _escape_nested_quotes_in_strings(
+                renamed
+            )
+            if requote_after_changed:
+                candidates.append((_escape_ctrl_chars_in_strings(requoted_after), True))
+    return candidates
+
+
+def _split_top_level_calls(text: str, *, respect_strings: bool = True) -> List[str]:
+    """Split a pythonic call block into top-level call segments.
+
+    ``[a(x=1), b(y=2)]`` becomes ``["a(x=1)", "b(y=2)"]``: one enclosing
+    bracket pair is stripped and only commas at bracket depth 0 separate
+    segments. With ``respect_strings=False`` only brackets are counted,
+    which a broken quote cannot desynchronize; string arguments always sit
+    at depth >= 1, so their commas still never split.
+    """
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    segments: List[str] = []
+    start = 0
+    depth = 0
+    quote: Optional[str] = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if respect_strings and quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if respect_strings and char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            segments.append(text[start:index])
+            start = index + 1
+        index += 1
+    segments.append(text[start:])
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def _top_level_call_count(module: ast.Module) -> int:
+    """Number of calls in a parsed ``[a(...), b(...)]`` block."""
+    if not module.body:
+        return 0
+    value = getattr(module.body[0], "value", None)
+    if isinstance(value, ast.List):
+        return sum(1 for element in value.elts if isinstance(element, ast.Call))
+    return 1 if isinstance(value, ast.Call) else 0
+
+
+def _salvage_calls_from_unparsable_block(text: str) -> List[Tuple[ast.Call, bool]]:
+    """Recover individual calls from a block ``ast.parse`` cannot handle.
+
+    When the block as a whole is a SyntaxError no rewrite recovers, there
+    is no call list at all and one bad call drops every parseable sibling,
+    leaving an agent loop with no tool result. Split with both scanning
+    strategies and parse each segment on its own through the rewrite
+    ladder. A wrongly split segment simply fails to parse and is dropped,
+    so this can only under-recover, never attribute arguments to the wrong
+    call. Each call carries the reserved-keyword flag of the candidate it
+    parsed from.
+    """
+    best: List[Tuple[ast.Call, bool]] = []
+    for respect_strings in (True, False):
+        segments = _split_top_level_calls(text, respect_strings=respect_strings)
+        if len(segments) < 2:
+            continue
+        calls: List[Tuple[ast.Call, bool]] = []
+        for segment in segments:
+            for candidate, kw_renamed in [(segment, False)] + _recovery_candidates(
+                segment
+            ):
+                try:
+                    module = safe_ast_parse(candidate)
+                except (SyntaxError, ValueError):
+                    continue
+                parsed = getattr(module.body[0], "value", None) if module.body else None
+                if isinstance(parsed, ast.Call):
+                    calls.append((parsed, kw_renamed))
+                break
+        if len(calls) > len(best):
+            best = calls
+    return best
 
 
 # --- imported with the qwen4 subsystem (sgl-project/sglang) ---

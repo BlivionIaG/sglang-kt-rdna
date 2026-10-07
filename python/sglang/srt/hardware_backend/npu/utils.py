@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
+import sys
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -134,3 +135,211 @@ def get_indexer_weight_stream():
     if indexer_weight_stream is None:
         indexer_weight_stream = torch.npu.Stream()
     return indexer_weight_stream
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    if not is_npu():
+        return False
+
+    import acl
+
+    return acl.rt.get_device_info(0, 601) == (3510, 0)
+
+
+def use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
+    """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
+
+    Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
+    ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
+    NPU arch35 MXFP8 scale layout.
+    """
+    if not _is_npu or not is_npu_arch35() or quant_config is None:
+        return False
+    if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+        return False
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    return tuple(weight_block_size or ()) == (128, 128)
+
+
+def _is_nz_aligned(tensor: torch.Tensor) -> bool:
+    """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
+
+    A fractal tile is 16 rows by 32 bytes (the C0_32 in the op's error strings),
+    so the row rule is always k % 16 and the column rule is 32 // itemsize:
+
+      BF16 / FP16  : k % 16 == 0  and  n % 16 == 0
+      INT8 / FP8   : k % 16 == 0  and  n % 32 == 0
+      INT4         : k % 16 == 0  and  n % 64 == 0
+
+    Unlisted dtypes fall through to True: this is a cheap pre-filter for known
+    bad combinations, not an authority — the op itself is.
+    """
+    if tensor.dim() < 2:
+        return False
+    k, n = tensor.shape[-2], tensor.shape[-1]
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+        return k % 16 == 0 and n % 16 == 0
+    if tensor.dtype in (torch.int8, torch.float8_e4m3fn):
+        # e4m3 is single-byte like int8, so it shares the column rule. Reached
+        # only by the MXFP8 MoE weights; the packed-FP4 callers pass
+        # customize_dtype and return before this check.
+        return k % 16 == 0 and n % 32 == 0
+    if tensor.dtype in (torch.uint8, torch.int32):
+        # INT4 is typically packed into uint8/int32; be conservative
+        return k % 16 == 0 and n % 64 == 0
+    return True
+
+
+def init_zbal(world_size, gpu_id, world_rank, do_check=True):
+    """
+    init zbal, if is mix alloc mode, only register for sma & comm
+    """
+    zbal_mem_size = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()
+    if not zbal_mem_size > 0:
+        return 1
+
+    global gva_is_inited
+    from zbal import is_mix_alloc, switch_to_allocator, zbal_init
+
+    if is_mix_alloc():
+        switch_to_allocator()
+        # use lazy init for mix alloc
+        return 1
+    else:
+        if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+            ret = zbal_init(
+                world_size,
+                gpu_id,
+                world_rank,
+                zbal_mem_size * (1024**2),
+                ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+            )
+        else:
+            ret = zbal_init(world_size, gpu_id, world_rank, zbal_mem_size * (1024**2))
+
+        gva_is_inited = True
+
+        if do_check and not ret:
+            logger.error("[ZBAL] zbal init failed!")
+            sys.exit(-1)
+
+        return ret
+
+
+def lazy_init_zbal_gva_mem(
+    device, gpu_id, world_rank, world_size, cpu_group=None, do_check=True
+):
+    """
+    lazy init zbal gva mem, keep weights and kv remains alloc by dma vmm to avoid memory fragment
+    """
+    from zbal import is_mix_alloc, zbal_init
+
+    if not is_mix_alloc():
+        logger.info(
+            "lazy init is supported only in mix alloc mode, this action will be passed"
+        )
+        return 1
+
+    global gva_is_inited
+    from sglang.srt.utils.common import get_available_gpu_memory
+
+    # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
+    total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch
+    free_gpu_memory = get_available_gpu_memory(
+        device,
+        gpu_id,
+        distributed=world_size > 1,
+        cpu_group=cpu_group,
+        empty_cache=True,
+    )
+
+    used_memory = total_memory - free_gpu_memory
+
+    used_memory_in_mb = int(used_memory * 1024)
+    gva_in_mb = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() - used_memory_in_mb
+    gva_in_mb = gva_in_mb - gva_in_mb % 128  # align to 128MB
+    print(f"[ZBAL] rank {world_rank} allocated {gva_in_mb} MB gva space.")
+
+    assert not gva_is_inited, "zbal gva should be inited only once"
+    # zbal_set_logger_level(0)
+    if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+        res = zbal_init(
+            world_size,
+            gpu_id,
+            world_rank,
+            gva_in_mb * (1024**2),
+            ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+        )
+    else:
+        res = zbal_init(world_size, gpu_id, world_rank, gva_in_mb * (1024**2))
+
+    gva_is_inited = True
+    if do_check and not res:
+        logger.error("[ZBAL] zbal lazy init failed!")
+        sys.exit(-1)
+    return res
+
+
+def get_share_stream():
+    global share_stream
+    return share_stream
+
+
+def set_share_stream(stream):
+    global share_stream
+    share_stream = stream
+    # TODO LKL: set stream limit has impact on precision
+    # torch.npu.set_stream_limit(share_stream, 8, 16)
+
+
+def get_routed_stream():
+    global routed_stream
+    return routed_stream
+
+
+def set_routed_stream(stream):
+    global routed_stream
+    routed_stream = stream
+    # TODO LKL: set stream limit has impact on precision
+    # torch.npu.set_stream_limit(routed_stream, 16, 32)
+
+
+def wait_share_stream():
+    stream = get_share_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
+
+
+def wait_routed_stream():
+    stream = get_routed_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
+
+
+def process_shared_expert(hidden_states, forward_func):
+    stream = get_share_stream()
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_share_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
+        shared_output = forward_func(hidden_states)
+    return shared_output
+
+
+def process_routed_expert(hidden_states, topk_output, forward_func):
+    stream = get_routed_stream()
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_routed_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
+        shared_output = forward_func(hidden_states, topk_output)
+    return shared_output

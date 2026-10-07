@@ -36,6 +36,9 @@ from sglang.srt.utils import (
 )
 from enum import Enum
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.environ import envs
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.moe.utils import xpu_moe_ld_padding_elems
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

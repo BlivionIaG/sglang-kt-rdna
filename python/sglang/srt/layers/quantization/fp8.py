@@ -2010,3 +2010,76 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _require_fp4_dtype():
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None:
+        raise RuntimeError(
+            "DeepSeek-V4 FP4 experts require torch.float4_e2m1fn_x2 support."
+        )
+    return fp4_dtype
+
+
+def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Restore the logical layout of a backend-shuffled FP8 weight."""
+    if not _use_aiter:
+        raise RuntimeError("FP8 weight unshuffle requires AITER")
+    return unshuffle_aiter_fp8_weight(weight)
+
+
+def cast_e2m1fn_to_e4m3fn(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Casts a tensor from e2m1fn to e4m3fn losslessly.
+    """
+    assert x.dtype == torch.int8
+    assert x.ndim == 2
+    out_dim, in_dim = x.size()
+    in_dim *= 2
+    fp8_block_size = 128
+    fp4_block_size = 32
+    assert in_dim % fp8_block_size == 0 and out_dim % fp8_block_size == 0
+    assert scale.size(0) == out_dim and scale.size(1) == in_dim // fp4_block_size
+
+    x = x.view(torch.uint8)
+    low = x & 0x0F
+    high = (x >> 4) & 0x0F
+    table = DSV4_DEQUANT_FP4_TABLE.to(x.device)
+    x = torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(2)
+
+    # max_fp4 (6.0) * MAX_OFFSET must fit in e4m3fn (max 448)
+    # 6.0 * 2^6 = 384 < 448; 6.0 * 2^7 = 768 > 448; so MAX_OFFSET_BITS = 6
+    MAX_OFFSET_BITS = 6
+
+    bOut = out_dim // fp8_block_size
+    bIn = in_dim // fp8_block_size
+    # bOut, bIn, 128, 128
+    x = x.view(bOut, fp8_block_size, bIn, fp8_block_size).transpose(1, 2)
+    # bOut, bIn, 128*4
+    scale = scale.float().view(bOut, fp8_block_size, bIn, -1).transpose(1, 2).flatten(2)
+    ## bOut, bIn, 1
+    scale_max_offset_bits = scale.amax(dim=-1, keepdim=True) / (2**MAX_OFFSET_BITS)
+    # bOut, bIn, 128*4
+    offset = scale / scale_max_offset_bits
+    # bOut, bIn, 128, 128
+    offset = offset.unflatten(-1, (fp8_block_size, -1)).repeat_interleave(
+        fp4_block_size, dim=-1
+    )
+    x = (x * offset).transpose(1, 2).reshape(out_dim, in_dim)
+    return x.to(torch.float8_e4m3fn), scale_max_offset_bits.squeeze(-1).to(
+        torch.float8_e8m0fnu
+    )
+
+
+class Fp8KVCacheMethod(BaseKVCacheMethod):
+    """
+    Supports loading kv-cache scaling factors from FP8 checkpoints.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        super().__init__(quant_config)

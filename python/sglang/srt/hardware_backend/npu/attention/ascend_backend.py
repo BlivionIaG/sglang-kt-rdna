@@ -33,6 +33,8 @@ import logging
 
 import numpy as np
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 
 
 def _reshape_kv_for_fia_nz(
@@ -1794,3 +1796,68 @@ class AscendAttnMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, call_fn)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+    )
+
+
+def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
+    if topk_indices.dim() == 2:
+        return topk_indices.unsqueeze(-2)
+    return topk_indices
+
+
+def _cp_allgather_and_save_kv_npu(
+    forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
+):
+    """NPU-compatible CP KV all-gather with merged K/V communication.
+
+    Merges K and V along the feature dimension so only one all-gather is
+    needed instead of two, halving communication latency.
+
+    k shape: [S_local, tp_k_head_num, qk_head_dim]
+    v shape: [S_local, tp_v_head_num, v_head_dim]
+
+    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
+    a single all-gather for both K and V.
+
+    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
+    (None for non-SWA pools); set_kv_buffer never translates internally.
+    """
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+    # Save original trailing shapes for reshape after gather.
+    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
+    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
+
+    # Flatten trailing dims then concat → one all-gather instead of two.
+    # Works for GQA where tp_k_head_num != tp_v_head_num.
+    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
+    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
+    k_feat_size = k_flat.shape[-1]
+    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
+
+    kv_full = cp_all_gather_rerange_kv_cache(
+        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+    )  # [S_full, k_feat + v_feat]
+
+    key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
+    value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
+
+    token_to_kv_pool.set_kv_buffer(
+        layer,
+        KVWriteLoc(cache_loc, swa_loc),
+        key_cache_full,
+        value_cache_full,
+    )

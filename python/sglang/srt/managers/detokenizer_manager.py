@@ -51,6 +51,7 @@ from sglang.utils import (
     find_printable_text,
     get_exception_traceback,
 )
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 
 logger = logging.getLogger(__name__)
 

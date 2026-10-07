@@ -11,6 +11,8 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     RoutingMethodType,
 )
+from typing import Any
+from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (

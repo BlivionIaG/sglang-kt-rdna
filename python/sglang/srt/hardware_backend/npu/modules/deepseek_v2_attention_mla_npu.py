@@ -16,6 +16,8 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.communicator import get_attn_tp_context
 from typing import TYPE_CHECKING, Optional
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.model_executor.forward_context import forward_context
+from sglang.srt.runtime_context import runtime_context
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -519,3 +521,29 @@ def npu_mla_preprocess(
 
 
 # endregion
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
+    return (
+        runtime_context.get_parallel().dcp_enabled
+        and not forward_context.get_attn_backend().is_draft_worker
+        and not dsa_use_prefill_cp(forward_batch)
+        and not forward_batch.forward_mode.is_idle()
+    )
+
+
+def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
+    """Apply RoPE to interleaved Q/K and return half-layout outputs."""
+    rotary_emb.get_cos_sin_with_position(positions)
+    cos = rotary_emb.position_cos.to(device=q_pe.device, dtype=q_pe.dtype).view(
+        -1, 1, 1, q_pe.shape[-1]
+    )
+    sin = rotary_emb.position_sin.to(device=q_pe.device, dtype=q_pe.dtype).view(
+        -1, 1, 1, q_pe.shape[-1]
+    )
+    q_pe = torch_npu.npu_interleave_rope(q_pe.unsqueeze(2), cos, sin).squeeze(2)
+    k_pe = torch_npu.npu_interleave_rope(k_pe.unsqueeze(2), cos, sin).squeeze(2)
+    return q_pe, k_pe

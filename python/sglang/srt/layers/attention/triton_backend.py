@@ -19,6 +19,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     next_power_of_2,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

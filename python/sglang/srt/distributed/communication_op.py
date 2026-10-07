@@ -13,6 +13,7 @@ from .parallel_state import (
     get_tp_group,
 )
 from typing import List
+from sglang.srt.utils import broadcast_pyobj
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

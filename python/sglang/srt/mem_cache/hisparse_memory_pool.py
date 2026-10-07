@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.deepseekv4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
 )
+from sglang.srt.layers.radix_attention import RadixAttention
 
 
 class DeepSeekV4SingleKVPoolHost:

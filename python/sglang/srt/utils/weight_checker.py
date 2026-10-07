@@ -8,6 +8,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
+from typing import NamedTuple
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from typing import Optional
+from typing import Set
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
+from sglang.srt.managers.mm_utils import tensor_hash
 
 logger = logging.getLogger(__name__)
 
@@ -175,3 +182,136 @@ def _postprocess_tensors(
     for name in raw:
         should_compare = name not in skip_compare_names
         yield name, should_compare, raw[name]
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class _StrictBaseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ParallelismInfo(_StrictBaseModel):
+    # "target", or a draft role such as "draft" / "draft_step_0"
+    role: str
+    tp_rank: int
+    tp_size: int
+    dp_rank: int
+    dp_size: int
+    pp_rank: int
+    pp_size: int
+    rank: int
+    size: int
+
+
+class ChecksumInfo(_StrictBaseModel):
+    checksums: Dict[str, str]
+    per_gpu_checksum: str
+    parallelism_info: ParallelismInfo
+
+
+class CheckEntry(NamedTuple):
+    name: str
+    should_compare: bool
+    comparable: ComparableWeight
+
+
+class QuantizedWeight(NamedTuple):
+    comparable_cls: type[ComparableWeight]
+    scale_name: str
+    is_shuffled: bool = False
+
+
+def _is_non_persistent_buffer_name(name: str) -> bool:
+    return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
+
+
+def _is_skip_weight_check(name, param, skip_tensor_list=None) -> bool:
+    # one skip set shared by reset / compare / checksum
+    return (
+        _is_non_persistent_buffer_name(name)
+        or getattr(param, "_skip_weight_check", False)
+        or any(pat in name for pat in (skip_tensor_list or ()))
+    )
+
+
+def overall_checksum(checksums: Dict[str, str]) -> str:
+    h = hashlib.sha256()
+    for name in sorted(checksums):
+        h.update(name.encode())
+        h.update(checksums[name].encode())
+    return h.hexdigest()
+
+
+def _padded(nbytes: int, align: int) -> int:
+    return (nbytes + align - 1) // align * align
+
+
+class _ArenaAllocator:
+    """Bump-allocates aligned views out of one mmap arena, so the whole snapshot is one munmap."""
+
+    def __init__(self, total_bytes: int, align: int):
+        self.arena = alloc_mmap((max(total_bytes, align),), torch.uint8)
+        self._align = align
+        self._pointer = 0
+
+    def allocate(self, like: torch.Tensor) -> torch.Tensor:
+        start = self._pointer
+        self._pointer += _padded(like.nbytes, self._align)
+        assert self._pointer <= len(self.arena)
+        return self.arena[start : start + like.nbytes].view(like.dtype).view(like.shape)
+
+
+def _hash_tensor(t: torch.Tensor) -> str:
+    return f"{tensor_hash(t):016x}"
+
+
+def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
+    """Run the router over the model: {weight_name: QuantizedWeight} for each
+    quantized weight; weights absent from the set compare raw."""
+    quantized_set = {}
+    for module_name, module in model.named_modules():
+        comparable_cls = select_comparable_weight(getattr(module, "quant_method", None))
+        if comparable_cls is None:
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        own = dict(module.named_parameters(recurse=False))
+        for name, parameter in own.items():
+            scale = name.replace("weight", "weight_scale_inv")
+            if name.endswith("weight") and scale in own:
+                quantized_set[prefix + name] = QuantizedWeight(
+                    comparable_cls,
+                    prefix + scale,
+                    getattr(parameter, "is_shuffled", False),
+                )
+    return quantized_set
+
+
+def _build_check_entries(
+    raw: Dict[str, torch.Tensor],
+    skip_compare_names: Set[str],
+    quantized_set: Optional[Dict[str, QuantizedWeight]] = None,
+) -> Iterable[CheckEntry]:
+    """Yields a CheckEntry per weight; quantized weights consume their scale, everything
+    else is raw."""
+    skip_compare_names = set(skip_compare_names)
+    quantized_set = quantized_set or {}
+    scale_names = {qw.scale_name for qw in quantized_set.values()}
+
+    for name, tensor in raw.items():
+        if name in scale_names:
+            continue  # compared via its weight's comparable
+        if name in quantized_set:
+            qw = quantized_set[name]
+            yield CheckEntry(
+                name,
+                True,
+                qw.comparable_cls(
+                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                ),
+            )
+        else:
+            should_compare = name not in skip_compare_names and (
+                not _is_non_persistent_buffer_name(name)
+            )
+            yield CheckEntry(name, should_compare, RawComparable(tensor))

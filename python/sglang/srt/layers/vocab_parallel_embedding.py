@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_npu,
     set_weight_attrs,
 )
+from sglang.srt.environ import envs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 

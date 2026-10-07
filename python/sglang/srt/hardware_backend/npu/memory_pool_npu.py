@@ -362,3 +362,199 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _mla_fia_nz_scatter_indices(
+    loc: torch.Tensor, head_dim: int, page_size: int
+) -> torch.Tensor:
+    """Return physical rows for token-wise writes into an MLA NZ cache.
+
+    The storage allocation remains page-major ``[page, slot, 1, D]`` for
+    transfer and bookkeeping compatibility. FIA reads that storage as
+    ``[page, 1, D / 16, page_size, 16]``. A token-major scatter would therefore
+    write the wrong physical rows, so every logical token expands to its
+    ``D / 16`` NZ tiles.
+    """
+    if head_dim % 16:
+        raise ValueError(
+            "FIA NZ MLA cache requires a head dimension divisible by 16, "
+            f"got {head_dim}."
+        )
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}.")
+
+    num_tiles = head_dim // 16
+    page = torch.div(loc, page_size, rounding_mode="floor")
+    slot = torch.remainder(loc, page_size)
+    tiles = torch.arange(num_tiles, dtype=loc.dtype, device=loc.device)
+    # Flatten [token, tile] in the same order as source.view(T, tiles, 16).
+    rows = ((page[:, None] * num_tiles + tiles) * page_size) + slot[:, None]
+    return rows.reshape(-1, 1)
+
+
+def _init_npu_conv_state(
+    conv_state_in,
+    conv_state_shape,
+    speculative_num_draft_tokens: Optional[int] = None,
+    is_kda: bool = False,
+):
+    extra_conv_len = 0
+    if speculative_num_draft_tokens is not None:
+        extra_conv_len = speculative_num_draft_tokens - 1
+
+    # Both KDA and Mamba/GDN NPU conv states use the unified
+    # [layers, pool, window, channels] layout. KDA shapes arrive as
+    # (window, channels) while Mamba/GDN shapes arrive as (channels, window);
+    # resolve the correct axis ordering and extend the window by
+    # speculative_num_draft_tokens - 1 so that verify can write all draft
+    # token conv states directly into conv_states (GDN rollback scheme).
+    conv_state = [
+        torch.zeros(
+            size=(
+                conv_state_in.shape[0],
+                conv_state_in.shape[1],
+                (conv_shape[0] if is_kda else conv_shape[1]) + extra_conv_len,
+                conv_shape[1] if is_kda else conv_shape[0],
+            ),
+            dtype=conv_state_in.dtype,
+            device=conv_state_in.device,
+        )
+        for conv_shape in conv_state_shape
+    ]
+    return conv_state
+
+
+class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
+    """NPU paged K-only cache used by MiniMax sparse index-only layers."""
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        super(MHATokenToKOnlyPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            # Keep a reference to the contiguous tensor for HiCache
+            # D2H/H2D transfers (transfer_kv_dim_exchange expects a
+            # tensor, not the per-layer list used in FIA mode below).
+            self.k_buffer_tensor = self.k_buffer
+            if self.use_fia:
+                self.k_buffer = [
+                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    for i in range(self.layer_num)
+                ]
+
+        self._finalize_allocation_log(size)
+
+    def _get_key_buffer(self, layer_id: int):
+        k_buffer = self.k_buffer[layer_id - self.start_layer]
+        if self.store_dtype != self.dtype:
+            return k_buffer.view(self.dtype)
+        return k_buffer
+
+    def set_k_buffer(
+        self,
+        layer_id: int,
+        loc_info,
+        cache_k: torch.Tensor,
+    ) -> None:
+        loc, _, _ = unwrap_write_loc(loc_info)
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+
+        k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
+            -1, self.head_num, self.head_dim
+        )
+        loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
+        torch_npu.npu_scatter_nd_update_(
+            k_buffer_layer,
+            loc.view(-1, 1),
+            cache_k.contiguous().view(-1, self.head_num, self.head_dim),
+        )
+
+    def get_contiguous_buf_infos(self):
+        data_ptrs = [
+            self.get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        data_lens = [
+            self.get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        if self.use_fia:
+            item_lens = [
+                self.get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            item_lens = [
+                self.get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        return data_ptrs, data_lens, item_lens
+
+    def get_kv_size_bytes(self):
+        return get_tensor_size_bytes(self.k_buffer), 0
+
+
+class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
+    """MiniMax sparse wrapper backed by NPU paged MHA/index pools."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            main_pool_cls=NPUMHATokenToKVPool,
+            index_kv_pool_cls=NPUMHATokenToKVPool,
+            index_k_pool_cls=NPUMHATokenToKOnlyPool,
+            **kwargs,
+        )
+
+    def get_index_k_state_buf_infos(self):
+        pool = self.index_k_pool
+        n = pool.layer_num
+        data_ptrs = [pool.get_key_buffer(i).data_ptr() for i in range(n)]
+        data_lens = [pool.get_key_buffer(i).nbytes for i in range(n)]
+        if pool.use_fia:
+            item_lens = [
+                pool.get_key_buffer(i)[0].nbytes * pool.page_size for i in range(n)
+            ]
+        else:
+            item_lens = [pool.get_key_buffer(i)[0].nbytes for i in range(n)]
+        return data_ptrs, data_lens, item_lens

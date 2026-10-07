@@ -29,6 +29,9 @@ from sglang.srt.utils.common import (
 )
 from typing import Optional
 from contextlib import contextmanager
+from typing import Generator
+from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

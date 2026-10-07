@@ -40,6 +40,8 @@ from sglang.srt.utils import (
 )
 from sglang.kernels.fused_op import BaseFusedOp
 from functools import lru_cache
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_parallel
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()

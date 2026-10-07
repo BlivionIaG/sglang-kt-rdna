@@ -46,6 +46,7 @@ from sglang.srt.utils import (
 )
 import time
 import copy
+from functools import partial
 
 logger = logging.getLogger(__name__)
 

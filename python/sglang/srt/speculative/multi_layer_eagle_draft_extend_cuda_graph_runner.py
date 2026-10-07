@@ -53,6 +53,9 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.model_executor.forward_context import forward_context
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
