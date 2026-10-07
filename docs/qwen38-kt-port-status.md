@@ -74,3 +74,37 @@ par1-llm1 wedged during the memlock test: ICMP fine, ARP REACHABLE, `:22` accept
 never sends a banner, all service ports closed. Confirmed from two vantages (this workstation
 and `par1-cssec1` via `chenco_adm@100.122.94.247`). No BMC exists (623/5900 closed; .122 is a
 Hue bridge). Recovery required a power cycle.
+
+## THE BLOCKER, AS UPSTREAM DOCUMENTS IT
+
+`python/sglang/srt/models/qwen4_exp_ple_table.py` says it plainly in its module docstring:
+
+> ``file`` -- A file-backed, shared ``mmap`` of a sparse file under ``--ple-offload-dir``.
+> Meant for unified-memory parts (GB10 / DGX Spark and similar), where pinned host memory
+> comes out of the *same* pool as the model weights and ``pinned`` therefore frees nothing:
+> **Qwen3.8-Flash-Next is 126.0 GiB of weights on a 121.63 GiB box and does not boot with
+> ``pinned``.**
+
+So the `pinned` backend this run uses is documented by upstream as not booting this model on
+a box of this size -- and it is what wedged par1-llm1. The two alternatives:
+
+| backend | requirement | this host |
+|---|---|---|
+| `pinned` | host RAM for 126 GiB of weights + 47.7 GiB PLE | 92 GB RAM -- documented as not booting |
+| `file` | `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (unified memory: GB10 / DGX Spark) | reports **False** -- correctly refused |
+| neither | the 47.69 GiB PLE table must be GPU-resident | 16 GB card -- `Tried to allocate 47.69 GiB` |
+
+**Attribute-number trap:** the library's constant is
+`_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100` (`ple_table.py:54`). An
+earlier hand-rolled probe of mine read attribute **129** and printed `1`, which briefly looked
+like the capability was available. It is not; the library's own
+`device_uses_host_page_tables(0)` returns `False`. Never hand-pick an enum value -- call the
+library's predicate.
+
+## CONCLUSION
+
+Both PLE backends are unavailable on this hardware, and the third option does not fit on the
+GPU. That is an environment/checkpoint mismatch, not a defect in the port: the code path is
+complete and pushed. Resolving it needs either a unified-memory device (so `file` works) or a
+host large enough for the weights plus the pinned table. `scripts/run-qwen38-kt.sh` is ready
+for either, and `ISOLATE=1` keeps a future attempt from wedging the machine.
