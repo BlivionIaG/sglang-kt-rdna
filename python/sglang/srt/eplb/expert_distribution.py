@@ -205,6 +205,17 @@ class ExpertDistributionRecorder(ABC):
         )
 
 
+    def on_gpu_expert_mask(self, layer_idx: int, gpu_experts_mask) -> None:
+        """Record the GPU expert mask for a layer (used by the KT EP wrapper).
+
+        Restored from the pre-base-forward fork. The KT wrapper calls this on the recorder
+        returned by `get_global_expert_distribution_recorder()`, and the newer base's
+        `ExpertDistributionRecorder` does not declare it -- so the no-op subclass raised
+        `AttributeError: '_ExpertDistributionRecorderNoop' object has no attribute
+        'on_gpu_expert_mask'` the moment the KT MoE path ran.
+        """
+        pass
+
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
     pass
 
