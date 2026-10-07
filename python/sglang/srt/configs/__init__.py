@@ -1,7 +1,11 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
-from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
+from sglang.srt.configs.bailing_hybrid import (
+    BailingHybridConfig,
+    BailingMoeV3VLConfig,
+)
 from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
 from sglang.srt.configs.chatglm import ChatGLMConfig
+from sglang.srt.configs.cosmos3 import Cosmos3Config
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
@@ -90,4 +94,6 @@ __all__ = [
     "MiniCPMHybridConfig",
     "ZayaConfig",
     "BailingMM2Config",
+    "BailingMoeV3VLConfig",
+    "Cosmos3Config",
 ]

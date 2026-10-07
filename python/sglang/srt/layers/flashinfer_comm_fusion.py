@@ -272,3 +272,27 @@ def cleanup_flashinfer_workspace():
     global _workspace_manager
     if _workspace_manager is not None:
         _workspace_manager.cleanup()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -----------------
+# `layer_boundary/residual/add_norm.py` asks whether the flashinfer
+# all-reduce fusion is unusable. Upstream keeps this as a module-global that
+# its fusion path sets when the workspace cannot be built; the same name and
+# the same latch are provided here so the caller reads identical state.
+
+_flashinfer_allreduce_unavailable = False
+
+
+def is_flashinfer_allreduce_unavailable() -> bool:
+    return _flashinfer_allreduce_unavailable
+
+
+def mark_flashinfer_allreduce_unavailable() -> None:
+    """Latch the flag: the fused all-reduce path cannot be used in this process."""
+    global _flashinfer_allreduce_unavailable
+    _flashinfer_allreduce_unavailable = True
+
+
+def uses_cutedsl_ar_fusion() -> bool:
+    """Selected CuTe DSL owns both patterns, so the legacy workspace stands down."""
+    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"

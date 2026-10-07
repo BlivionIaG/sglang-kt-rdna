@@ -1129,3 +1129,67 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ----------------
+@dataclass
+class NgramEmbeddingInfo:
+    """Ngram embedding state for LongCat models."""
+
+    token_table: torch.Tensor
+    column_starts: torch.Tensor
+    req_lens: torch.Tensor
+    out_column_starts: torch.Tensor
+    out_req_lens: torch.Tensor
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the token table.
+    skip_token_table_update: Optional[torch.Tensor] = None
+
+    @classmethod
+    def create(
+        cls,
+        token_table: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+        column_starts=None,
+        req_lens=None,
+        skip_token_table_update=None,
+    ) -> NgramEmbeddingInfo:
+        info = cls(
+            token_table=token_table,
+            column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            skip_token_table_update=skip_token_table_update,
+        )
+        if column_starts is not None:
+            info.column_starts[:] = column_starts
+        if req_lens is not None:
+            info.req_lens[:] = req_lens
+        return info
+
+    def slice(self, bs: int) -> NgramEmbeddingInfo:
+        return NgramEmbeddingInfo(
+            token_table=self.token_table,
+            column_starts=self.column_starts[:bs],
+            req_lens=self.req_lens[:bs],
+            out_column_starts=self.out_column_starts[:bs],
+            out_req_lens=self.out_req_lens[:bs],
+            skip_token_table_update=(
+                self.skip_token_table_update[:bs]
+                if self.skip_token_table_update is not None
+                else None
+            ),
+        )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
+    features = get_exec().features
+    mode = features.return_hidden_states_mode
+    if mode == "last":
+        return CaptureHiddenMode.LAST
+    if mode == "full" or features.enable_return_hidden_states:
+        return CaptureHiddenMode.FULL
+    return CaptureHiddenMode.NULL

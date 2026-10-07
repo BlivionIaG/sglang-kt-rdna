@@ -4258,3 +4258,14 @@ def maybe_torch_compile(func):
     if get_is_capture_mode():
         return torch.compile(func)
     return func
+
+
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD RDNA4 (gfx1250).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx1250"])
+    else:
+        return False
