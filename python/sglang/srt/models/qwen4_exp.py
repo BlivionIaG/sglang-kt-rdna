@@ -48,6 +48,17 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+# Side-effect import, the same mechanism `models/deepseek_v4.py` uses
+# (`_try_side_effect("sglang.srt.layers.moe.kt_ep_wrapper")`). `kt_ep_wrapper`
+# registers the kt CPU/GPU expert wrapper with the MoE quant-method registry at
+# import time; until then the only activator was deepseek_v4, so a Qwen4-Exp MoE
+# block fell through to the stock Triton fused-MoE path and put every routed
+# expert on the GPU.
+try:
+    from sglang.srt.layers.moe import kt_ep_wrapper as _kt_ep_wrapper  # noqa: F401
+except ImportError:
+    _kt_ep_wrapper = None
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
