@@ -94,6 +94,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
@@ -4399,3 +4400,52 @@ def log_debug_on_rank0(logger, msg):
                 logger.debug(f"{msg} (rank-check failed: {e})")
         else:
             logger.debug(f"{msg} (rank-check failed: {e})")
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
+
+
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def get_dispatch_device_backend():
+    if is_cuda_alike():
+        dispatch_key = "CUDA"
+    elif is_xpu():
+        dispatch_key = "XPU"
+    elif is_npu():
+        dispatch_key = "NPU"
+    else:
+        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
+    return dispatch_key
+
+
+# --- imported with the qwen4 subsystem ---
+def get_nvidia_driver_version() -> tuple:
+    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
+    Returns (0,) on failure."""
+    version_str = get_nvidia_driver_version_str()
+    if version_str is None:
+        return (0,)
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except ValueError:
+        return (0,)

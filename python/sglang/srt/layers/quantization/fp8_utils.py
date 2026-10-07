@@ -1399,3 +1399,48 @@ def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> 
     so the transposed emit buys nothing and the materialize path is used.
     """
     return on_bpreshuffle_gfx95 and m >= 2
+
+
+# --- imported with the qwen4 subsystem ---
+def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
+    # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
+    # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
+    # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
+    # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
+    # 14us against 90us for the cktile instance that does accept it.
+    return _use_aiter and output_size % 64 == 0
+
+
+# --- imported with the qwen4 subsystem ---
+def requant_block_scale_ue8m0_for_deepgemm(
+    weight: torch.nn.Parameter,
+    weight_scale: torch.nn.Parameter,
+    weight_block_size: Optional[List[int]],
+    use_deepgemm_runner: bool,
+    output_dtype: Optional[torch.dtype] = None,
+    weight_shape=None,
+) -> bool:
+    """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
+
+    No-op (returns False) unless the caller selected the DeepGEMM runner, the
+    block size is 128x128 (the only layout the requant kernel supports), the
+    scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
+    aligned shape). Returns True when it requantizes.
+    """
+    from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+
+    if (
+        not use_deepgemm_runner
+        or weight_block_size != [128, 128]
+        or getattr(weight_scale, "format_ue8m0", False)
+        or not should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=weight_block_size,
+            output_dtype=output_dtype,
+            weight_shape=weight_shape,
+        )
+    ):
+        return False
+
+    requant_weight_ue8m0_inplace(weight, weight_scale, weight_block_size)
+    weight_scale.format_ue8m0 = True
+    return True

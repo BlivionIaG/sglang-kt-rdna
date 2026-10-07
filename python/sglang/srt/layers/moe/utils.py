@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
 
@@ -77,18 +78,98 @@ class MoeA2ABackend(Enum):
         return self == MoeA2ABackend.MORI
 
 
-class MoeRunnerBackend(Enum):
+class _MoeRunnerBackendPredicates:
+    value: str
 
+    def is_auto(self):
+        return self.value == MoeRunnerBackend.AUTO.value
+
+    def is_hpc_ops(self):
+        return self.value == MoeRunnerBackend.HPC_OPS.value
+
+    def is_deep_gemm(self):
+        return self.value == MoeRunnerBackend.DEEP_GEMM.value
+
+    def is_triton(self):
+        return self.value == MoeRunnerBackend.TRITON.value
+
+    def is_ascend(self):
+        return self.value == MoeRunnerBackend.ASCEND.value
+
+    def is_triton_kernels(self):
+        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
+
+    def is_flashinfer_trtllm(self):
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
+        return self.value in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM.value,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM.value,
+        )
+
+    def is_experimental_sgl_trtllm(self):
+        return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM.value
+
+    def is_flashinfer_trtllm_routed(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED.value
+
+    def is_flashinfer_cutlass(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTLASS.value
+
+    def is_flashinfer_cutedsl(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
+
+    def is_flashinfer_megamoe(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_MEGAMOE.value
+
+    def is_flashinfer_mxfp4(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_MXFP4.value
+
+    def is_cutlass(self):
+        return self.value == MoeRunnerBackend.CUTLASS.value
+
+    def is_marlin(self):
+        # experimental_sgl_marlin shares the marlin weight repack, quant-method
+        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
+        # check is_experimental_sgl_marlin() first.
+        return self.value in (
+            MoeRunnerBackend.MARLIN.value,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value,
+        )
+
+    def is_experimental_sgl_marlin(self):
+        return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value
+
+    def is_humming(self):
+        return self.value == MoeRunnerBackend.HUMMING.value
+
+    def is_aiter(self):
+        return self.value == MoeRunnerBackend.AITER.value
+
+    def is_intel_xpu(self):
+        return self.value == MoeRunnerBackend.INTEL_XPU.value
+
+
+class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
+    ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
+    FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    HUMMING = "humming"
+    EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
+    AITER = "aiter"
+    HPC_OPS = "hpc_ops"
+    INTEL_XPU = "intel_xpu"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -119,6 +200,55 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+
+
+# Added with the qwen4 subsystem (sgl-project/sglang): the union alias the
+# newer MoE code annotates `get_moe_runner_backend()` with.
+
+
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -------------
+@dataclass(frozen=True)
+class RegisteredMoeRunnerBackend(_MoeRunnerBackendPredicates):
+    """Identifier for an MoE runner backend supplied by an extension."""
+
+    value: str
+
+
+MoeRunnerBackendLike = MoeRunnerBackend | RegisteredMoeRunnerBackend
+_REGISTERED_MOE_RUNNER_BACKEND_NAMES: set[str] = set()
+
+
+def register_moe_runner_backend_name(name: str) -> None:
+    """Register a backend name supplied by an out-of-tree extension."""
+
+    if not name:
+        raise ValueError("MoE runner backend name must not be empty")
+    try:
+        MoeRunnerBackend(name)
+    except ValueError:
+        _REGISTERED_MOE_RUNNER_BACKEND_NAMES.add(name)
+    else:
+        raise ValueError(f"MoE runner backend {name!r} is already built in")
+
+
+def resolve_moe_runner_backend(
+    backend: str | MoeRunnerBackendLike,
+) -> MoeRunnerBackendLike:
+    """Resolve a built-in or registered backend identifier."""
+
+    if isinstance(backend, (MoeRunnerBackend, RegisteredMoeRunnerBackend)):
+        return backend
+    try:
+        return MoeRunnerBackend(backend)
+    except ValueError:
+        if backend in _REGISTERED_MOE_RUNNER_BACKEND_NAMES:
+            return RegisteredMoeRunnerBackend(backend)
+        raise ValueError(
+            f"MoE runner backend {backend!r} is neither built in nor registered"
+        ) from None
 
 
 class DeepEPMode(Enum):
@@ -627,3 +757,63 @@ def adds_replicated_output_to_partial() -> bool:
         is_tp_path=True
     )
     return not owes_sum or parallel.tp_rank == 0
+
+
+# --- imported with the qwen4 subsystem ---
+def xpu_moe_ld_padding_elems(k_dim: int, itemsize: int) -> int:
+    """Extra elements to add to an XPU MoE weight's row stride (leading dim).
+
+    The Xe20 grouped GEMM walks B row-by-row over the K dim, so the row stride
+    in bytes decides which L3 set each row lands in. The L3 set index is
+    derived by XOR-folding address bits; when the row byte size is a multiple
+    of 2048 with an odd cofactor >= 3 (K = 3072, 7168, ... in bf16) successive
+    rows collapse onto a small number of sets and thrash. Padding the stride
+    (without changing the logical shape) breaks the aliasing.
+
+    Returns 0 when the shape is already well distributed, so callers can use
+    this to decide whether to allocate a padded buffer at all.
+    """
+    row_bytes = k_dim * itemsize
+    if row_bytes <= 0 or XPU_MOE_LD_PADDING_BYTES % itemsize != 0:
+        return 0
+    trailing_zeros = (row_bytes & -row_bytes).bit_length() - 1
+    odd_cofactor = row_bytes >> trailing_zeros
+    if trailing_zeros >= 11 and odd_cofactor >= 3:
+        return XPU_MOE_LD_PADDING_BYTES // itemsize
+    return 0
+
+
+# Unit of padding - context dependent
+
+
+# --- imported with the qwen4 subsystem ---
+def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+    """
+    Calculate dimensions for MoE weight tensors.
+
+    Args:
+        inter_dim: Base intermediate dimension.
+        is_concat: If True, fusions W1 (gate) and W3 (up) projections.
+        is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
+        is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
+    """
+    # w2_down_dim is the packing rank, but w13_up_dim not (of matrix to matmul)
+    w13_up_dim = 2 * inter_dim if is_concat else inter_dim
+    w2_down_dim = inter_dim // 2 if is_packed else inter_dim
+
+    if is_aiter_moe:
+        padding_size = get_moe_padding_size(True)
+        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+        is_padded = (w2_down_dim % padding_size) > 0
+        if is_padded:
+            # w2_down_dim, padding & aligned, unit: parameter dtype
+            w2_down_dim = align_aiter(w2_down_dim)
+        # up proj + gate fusion : 2x
+        if is_concat:
+            w13_up_dim = w2_down_dim * 2
+        # packed
+        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            # w13_up_dim (row rank of matmul matrix) is not packing dim, *2 to recover
+            w13_up_dim *= 2
+
+    return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)

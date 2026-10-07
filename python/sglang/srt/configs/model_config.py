@@ -1599,3 +1599,36 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+# --- imported with the qwen4 subsystem ---
+def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
+    """MTP seeds include index_topk pooled tokens plus up to index_kpool - 1 tail tokens."""
+    index_kpool = get_dsa_index_kpool(config)
+    assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
+    return config.index_topk + index_kpool - 1
+
+
+# --- imported with the qwen4 subsystem ---
+def is_deepseek_dsa(config) -> bool:
+    return (
+        _hf_arch(config)
+        in (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
+            "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGenerationNextN",
+            "Glm5NextForConditionalGeneration",
+            "LongcatFlashForCausalLM",
+            "LongcatFlashForCausalLMNextN",
+            "Dots3NoteForCausalLM",
+            "Dots3NoteForCausalLMNextN",
+            "HYV4ForCausalLM",
+            "HYV4ForCausalLMNextN",
+        )
+        and _hf_attr(config, "index_topk") is not None
+    )
