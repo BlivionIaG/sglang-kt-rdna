@@ -2563,3 +2563,1216 @@ class KVWriteLoc:
     def as_loc(self) -> torch.Tensor:
         """This fork's ``set_kv_buffer`` takes the loc tensor directly."""
         return self.loc
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang), which renamed
+# NSATokenToKVPool to DSATokenToKVPool. Both names are bound.
+class DSATokenToKVPool(MLATokenToKVPool):
+    quant_block_size = 128
+    index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        kv_cache_dim: int,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
+    ):
+        override_dim = (
+            kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
+        )
+
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+            use_dsa=True,
+            override_kv_cache_dim=override_dim,
+        )
+        # self.index_k_dtype = torch.float8_e4m3fn
+        # self.index_k_scale_dtype = torch.float32
+        self.index_head_dim = index_head_dim
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress
+        self.tail_extra_slots = tail_extra_slots
+        assert self.page_size % index_kpool == 0, (
+            f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
+        )
+        self.index_page_size = self.page_size // index_kpool
+        if index_buf_size is None:
+            index_buf_size = size
+        self.index_buf_size = index_buf_size
+        # num head == 1 and head dim == 128 for index_k in DSA
+        assert index_head_dim == 128
+
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [False] * layer_num
+        )
+        assert len(self.skip_topk_layers) == layer_num
+
+        physical_page_size = self.page_size // index_kpool
+        if _is_hip:
+            if aiter_can_use_preshuffle_paged_mqa():
+                assert physical_page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {physical_page_size}"
+                )
+            else:
+                assert physical_page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {physical_page_size}"
+                )
+        elif is_xpu():
+            assert physical_page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {physical_page_size}"
+        else:
+            assert physical_page_size == 64, (
+                f"DSA requires 64-token physical pages, got page_size={self.page_size} "
+                f"with index_kpool={index_kpool}"
+            )
+        self.index_key_cache = self._create_index_key_cache()
+        self._init_kpool_compress_tail_buffers(
+            index_kpool=index_kpool,
+            index_kpool_compress=index_kpool_compress,
+            tail_extra_slots=tail_extra_slots,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+            max_running_requests=max_running_requests,
+        )
+        self._finalize_allocation_log(size)
+
+    def _create_index_key_cache(self) -> IndexKeyCache:
+        return IndexKeyCache(self, self.index_buf_size)
+
+    def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
+        return not self.skip_topk_layers[local_layer_idx]
+
+    def host_pool_decls(self):
+        # pool_host imports this module. Resolve the mirror side lazily.
+        from sglang.srt.mem_cache.pool_host.dsa import make_dsa_indexer_pool_decl
+
+        kv_decls = super().host_pool_decls()
+        # Shared-topk layers own a 0-row placeholder, so a non-empty buffer list
+        # is not enough: some layer must actually hold index keys.
+        if not self.index_k_with_scale_buffer or all(self.skip_topk_layers):
+            return kv_decls
+        return (*kv_decls, make_dsa_indexer_pool_decl(self))
+
+    @property
+    def index_k_with_scale_buffer(self):
+        # Preserve direct HiCache access while storage lives behind the facade.
+        return self.index_key_cache.buffer
+
+    def _init_kpool_compress_tail_buffers(
+        self,
+        index_kpool: int,
+        index_kpool_compress: bool,
+        tail_extra_slots: int,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+        max_running_requests: Optional[int],
+    ) -> None:
+        """Keep request tails on the pool so they follow the index-cache lifecycle."""
+        self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
+
+        if not self.kpool_use_compress:
+            self._compress_tail_k = None
+            self._compress_tail_score = None
+            return
+
+        assert max_running_requests is not None, (
+            "DSATokenToKVPool with kpool compress requires max_running_requests"
+        )
+        # +1 mirrors req_to_token_pool.size + 1 used by the indexer to
+        # provide an extra slot for invalid / sentinel req indices.
+        req_pool_size = max_running_requests + 1
+        tail_dtype = torch.bfloat16
+        tail_width = index_kpool + tail_extra_slots
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self._compress_tail_k: Optional[List[torch.Tensor]] = [
+                torch.zeros(
+                    req_pool_size if self._should_allocate_index_layer(i) else 0,
+                    tail_width,
+                    index_head_dim,
+                    dtype=tail_dtype,
+                    device=device,
+                )
+                for i in range(layer_num)
+            ]
+            self._compress_tail_score: Optional[List[torch.Tensor]] = [
+                torch.zeros(
+                    req_pool_size if self._should_allocate_index_layer(i) else 0,
+                    tail_width,
+                    index_head_dim,
+                    dtype=tail_dtype,
+                    device=device,
+                )
+                for i in range(layer_num)
+            ]
+
+    def get_compress_tail_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.kpool_use_compress, (
+            "get_compress_tail_buffers called when kpool compress is disabled"
+        )
+        idx = layer_id - self.start_layer
+        return (
+            self._compress_tail_k[idx],
+            self._compress_tail_score[idx],
+        )
+
+    def get_compress_tail_buf_infos(self):
+        if not self.kpool_use_compress:
+            return [], [], []
+        transfer_layer_ids = list(range(self.layer_num))
+        # Keep zero-row indexShare entries in the pointer list so layer offsets
+        # stay aligned across PD peers; item_len=0 makes transfer backends skip them.
+        tail_buffers = [self._compress_tail_k[i] for i in transfer_layer_ids] + [
+            self._compress_tail_score[i] for i in transfer_layer_ids
+        ]
+        data_ptrs = [buf.data_ptr() for buf in tail_buffers]
+        data_lens = [buf.nbytes for buf in tail_buffers]
+        item_lens = [buf[0].nbytes if buf.shape[0] > 0 else 0 for buf in tail_buffers]
+        return data_ptrs, data_lens, item_lens
+
+    def kpool_decode_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        round_scale: bool = False,
+    ) -> None:
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            kpool_decode_update_and_maybe_write_cache,
+        )
+
+        assert self.kpool_use_compress, (
+            "kpool_decode_update_index_cache called when kpool compress is disabled"
+        )
+        idx = layer_id - self.start_layer
+        buf = self.get_index_k_with_scale_buffer(layer_id)
+        kpool_decode_update_and_maybe_write_cache(
+            pool=self,
+            buf=buf,
+            tail_k=self._compress_tail_k[idx],
+            tail_score=self._compress_tail_score[idx],
+            key=key,
+            slot_score=slot_score,
+            ape=ape,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            round_scale=round_scale,
+        )
+
+    def set_compress_tail_for_request(
+        self,
+        layer_id: int,
+        req_pool_idx: torch.Tensor,
+        key_tail: torch.Tensor,
+        score_tail: torch.Tensor,
+        n_remain: int,
+        dst_logical_start: int,
+    ) -> None:
+        """Leave the ring untouched at a pool boundary; no tail carries over."""
+        assert self.kpool_use_compress, (
+            "set_compress_tail_for_request called when kpool compress is disabled"
+        )
+        idx = layer_id - self.start_layer
+        if n_remain > 0:
+            slots = (
+                torch.arange(n_remain, device=key_tail.device, dtype=torch.long)
+                + int(dst_logical_start)
+            ) % self._compress_tail_k[idx].shape[1]
+            self._compress_tail_k[idx][req_pool_idx, slots] = key_tail
+            self._compress_tail_score[idx][req_pool_idx, slots] = score_tail
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        self.index_key_cache.clear()
+        if hasattr(self, "_compress_tail_k") and self._compress_tail_k is not None:
+            del self._compress_tail_k
+            del self._compress_tail_score
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
+        super().move_kv_cache(tgt_loc, src_loc)
+        self.index_key_cache.move(tgt_loc, src_loc)
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_key_cache.get_local_buffer(layer_id)
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        return self.index_key_cache.get_k_and_scale(
+            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
+
+    def _get_compress_tail_cpu_copy(self, req_pool_index):
+        if not self.kpool_use_compress or req_pool_index is None:
+            return None
+
+        tail_k_cpu = []
+        tail_score_cpu = []
+        for tail_k, tail_score in zip(self._compress_tail_k, self._compress_tail_score):
+            if tail_k.shape[0] == 0:
+                tail_k_cpu.append(None)
+                tail_score_cpu.append(None)
+                continue
+            tail_k_cpu.append(tail_k[req_pool_index].to("cpu", non_blocking=True))
+            tail_score_cpu.append(
+                tail_score[req_pool_index].to("cpu", non_blocking=True)
+            )
+        return tail_k_cpu, tail_score_cpu
+
+    def _load_compress_tail_cpu_copy(self, tail_k_cpu, tail_score_cpu, req_pool_index):
+        if (
+            not self.kpool_use_compress
+            or req_pool_index is None
+            or tail_k_cpu is None
+            or tail_score_cpu is None
+        ):
+            return
+
+        for tail_k, tail_score, saved_k, saved_score in zip(
+            self._compress_tail_k,
+            self._compress_tail_score,
+            tail_k_cpu,
+            tail_score_cpu,
+        ):
+            if tail_k.shape[0] == 0 or saved_k is None or saved_score is None:
+                continue
+            tail_k[req_pool_index] = saved_k.to(tail_k.device, non_blocking=True)
+            tail_score[req_pool_index] = saved_score.to(
+                tail_score.device, non_blocking=True
+            )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        # Retraction reuses index-cache pages; offload index/scale with KV so resume cannot read another request's entries.
+        kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
+        cpu_copy = {
+            "kv": kv_cache_cpu,
+            "index_k": self.index_key_cache.cpu_copy(indices),
+        }
+        compress_tail = self._get_compress_tail_cpu_copy(req_pool_index)
+        if compress_tail is not None:
+            cpu_copy["tail_k"], cpu_copy["tail_score"] = compress_tail
+        torch.cuda.synchronize()
+        return cpu_copy
+
+    def load_cpu_copy(
+        self,
+        kv_cache_cpu_dict,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+    ):
+        super().load_cpu_copy(
+            kv_cache_cpu_dict["kv"],
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
+        self._load_compress_tail_cpu_copy(
+            kv_cache_cpu_dict.get("tail_k"),
+            kv_cache_cpu_dict.get("tail_score"),
+            req_pool_index,
+        )
+        torch.cuda.synchronize()
+
+    def get_state_buf_infos(self):
+        return self.index_key_cache.state_buf_infos()
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = super().get_kv_size_bytes()
+        for index_k_cache in self.index_k_with_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return kv_size_bytes
+
+
+# This fork's name for the same pool; kept so existing references work.
+NSATokenToKVPool = DSATokenToKVPool
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def conv_window_dedup_enabled(
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
+) -> bool:
+    """Whether the deduplicated sliding-window conv-intermediate layout is safe.
+
+    It is safe for CUDA linear draft chains whose kernels consume the window raw.
+    Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
+    windows, platform kernels expect contiguous steps, and KDA transposes the window
+    before conv so the overlapping ``as_strided`` layout would corrupt stores.
+    """
+    return (
+        not is_npu
+        and not is_cpu
+        and not is_kda
+        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+    )
+
+
+def _set_kv_buffer_prefix_valid_impl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    store_dtype: torch.dtype,
+) -> None:
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    row_bytes = row_dim * store_dtype.itemsize
+    if row_bytes <= 0:
+        return
+
+    if row_bytes >= 8192:
+        bytes_per_tile = 512
+        num_warps = 8
+    elif row_bytes >= 4096:
+        bytes_per_tile = 256
+        num_warps = 4
+    else:
+        bytes_per_tile = 128
+        num_warps = 4
+
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_bytes, bytes_per_tile),
+    )
+
+    set_kv_buffer_prefix_valid_tiled[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        int(k.stride(0) * k.element_size()),
+        int(v.stride(0) * v.element_size()),
+        int(k_cache.stride(0) * k_cache.element_size()),
+        int(v_cache.stride(0) * v_cache.element_size()),
+        int(loc_2d.shape[1]),
+        ROW_BYTES=row_bytes,
+        BYTES_PER_TILE=bytes_per_tile,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
+def _set_kv_buffer_prefix_valid_impl_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    k_scale_is_tensor: bool = False,
+    v_scale_is_tensor: bool = False,
+) -> None:
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    if row_dim <= 0:
+        return
+
+    if row_dim >= 4096:
+        elems_per_tile = 256
+        num_warps = 8
+    elif row_dim >= 2048:
+        elems_per_tile = 128
+        num_warps = 4
+    else:
+        elems_per_tile = 64
+        num_warps = 4
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_dim, elems_per_tile),
+    )
+    set_kv_buffer_prefix_valid_tiled_fp8[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        k_scale,
+        v_scale,
+        int(k.stride(0)),
+        int(v.stride(0)),
+        int(k_cache.stride(0)),
+        int(v_cache.stride(0)),
+        int(loc_2d.shape[1]),
+        ROW_ELEMS=row_dim,
+        ELEMS_PER_TILE=elems_per_tile,
+        K_SCALE_IS_TENSOR=k_scale_is_tensor,
+        V_SCALE_IS_TENSOR=v_scale_is_tensor,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
+def _resolve_fused_scale(
+    scale,
+    layer_scale,
+    layer_scale_float,
+) -> Optional[float]:
+    if isinstance(scale, (float, int)):
+        return float(scale)
+
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.ndim == 0
+        and scale.device.type == "cpu"
+    ):
+        return float(scale.item())
+
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.ndim == 0
+        and scale.is_cuda
+        and scale is layer_scale
+        and isinstance(layer_scale_float, (float, int))
+    ):
+        return float(layer_scale_float)
+
+    return None
+
+
+def unwrap_write_loc(loc_info):
+    """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
+    if isinstance(loc_info, KVWriteLoc):
+        return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+    return loc_info, None, None
+
+
+def write_loc_is_physical(loc_info) -> bool:
+    """Whether ``loc_info`` is a ``KVWriteLoc`` marked physical; a bare loc is not."""
+    return isinstance(loc_info, KVWriteLoc) and loc_info.physical
+
+
+class KvBufferDesc:
+    """Byte-span math for one KV buffer laid out as rows of ``row_bytes`` holding
+    ``tokens_per_row`` tokens each (a row = one token slot, or one whole page)."""
+
+    __slots__ = ("name", "shape", "row_bytes", "tokens_per_row")
+
+    def __init__(self, name: str, shape: tuple, *, row_bytes: int, tokens_per_row: int):
+        self.name = name
+        self.shape = tuple(shape)
+        self.row_bytes = int(row_bytes)
+        self.tokens_per_row = int(tokens_per_row)
+
+    def _rows(self, num_tokens: int) -> int:
+        n = max(int(num_tokens), 0)
+        return (n + self.tokens_per_row - 1) // self.tokens_per_row
+
+    def reserved_span_bytes(self, itemsize: int) -> int:
+        """Full upper-bound byte size of the buffer (its whole tensor)."""
+        return math.prod(self.shape) * itemsize
+
+    def prefix_span_bytes(self, num_tokens: int, page_size: int) -> int:
+        """Bytes to back to make the first ``num_tokens`` tokens usable."""
+        return self._rows(num_tokens) * self.row_bytes
+
+    def final_span_bytes(self, num_tokens: int, page_size: int) -> int:
+        """Bytes of the final advertised span (adds the padded page). CEIL, not floor:
+        an unaligned count must still cover its partial last page (e.g. n=17, page=16
+        -> 3 pages, not 2)."""
+        return self._rows(max(int(num_tokens), 0) + page_size) * self.row_bytes
+
+    def item_len_bytes(self, page_size: int) -> int:
+        """Per-page transfer chunk (one page's worth of this buffer)."""
+        return (page_size // self.tokens_per_row) * self.row_bytes
+
+
+class NoOpMHATokenToKVPool(MHATokenToKVPool):
+    """KV cache pool that skips physical K/V buffer allocation.
+
+    Used in embedding-mode prefill-only workloads with the FA
+    fa_skip_kv_cache path, where no layer reads or writes KV cache because
+    attention uses raw K/V via flash_attn_varlen_func. Other prefill-only paths
+    such as scoring/MIS may benefit from the same idea later, but some still
+    stage K/V through paged cache today.
+
+    This class keeps the scheduler's view of pool capacity (self.size is
+    honored for admission) but allocates only (page_size, head_num, head_dim)
+    placeholder tensors per layer to satisfy any code paths that dereference
+    the buffers.
+
+    Callers MUST ensure no real set_kv_buffer/get_*_buffer calls happen against
+    this pool; those paths raise loudly so misuse is visible.
+    """
+
+    def _create_buffers(self):
+        # No-op pool keeps tiny NHD placeholders regardless of SGLANG_USE_HND_KVCACHE
+        # (no real KV is stored), so force NHD here to keep the store/move fast paths.
+        self.use_hnd = False
+        self.kv_cache_layout = "nhd"
+        # Allocate minimal placeholder buffers. They exist purely so that code
+        # paths holding `k_buffer` / `v_buffer` references (pointer tables,
+        # layer-transfer counters, stride arithmetic) keep working without
+        # None-guards scattered across the codebase. Shape is
+        # [page_size, head_num, head_dim] per layer so that the unconditional
+        # `key_cache.view(-1, page_size, head_num, head_dim)` in the FA backend
+        # at the top of forward_extend succeeds regardless of --page-size.
+        # Total footprint is still on the order of KB vs GBs for a real pool.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = [
+                torch.zeros(
+                    (self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (self.page_size, self.head_num, self.v_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [x.stride(0) * x.dtype.itemsize for x in self.k_buffer + self.v_buffer],
+            device=self.device,
+        )
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        self.mem_usage = 0.0
+        placeholder_bytes = (
+            2
+            * self.layer_num
+            * self.page_size
+            * self.head_num
+            * max(self.head_dim, self.v_head_dim)
+            * self.store_dtype.itemsize
+        )
+        logger.info(
+            f"KV Cache skipped (no-op pool). Logical #tokens: {num_tokens}, "
+            f"physical K/V size: ~{placeholder_bytes / 1024:.1f} KB placeholder"
+        )
+
+    def get_kv_size_bytes(self):
+        # Report zero so downstream memory accounting matches reality.
+        return (0, 0)
+
+    def set_kv_buffer(self, *args, **kwargs):
+        raise RuntimeError(
+            "NoOpMHATokenToKVPool.set_kv_buffer was called. This pool is only "
+            "valid in prefill-only modes (e.g. --is-embedding, scoring) with "
+            "the FA backend's fa_skip_kv_cache path active; the attention "
+            "backend must never write to it. Check that the workload truly "
+            "performs no decode and that the FA backend's fa_skip_kv_cache "
+            "preconditions are met."
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        # Return the placeholder. The FA backend reads this before taking the
+        # fa_skip_kv_cache branch (which does not use it); the placeholder shape
+        # is (page_size, head_num, head_dim) so downstream .view() calls succeed.
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # no-op; embedding mode has no KV cache to move
+        return
+
+
+class PageMajorMHATokenToKVPool(MHATokenToKVPool):
+    """MHA pool with the page-major page-granularity envelope layout.
+
+    NON-CONSTRUCTIBLE: the strided 4-D view builder and its write kernel are
+    gone, and ServerArgs rejects the static page-major arm at boot. The class
+    stays as the seat for the per-layer-view reimplementation.
+    """
+
+    def __init__(
+        self,
+        *args,
+        kv_cache_layout: Optional[str] = None,
+        enable_kv_cache_copy: bool = False,
+        **kwargs,
+    ):
+        assert kv_cache_layout in (
+            None,
+            "page_major_layer_major",
+        ), f"PageMajorMHATokenToKVPool fixes its layout; got {kv_cache_layout!r}"
+        # The tiled copy kernel assumes stride == row bytes, which the strided 4-D
+        # views violate, so the copy path is never available here regardless of
+        # what the caller requested (the spec-decode call sites pass
+        # enable_kv_cache_copy=True). Always fall back to the native move.
+        super().__init__(
+            *args,
+            kv_cache_layout="page_major_layer_major",
+            enable_kv_cache_copy=False,
+            **kwargs,
+        )
+
+    def _create_buffers(self):
+        raise NotImplementedError(
+            "PageMajorMHATokenToKVPool: the strided 4-D envelope views were "
+            "removed; the static-pool page-major layout is temporarily "
+            "unsupported (ServerArgs rejects it at startup). "
+            "--enable-unified-memory provides the page-major layout with "
+            "per-layer views."
+        )
+
+    # The methods below assume the per-layer contiguous 3-D layout. The 4-D
+    # strided envelope views have no per-layer contiguous region (their bytes are
+    # interleaved layer-major within each page) and index page-major, not
+    # token-major. Inheriting them would silently mis-index; fail loudly instead.
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "page-major layout has no per-layer contiguous regions; KV transfer / "
+            "disaggregation is unsupported (TODO: expose the single _raw buffer "
+            "with a page-aware transfer scheme)."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the page-major layout "
+            "(TODO: split token ids into page/slot for the 4-D index)."
+        )
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        raise NotImplementedError(
+            "CPU offloading is unsupported under the page-major layout "
+            "(TODO: split token ids into page/slot for the 4-D index)."
+        )
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported under the page-major layout "
+            "(_set_kv_buffer_prefix_valid_impl assumes 3-D contiguous + row_dim)."
+        )
+
+
+class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
+    """MHA KV cache pool for MXFP8 block-scaled FP8.
+
+    K/V data is stored as FP8 E4M3. Per-32-element UE8M0 scale factors are
+    stored beside it and passed to the FA4 MXFP8 kernel.
+    """
+
+    MXFP8_SCALE_BLOCK_SIZE = 32
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = self.head_num
+                k = self.head_dim
+                v = self.v_head_dim
+
+                if k % self.MXFP8_SCALE_BLOCK_SIZE != 0:
+                    raise ValueError(
+                        f"MXFP8 KV cache requires head_dim divisible by "
+                        f"{self.MXFP8_SCALE_BLOCK_SIZE}, got {k}."
+                    )
+                if v % self.MXFP8_SCALE_BLOCK_SIZE != 0:
+                    raise ValueError(
+                        f"MXFP8 KV cache requires v_head_dim divisible by "
+                        f"{self.MXFP8_SCALE_BLOCK_SIZE}, got {v}."
+                    )
+                if not hasattr(torch, "float8_e8m0fnu"):
+                    raise RuntimeError(
+                        "MXFP8 KV cache requires torch.float8_e8m0fnu support."
+                    )
+                if self.use_hnd:
+                    # Buffers are NHD; the inherited HND move_kv_cache branch
+                    # would silently relocate wrong bytes.
+                    raise ValueError(
+                        "MXFP8 KV cache does not support SGLANG_USE_HND_KVCACHE."
+                    )
+
+                self.store_dtype = torch.float8_e4m3fn
+                self.k_buffer = [
+                    torch.zeros((m, n, k), dtype=self.store_dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros((m, n, v), dtype=self.store_dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+                # UE8M0 scales, one per 32-element block. For the production
+                # page_size==128 path they are stored interleaved in the FA4
+                # BlockScaledBasicChunk atom layout
+                # (num_pages, head, 32, page_size//32, sf_dim) and written by
+                # the store_sf_interleaved kernel; otherwise flat per slot. Must
+                # be zero-initialized (garbage 0xFF is e8m0 NaN).
+                k_sf_dim = k // self.MXFP8_SCALE_BLOCK_SIZE
+                v_sf_dim = v // self.MXFP8_SCALE_BLOCK_SIZE
+                self.mxfp8_sf_interleaved = self.page_size == 128
+                if self.mxfp8_sf_interleaved:
+                    assert m % self.page_size == 0
+                    num_pages = m // self.page_size
+                    chunk = self.page_size // self.MXFP8_SCALE_BLOCK_SIZE
+                    k_sf_shape = (
+                        num_pages,
+                        n,
+                        self.MXFP8_SCALE_BLOCK_SIZE,
+                        chunk,
+                        k_sf_dim,
+                    )
+                    v_sf_shape = (
+                        num_pages,
+                        n,
+                        self.MXFP8_SCALE_BLOCK_SIZE,
+                        chunk,
+                        v_sf_dim,
+                    )
+                else:
+                    k_sf_shape = (m, n, k_sf_dim)
+                    v_sf_shape = (m, n, v_sf_dim)
+                self.k_scale_buffer = [
+                    torch.zeros(
+                        k_sf_shape, dtype=torch.float8_e8m0fnu, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros(
+                        v_sf_shape, dtype=torch.float8_e8m0fnu, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [x.stride(0) * x.dtype.itemsize for x in self.k_buffer + self.v_buffer],
+            device=self.device,
+        )
+        # This override replaces the base allocation, so the PD-transfer
+        # descriptors for the packed data buffers are built here too.
+        self._kv_buffer_descs = self._build_kv_buffer_descs()
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    def _get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def _get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        idx = layer_id - self.start_layer
+        return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+    ):
+        if dcp_kv_mask is not None:
+            raise NotImplementedError("MXFP8 KV cache does not support DCP KV masks.")
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-MXFP8)"
+        )
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        idx = layer_id - self.start_layer
+
+        if k_scale is None or v_scale is None:
+            # Fused path (SGLANG_OPT_INKLING_MXFP8_FUSED_QUANT_STORE): the layer
+            # hands us bf16 K/V and one kernel quantizes + scatters the fp8
+            # payload and the interleaved UE8M0 scales.
+            if not self.mxfp8_sf_interleaved or cache_k.dtype == self.store_dtype:
+                raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
+            from sglang.kernels.ops.quantization.mxfp8_quant import quant_store_kv_mxfp8
+
+            quant_store_kv_mxfp8(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[idx],
+                self.v_buffer[idx],
+                self.k_scale_buffer[idx],
+                self.v_scale_buffer[idx],
+                page_size=self.page_size,
+            )
+            return
+
+        # store_cache and store_sf_interleaved skip the reserved CUDA-graph
+        # padding slot 0 in-kernel, matching the bf16 pool.
+        row_bytes = self.head_num * self.head_dim * self.store_dtype.itemsize
+        v_row_bytes = self.head_num * self.v_head_dim * self.store_dtype.itemsize
+        assert _is_cuda and can_use_store_cache(row_bytes, v_row_bytes), (
+            f"MXFP8 KV cache requires CUDA and store_cache-compatible rows, "
+            f"got _is_cuda={_is_cuda}, {row_bytes=}, {v_row_bytes=}"
+        )
+        assert self.mxfp8_sf_interleaved, (
+            "MXFP8 KV cache requires the page_size=128 interleaved scale layout"
+        )
+        store_cache(
+            cache_k.reshape(loc.shape[0], -1),
+            cache_v.reshape(loc.shape[0], -1),
+            self.k_buffer[idx].view(-1, row_bytes // self.store_dtype.itemsize),
+            self.v_buffer[idx].view(-1, v_row_bytes // self.store_dtype.itemsize),
+            loc,
+            row_bytes=row_bytes,
+            v_row_bytes=v_row_bytes,
+            size_limit=self.size + self.page_size,
+        )
+        self._write_scales(idx, loc, k_scale, v_scale)
+
+    def _write_scales(self, idx, loc, k_scale, v_scale):
+        """Write per-token UE8M0 K/V scales — interleaved into the FA4
+        BlockScaledBasicChunk layout for page_size==128, flat otherwise."""
+        if self.mxfp8_sf_interleaved:
+            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
+                store_sf_interleaved,
+            )
+
+            store_sf_interleaved(
+                k_scale, self.k_scale_buffer[idx], loc, page_size=self.page_size
+            )
+            store_sf_interleaved(
+                v_scale, self.v_scale_buffer[idx], loc, page_size=self.page_size
+            )
+        else:
+            self.k_scale_buffer[idx][loc] = k_scale
+            self.v_scale_buffer[idx][loc] = v_scale
+
+    def _read_sf_interleaved(self, sf_buf: torch.Tensor, loc: torch.Tensor):
+        """Inverse of store_sf_interleaved: gather per-slot (T, head, sf_dim)
+        UE8M0 scales out of the interleaved BlockScaledBasicChunk buffer."""
+        num_pages, n = sf_buf.shape[0], sf_buf.shape[1]
+        sf_dim = sf_buf.shape[-1]
+        # (num_pages, n, page_size) as u32: 4 packed scales per u32.
+        buf_u32 = sf_buf.reshape(num_pages, n, -1).view(torch.int32)
+        off = loc % self.page_size
+        page = (loc // self.page_size).long()
+        chunk = self.page_size // self.MXFP8_SCALE_BLOCK_SIZE
+        ipos = (
+            (off % self.MXFP8_SCALE_BLOCK_SIZE) * chunk
+            + (off // self.MXFP8_SCALE_BLOCK_SIZE)
+        ).long()
+        heads = torch.arange(n, device=loc.device)
+        gathered = buf_u32[page[:, None], heads[None, :], ipos[:, None]]  # (T, n) int32
+        return (
+            gathered.reshape(loc.shape[0], n, 1)
+            .view(torch.uint8)
+            .reshape(loc.shape[0], n, sf_dim)
+            .view(torch.float8_e8m0fnu)
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # The mamba extra_buffer allocator relocates KV rows during serving;
+        # scale rows must travel with their fp8 payload or dequant reads
+        # mismatched exponents.
+        if self.mxfp8_sf_interleaved:
+            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
+                store_sf_interleaved,
+            )
+
+            for idx in range(self.layer_num):
+                self.k_buffer[idx][tgt_loc] = self.k_buffer[idx][src_loc]
+                self.v_buffer[idx][tgt_loc] = self.v_buffer[idx][src_loc]
+                k_sf = self._read_sf_interleaved(self.k_scale_buffer[idx], src_loc)
+                v_sf = self._read_sf_interleaved(self.v_scale_buffer[idx], src_loc)
+                store_sf_interleaved(
+                    k_sf, self.k_scale_buffer[idx], tgt_loc, page_size=self.page_size
+                )
+                store_sf_interleaved(
+                    v_sf, self.v_scale_buffer[idx], tgt_loc, page_size=self.page_size
+                )
+        else:
+            super().move_kv_cache(tgt_loc, src_loc)
+            for idx in range(self.layer_num):
+                self.k_scale_buffer[idx][tgt_loc] = self.k_scale_buffer[idx][src_loc]
+                self.v_scale_buffer[idx][tgt_loc] = self.v_scale_buffer[idx][src_loc]
+
+    def _read_scales(self, idx, loc):
+        """Per-token UE8M0 K/V scales at ``loc``, inverse of ``_write_scales``."""
+        if self.mxfp8_sf_interleaved:
+            return (
+                self._read_sf_interleaved(self.k_scale_buffer[idx], loc),
+                self._read_sf_interleaved(self.v_scale_buffer[idx], loc),
+            )
+        return self.k_scale_buffer[idx][loc], self.v_scale_buffer[idx][loc]
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        # The scales travel with their fp8 payload; a restored slot dequantizes
+        # against mismatched exponents without them.
+        assert not self.use_hnd, (
+            "CPU KV offload indexes by slot (NHD); HND KV cache "
+            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_scale, v_scale = self._read_scales(layer_id, chunk_indices)
+                kv_cache_cpu[-1].append(
+                    [
+                        self.k_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        k_scale.to("cpu", non_blocking=True),
+                        v_scale.to("cpu", non_blocking=True),
+                    ]
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        assert not self.use_hnd, (
+            "CPU KV offload indexes by slot (NHD); HND KV cache "
+            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
+        current_platform.synchronize()
+        device = self.k_buffer[0].device
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, v_cpu, k_scale_cpu, v_scale_cpu = kv_cache_cpu[layer_id][
+                    i // chunk_size
+                ]
+                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
+                self.k_buffer[layer_id][chunk_indices] = k_cpu.to(
+                    device, non_blocking=True
+                )
+                self.v_buffer[layer_id][chunk_indices] = v_cpu.to(
+                    device, non_blocking=True
+                )
+                self._write_scales(
+                    layer_id,
+                    chunk_indices,
+                    k_scale_cpu.to(device, non_blocking=True),
+                    v_scale_cpu.to(device, non_blocking=True),
+                )
+        current_platform.synchronize()
+
+    def get_kv_scale_buf_infos(self):
+        """(ptrs, lens, item_lens) for the UE8M0 scale buffers, k then v.
+
+        The interleaved layout puts pages on the leading axis, so a page's
+        scales are one contiguous row; the flat layout is per slot.
+        """
+        tensors = self.k_scale_buffer + self.v_scale_buffer
+        ptrs = [t.data_ptr() for t in tensors]
+        lens = [t.nbytes for t in tensors]
+        row_bytes = [t[0].nbytes for t in tensors]
+        if self.mxfp8_sf_interleaved:
+            item_lens = row_bytes
+        else:
+            item_lens = [rb * self.page_size for rb in row_bytes]
+        return ptrs, lens, item_lens
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported for MXFP8 KV cache "
+            "(it does not carry the scale buffers)."
+        )
+
+    def get_kv_size_bytes(self):
+        k_size_bytes = 0
+        v_size_bytes = 0
+        for k_cache in self.k_buffer:
+            k_size_bytes += get_tensor_size_bytes(k_cache)
+        for k_scale in self.k_scale_buffer:
+            k_size_bytes += get_tensor_size_bytes(k_scale)
+        for v_cache in self.v_buffer:
+            v_size_bytes += get_tensor_size_bytes(v_cache)
+        for v_scale in self.v_scale_buffer:
+            v_size_bytes += get_tensor_size_bytes(v_scale)
+        return k_size_bytes, v_size_bytes
+
+
+@triton.jit
+def masked_set_kv_buffer_kernel(
+    k_ptr,
+    v_ptr,
+    k_buffer_ptr,
+    v_buffer_ptr,
+    loc_ptr,
+    mask_ptr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    CHUNK: tl.constexpr,
+    k_stride_B: tl.constexpr,
+    k_stride_H: tl.constexpr,
+    v_stride_B: tl.constexpr,
+    v_stride_H: tl.constexpr,
+    k_buffer_stride: tl.constexpr,
+    v_buffer_stride: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= N:
+        return
+
+    do_write = tl.load(mask_ptr + pid) != 0
+    if not do_write:
+        return
+
+    loc = tl.load(loc_ptr + pid)
+    total = H * D
+    num_chunks = tl.cdiv(total, CHUNK)
+
+    for c in range(num_chunks):
+        offs = tl.arange(0, CHUNK)
+        idx = c * CHUNK + offs
+        mask = idx < total
+        row = idx // D
+        col = idx % D
+
+        key = tl.load(k_ptr + pid * k_stride_B + row * k_stride_H + col, mask=mask)
+        tl.store(k_buffer_ptr + loc * k_buffer_stride + idx, key, mask=mask)
+
+        value = tl.load(v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask)
+        tl.store(v_buffer_ptr + loc * v_buffer_stride + idx, value, mask=mask)
+
+
+def get_minimax_sparse_index_dtype(
+    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+) -> torch.dtype:
+    """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
+    if fp8_attn_gemm:
+        return kv_cache_dtype
+    if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
+        return torch.float8_e4m3fn
+    return model_dtype
