@@ -6,6 +6,11 @@ from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 from sglang.srt.runtime_context import get_parallel
 
+# Restored for kt_ep_wrapper.py: the fork’s older glm5_next.py defined this and
+# the base-forward replaced the file with upstream’s, which does not. The KT expert
+# wrapper validates the TP size against it.
+GLM5_NEXT_SUPPORTED_TP_SIZES = frozenset((1, 2, 4, 8))
+
 _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "architectures",
     "vocab_size",

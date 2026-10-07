@@ -79,6 +79,8 @@ dependencies = [
   "tqdm",
   "transformers==5.17.0",
   "xgrammar==0.2.7",
+  "sglang-kernel==0.4.9",  # built for torch 2.14; the old
+  # `sgl-kernel==0.3.21` wheel links against torch 2.9 and fails to import
   "uvicorn",
   "uvloop",
 
