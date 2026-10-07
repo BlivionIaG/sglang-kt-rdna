@@ -92,17 +92,25 @@ else
   echo "PLE: pinned backend  (upstream docs say this does NOT boot 126 GiB weights on a 92 GB box)"
 fi
 
+# Radix cache and CUDA graphs are ON by default. They were disabled only during bring-up;
+# the measured cost of --disable-cuda-graph is visible as `cuda graph: False` on every batch
+# in the server log, and --disable-radix-cache throws away prefix reuse on every request.
+# Either can still be turned off for debugging:
+#   DISABLE_RADIX=1 / DISABLE_CUDA_GRAPH=1
 ARGS=(
   --model-path "$MODEL"
   --kt-weight-path "$MODEL"
   "${PLE_OFFLOAD[@]}"
   --quantization modelopt_mixed
   --kt-num-gpu-experts 0 --kt-cpuinfer "$CPUINFER" --kt-threadpool-count 1 --kt-method NVFP4
-  --attention-backend triton --disable-cuda-graph --mem-fraction-static "${MEMFRAC:-0.55}"
+  --attention-backend triton --mem-fraction-static "${MEMFRAC:-0.55}"
   --max-running-requests 2
   --host 127.0.0.1 --port "$PORT"
-  --trust-remote-code --disable-radix-cache
+  --trust-remote-code
 )
+
+[ "${DISABLE_RADIX:-0}" = "1" ] && ARGS+=(--disable-radix-cache)
+[ "${DISABLE_CUDA_GRAPH:-0}" = "1" ] && ARGS+=(--disable-cuda-graph)
 
 if [ "${ISOLATE:-0}" = "1" ]; then
   # Hard memory cap in a transient scope: the cgroup kills the load BEFORE the host
