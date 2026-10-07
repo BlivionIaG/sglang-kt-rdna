@@ -642,6 +642,13 @@ class ServerArgs:
     dtype: str = "auto"
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
+    # Added with the qwen4 subsystem (sgl-project/sglang). Qwen4-Exp keeps its PLE
+    # n-gram table (47.7 GiB in fp8 for the staged checkpoint) off the GPU. None
+    # means "decide from the platform and dtype" in the qwen4_exp model override,
+    # which enables it for BF16 Qwen4-Exp on CUDA.
+    ple_offload_embedding: Optional[bool] = None
+    ple_offload_backend: str = "pinned"
+    ple_offload_dir: Optional[str] = None
     kv_cache_dtype: str = "auto"
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
@@ -3928,6 +3935,29 @@ class ServerArgs:
             default=ServerArgs.quantization,
             choices=QUANTIZATION_CHOICES,
             help="The quantization method.",
+        )
+        # Added with the qwen4 subsystem (sgl-project/sglang).
+        parser.add_argument(
+            "--ple-offload-embedding",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.ple_offload_embedding,
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+        )
+        parser.add_argument(
+            "--ple-offload-backend",
+            type=str,
+            default=ServerArgs.ple_offload_backend,
+            choices=["pinned", "file"],
+            help="Host storage for the offloaded Qwen4 PLE n-gram table.",
+        )
+        parser.add_argument(
+            "--ple-offload-dir",
+            type=nullable_str,
+            default=ServerArgs.ple_offload_dir,
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'.",
         )
         parser.add_argument(
             "--quantization-param-path",

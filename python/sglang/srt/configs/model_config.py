@@ -155,8 +155,16 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
+        ple_offload_embedding: Optional[bool] = None,
+        ple_offload_backend: Optional[str] = None,
+        ple_offload_dir: Optional[str] = None,
     ) -> None:
         # Parse args
+        # Qwen4 PLE offload options, applied to the text config below. They come
+        # from ServerArgs; see the comment at the hf_text_config assignment.
+        self.ple_offload_embedding = ple_offload_embedding
+        self.ple_offload_backend = ple_offload_backend
+        self.ple_offload_dir = ple_offload_dir
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
@@ -184,6 +192,26 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+
+        # Apply the Qwen4 PLE offload options onto the text config. Upstream does
+        # this through the `arg_groups` model-override hook
+        # (`arg_groups/model_overrides/qwen4_exp.py`, applied by model_hook.py);
+        # this fork's server_args does not run that hook, so `ple_offload_
+        # embedding` stayed at the config class default of False and
+        # `Qwen4ExpNGramEmbedding` put the 47.69 GiB PLE table on the GPU:
+        #     torch.OutOfMemoryError: Tried to allocate 47.69 GiB
+        # The same three values are copied here, with `None` meaning "not set on
+        # the CLI", which the override resolves from platform and dtype.
+        _ple_offload = getattr(self, "ple_offload_embedding", None)
+        for _cfg in (self.hf_config, self.hf_text_config):
+            if _cfg is None or not hasattr(_cfg, "ple_offload_embedding"):
+                continue
+            if _ple_offload is not None:
+                _cfg.ple_offload_embedding = _ple_offload
+            if getattr(self, "ple_offload_backend", None):
+                _cfg.ple_offload_backend = self.ple_offload_backend
+            if getattr(self, "ple_offload_dir", None):
+                _cfg.ple_offload_dir = self.ple_offload_dir
         self.glm5_next_capabilities = get_glm5_next_capabilities(self.hf_config)
         self.is_glm5_next = self.glm5_next_capabilities.is_glm5_next
         self.uses_kpool4_compress = (
@@ -328,6 +356,9 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=quantization,
+            ple_offload_embedding=getattr(server_args, "ple_offload_embedding", None),
+            ple_offload_backend=getattr(server_args, "ple_offload_backend", None),
+            ple_offload_dir=getattr(server_args, "ple_offload_dir", None),
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
