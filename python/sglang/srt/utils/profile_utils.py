@@ -12,6 +12,11 @@ from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
 if _is_npu:
@@ -386,3 +391,80 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
+
+
+# --- imported with the qwen4 subsystem ---
+
+
+GRAPH_CAPTURE_PROFILE_DIRNAME = "graph_capture_profile"
+
+
+def graph_capture_profile_dir() -> str:
+    """``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile`` — the one directory
+    both capture-trace modes write to. Change the location here only."""
+    return os.path.join(
+        envs.SGLANG_TORCH_PROFILER_DIR.get(), GRAPH_CAPTURE_PROFILE_DIRNAME
+    )
+
+
+def export_cuda_graph_capture_trace(prof_context, *, runner_name: str):
+    """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
+
+    Opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE`` (no-op otherwise). The
+    capture profiler must have run with ``record_shapes=True`` so the trace can
+    be inspected offline as a per-kernel shape/identity record. The file lands in
+    ``graph_capture_profile_dir()`` and is namespaced by runner class and TP rank
+    so concurrent capture passes (e.g. EAGLE3 target/draft/draft-extend) and
+    ranks don't overwrite each other.
+    """
+    if not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
+        return
+    tp_rank = get_parallel().tp_rank
+    output_dir = graph_capture_profile_dir()
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(
+        output_dir, f"cuda_graph_capture-{runner_name}-TP-{tp_rank}.json.gz"
+    )
+    prof_context.export_chrome_trace(path)
+    logger.info(f"CUDA graph capture trace saved to: {path}")
+
+
+def build_step_span_name(
+    forward_batch: ForwardBatch,
+    detailed_annotations: bool | None = None,
+    *,
+    is_draft_worker: bool = False,
+) -> str:
+    """Build the profile-trace span name for one forward step.
+
+    Detailed annotations are folded into the label (via
+    build_detailed_annotation_suffix) when enabled. detailed_annotations
+    defaults to the process-wide toggle (detailed_annotations_enabled, set
+    by the profiler manager); pass an explicit bool to override (e.g. in tests).
+
+    The target-verify step is labeled ``VERIFY``; every step a draft model
+    runner emits is labeled ``DRAFT`` (some draft paths borrow the TARGET_VERIFY
+    mode, so the mode name alone cannot tell the two models apart).
+    """
+    if detailed_annotations is None:
+        detailed_annotations = detailed_annotations_enabled()
+
+    mode = forward_batch.forward_mode
+    bs = forward_batch.batch_size
+    if is_draft_worker:
+        stage = "DRAFT"
+    elif mode == ForwardMode.TARGET_VERIFY:
+        stage = "VERIFY"
+    else:
+        stage = mode.name
+    if mode == ForwardMode.EXTEND:
+        ext_toks = forward_batch.extend_num_tokens or 0
+        base = f"step[{stage} bs={bs} toks={ext_toks}"
+    else:
+        base = f"step[{stage} bs={bs}"
+
+    if detailed_annotations:
+        suffix = build_detailed_annotation_suffix(forward_batch)
+        if suffix:
+            base = f"{base} {suffix}"
+    return f"{base}]"

@@ -1632,3 +1632,45 @@ def is_deepseek_dsa(config) -> bool:
         )
         and _hf_attr(config, "index_topk") is not None
     )
+
+
+# --- imported with the qwen4 subsystem ---
+REQUANTIZATION_METHODS = ["quark_mxfp4"]
+
+
+# --- imported with the qwen4 subsystem ---
+def is_qwen3_5_mtp_draft(config) -> bool:
+    """The Qwen3.5 MoE MTP draft: _config_draft_model rewrites architectures[0] to
+    Qwen3_5ForCausalLMMTP before quantization is resolved."""
+    return (
+        _hf_arch(config) == "Qwen3_5ForCausalLMMTP"
+        and _hf_attr(config, "model_type") == "qwen3_5_moe"
+    )
+
+
+# --- imported with the qwen4 subsystem ---
+def is_qwen4_exp(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLMMTP",
+    )
+
+
+# --- imported with the qwen4 subsystem ---
+def is_deepseek_v4(config) -> bool:
+    return _hf_arch(config) in (
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
+        "DeepseekV4ForCausalLMDSpark",
+    )
+
+
+# --- imported with the qwen4 subsystem ---
+def get_dsa_index_kpool(config: PretrainedConfig) -> int:
+    return getattr(config, "index_kpool", 1)
+
+
+# --- imported with the qwen4 subsystem ---
+def get_dsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
+    return config.index_topk

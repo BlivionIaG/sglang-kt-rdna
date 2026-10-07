@@ -1444,3 +1444,32 @@ def requant_block_scale_ue8m0_for_deepgemm(
     requant_weight_ue8m0_inplace(weight, weight_scale, weight_block_size)
     weight_scale.format_ue8m0 = True
     return True
+
+
+# --- imported with the qwen4 subsystem ---
+def quantize_block_fp8_weight_to_mxfp4(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    weight_block_size: List[int],
+    mxfp4_block_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if _is_hip:
+        return _quantize_block_fp8_weight_to_mxfp4_rne(
+            fp8_weight, fp8_scale, weight_block_size, mxfp4_block_size
+        )
+    fp8_weight_dequant = block_quant_dequant(
+        fp8_weight,
+        fp8_scale.to(torch.float32),
+        weight_block_size,
+        torch.bfloat16,
+    )
+    fp4_weight, fp4_scale = _MXFP4QuantizedData.quantize(
+        fp8_weight_dequant, block_size=mxfp4_block_size
+    )
+    fp4_weight = fp4_weight.quantized_data
+    fp4_weight = fp4_weight.contiguous().view(torch.int8)
+    fp4_scale = fp4_scale.view(
+        *fp8_weight_dequant.shape[:-1],
+        fp8_weight_dequant.shape[-1] // mxfp4_block_size,
+    )
+    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)

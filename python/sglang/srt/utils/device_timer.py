@@ -52,3 +52,15 @@ class _TimingInterval:
 
     def elapsed_time(self) -> float:
         return self.start_event.elapsed_time(self.end_event)
+
+
+# --- imported with the qwen4 subsystem ---
+def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
+    """Timing context for one forward segment; no-op when the timer is absent.
+
+    A segment that skips this stays out of the fwd_occupancy numerator while
+    still counting in its wall-clock denominator, i.e. reads as GPU idle.
+    """
+    if timer is None:
+        return nullcontext()
+    return timer.wrap(metadata={"category": category})

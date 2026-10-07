@@ -981,3 +981,75 @@ def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
         "flashinfer_a2a_dispatch_type='auto' reached the published runtime "
         "configuration; ServerArgs must resolve it before publication"
     )
+
+
+# --- imported with the qwen4 subsystem ---
+def get_deepep_v2_dispatcher_output_dtype(
+    experts_are_fp8: bool,
+) -> DispatcherOutputDtype:
+    """Match the dispatch dtype to the expert weights consumed by DeepGEMM."""
+    required = (
+        DispatcherOutputDtype.FP8 if experts_are_fp8 else DispatcherOutputDtype.BF16
+    )
+    requested = get_exec().moe.deepep_dispatcher_output_dtype
+    if requested != "auto" and DispatcherOutputDtype(requested) is not required:
+        raise ValueError(
+            f"--deepep-dispatcher-output-dtype {requested} contradicts this "
+            f"checkpoint: --moe-a2a-backend deepep_v2 dispatches "
+            f"{required.value} for "
+            f"{'FP8 blockwise' if experts_are_fp8 else 'BF16'} experts. Drop "
+            "the flag to let it follow the checkpoint."
+        )
+    return required
+
+
+# --- imported with the qwen4 subsystem ---
+def uses_per_rank_fused_shared_slots() -> bool:
+    """Check whether fused shared experts use per-rank physical slots."""
+    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+
+
+# --- imported with the qwen4 subsystem ---
+def install_shared_experts_fusion_decision(
+    model_class, hf_config, quant_config
+) -> None:
+    """Decide whether this runner's model fuses its shared experts, and install
+    the answer for the model it is about to build.
+
+    Called from the loader's single model-instantiation point, so the decision
+    is made once per runner — before any layer exists — and the model classes
+    are pure readers (``is_shared_experts_fusion_disabled``). A model family
+    that can auto-disable exposes the conditions as
+    ``shared_experts_fusion_disable_reason(hf_config, quant_config)``; families
+    without one follow the user's intent.
+
+    Inside ``draft_model_build_scope`` the answer also lands on the speculative
+    leaf, so a flags dump afterwards shows both runners' decisions.
+    """
+
+    disabled = get_exec().moe.disable_shared_experts_fusion
+    if not disabled:
+        gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
+        reason = gate(hf_config, quant_config) if gate is not None else None
+        if reason:
+            log_info_on_rank0(
+                logger, f"{reason} Shared experts fusion optimization is disabled."
+            )
+            disabled = True
+    moe = get_flags().moe
+    moe.disable_shared_experts_fusion = disabled
+    if moe.in_speculative_scope:
+        moe.speculative_disable_shared_experts_fusion = disabled
+
+
+# --- imported with the qwen4 subsystem ---
+def is_deepep_class_backend() -> bool:
+    """Return whether A2A combine occurs inside a DeepEP-family dispatcher."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_deepep_v2()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+    )

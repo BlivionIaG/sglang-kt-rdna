@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.utils import (
         is_tbo_enabled,
         post_experts_reduction_group,
         post_experts_sum_is_one_all_reduce,
+        reduce_moe_output,
         should_use_dp_reduce_scatterv,
         should_use_flashinfer_cutlass_moe_fp4_allgather,
     )
@@ -37,4 +38,5 @@ __all__ = [
     "post_experts_reduction_group",
     "post_experts_sum_is_one_all_reduce",
     "should_use_dp_reduce_scatterv",
+    "reduce_moe_output",
 ]
