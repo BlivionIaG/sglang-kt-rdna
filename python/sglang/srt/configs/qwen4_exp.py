@@ -55,20 +55,10 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
                 kwargs["partial_rotary_factor"] = rope_parameters[
                     "partial_rotary_factor"
                 ]
-        # transformers 5.x makes `rope_scaling` a PROPERTY aliasing
-        # `rope_parameters` (configuration_utils.py: `@property def rope_scaling:
-        # return self.rope_parameters`), while `PretrainedConfig.__init__` decides
-        # its RoPE-standardization path with `hasattr(self, "rope_parameters")`.
-        # Reading `self.rope_scaling` before `rope_parameters` exists therefore
-        # resolves to a missing attribute and raises
-        # `AttributeError: 'Qwen4ExpTextConfig' object has no attribute
-        # 'rope_parameters'`. Set the real attribute first, then let the alias
-        # follow. `kwargs` already carries the old-name spellings from the block
-        # above, so `super().__init__` sees a consistent config either way.
-        self.rope_parameters = rope_parameters or kwargs.get("rope_scaling") or {}
         super().__init__(**kwargs)
         if self.rope_scaling is None:
-            self.rope_scaling = self.rope_parameters
+            self.rope_scaling = rope_parameters or {}
+        self.rope_parameters = rope_parameters or self.rope_scaling
         self.hc_count = hc_count
         self.hc_lowrank = hc_lowrank
         self.layer_types = layer_types

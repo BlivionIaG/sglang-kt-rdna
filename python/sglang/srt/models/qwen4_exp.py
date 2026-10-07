@@ -48,21 +48,6 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-# Side-effect import, the same mechanism `models/deepseek_v4.py` uses
-# (`_try_side_effect("sglang.srt.layers.moe.kt_ep_wrapper")`). `kt_ep_wrapper`
-# registers the kt CPU/GPU expert wrapper with the MoE quant-method registry at
-# import time -- see its own comment: "Plugin registration: makes
-# KTEPWrapperMethod available to FusedMoE without any base-file import. Activated
-# by importing this module". Until then the only activator was deepseek_v4, so a
-# Qwen4-Exp MoE block fell through to the stock Triton fused-MoE path and
-# allocated every routed expert on the GPU: a ~68 GB NVFP4 expert set against a
-# 16 GB card. Importing the module here makes `--kt-num-gpu-experts` (and the
-# whole host-side expert path) apply to this model too.
-try:
-    from sglang.srt.layers.moe import kt_ep_wrapper as _kt_ep_wrapper  # noqa: F401
-except ImportError:
-    _kt_ep_wrapper = None
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
@@ -79,11 +64,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-# ^ adapted for this fork: upstream moved this flag to
-#   sglang.srt.model_executor.runner_utils.capture_mode, which does not exist
-#   in kvcache-ai/sglang. cuda_graph_runner owns the same process-global
-#   `is_capture_mode` flag here, so the semantics are unchanged.
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
