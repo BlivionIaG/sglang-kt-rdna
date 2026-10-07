@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align
 
@@ -54,7 +53,6 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
@@ -91,12 +89,15 @@ from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 import msgspec
 from functools import lru_cache
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    # Annotation-only; imported lazily because dllm.config imports
+    # ModelConfig from configs.model_config, which is still initialising here.
+    from sglang.srt.dllm.config import DllmConfig
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig

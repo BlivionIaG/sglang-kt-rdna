@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing import Any
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
@@ -26,6 +25,11 @@ class DllmConfig:
     ):
         if server_args.dllm_algorithm is None:
             return None
+
+        # Imported here, not at module scope: configs.model_config imports
+        # managers.schedule_batch -> dllm.mixin.req -> dllm.config, so a module-level
+        # import closes a cycle. The name is only needed when this runs.
+        from sglang.srt.configs.model_config import ModelConfig
 
         model_config = ModelConfig.from_server_args(
             server_args,

@@ -19,6 +19,7 @@ from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_
 from sglang.srt.disaggregation.base import KVPoll
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.disaggregation.base.conn import KVArgs
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
@@ -26,8 +27,7 @@ if TYPE_CHECKING:
         CommonKVReceiver,
         CommonKVSender,
     )
-    from sglang.srt.managers.schedule_batch import Req
-
+    
 #########################
 # Constants & Enums
 #########################
