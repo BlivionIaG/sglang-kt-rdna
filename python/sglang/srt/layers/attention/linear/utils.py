@@ -1,20 +1,15 @@
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-import msgspec
-
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.server_args import ServerArgs
 
-
-def pp_spec_stable_rows_enabled() -> bool:
-    return envs.SGLANG_ENABLE_PP_SPEC.get()
+logger = logging.getLogger(__name__)
 
 
 class LinearAttnKernelBackend(Enum):
@@ -31,6 +26,8 @@ class LinearAttnKernelBackend(Enum):
 
     @classmethod
     def _missing_(cls, value):
+        # Unknown backend names fall back to CUSTOM rather than raising, so a
+        # newer name delivered by a model config cannot abort startup.
         return cls.CUSTOM
 
     def is_triton(self):
@@ -64,48 +61,59 @@ class LinearAttnKernelBackend(Enum):
         return self == LinearAttnKernelBackend.CUSTOM
 
 
-class LinearAttnBackends(msgspec.Struct, frozen=True):
-    """One runner's linear-attn kernel choice, per phase.
-
-    Per runner, not per process: a target and its draft coexist and can want
-    different kernels (only the runner whose model is GDN gets the SM100
-    FlashInfer prefill default, and an explicit flag applies to whichever runner
-    was launched with it).
-    """
-
-    decode: LinearAttnKernelBackend
-    prefill: LinearAttnKernelBackend
-    verify: LinearAttnKernelBackend
+LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
+LINEAR_ATTN_PREFILL_BACKEND: Optional[LinearAttnKernelBackend] = None
 
 
-def resolve_linear_attn_backends(
-    prefill_default: Optional[str] = None,
-) -> LinearAttnBackends:
-    """This runner's kernel choice from the published leaves.
+def initialize_linear_attn_config(server_args: ServerArgs):
+    global LINEAR_ATTN_DECODE_BACKEND
+    global LINEAR_ATTN_PREFILL_BACKEND
 
-    ``prefill_default`` is the caller's own auto-default (the SM100 GDN
-    domain); an explicitly configured ``--linear-attn-prefill-backend`` wins.
-    """
-    mamba = get_exec().mamba
-    base = mamba.linear_attn_backend
-    decode = LinearAttnKernelBackend(mamba.linear_attn_decode_backend or base)
-    prefill = LinearAttnKernelBackend(
-        mamba.linear_attn_prefill_backend or prefill_default or base
-    )
+    base = server_args.linear_attn_backend
+    decode = server_args.linear_attn_decode_backend or base
+    prefill = server_args.linear_attn_prefill_backend or base
 
-    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
-    verify = mamba.linear_attn_verify_backend
-    if verify is None:
-        verify = decode.value if decode.is_flashinfer() else "triton"
-
-    backends = LinearAttnBackends(
-        decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
-    )
+    LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
+    LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)
     rank0_log(
-        f"Linear attention kernel backend: decode={backends.decode.value}, "
-        f"prefill={backends.prefill.value}, verify={backends.verify.value}"
+        f"Linear attention kernel backend: "
+        f"decode={LINEAR_ATTN_DECODE_BACKEND.value}, "
+        f"prefill={LINEAR_ATTN_PREFILL_BACKEND.value}"
     )
-    return backends
+
+
+def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:
+    global LINEAR_ATTN_DECODE_BACKEND
+    if LINEAR_ATTN_DECODE_BACKEND is None:
+        logger.warning(
+            "LINEAR_ATTN_DECODE_BACKEND is not initialized, using triton backend"
+        )
+        LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend.TRITON
+    return LINEAR_ATTN_DECODE_BACKEND
+
+
+def get_linear_attn_prefill_backend() -> LinearAttnKernelBackend:
+    global LINEAR_ATTN_PREFILL_BACKEND
+    if LINEAR_ATTN_PREFILL_BACKEND is None:
+        logger.warning(
+            "LINEAR_ATTN_PREFILL_BACKEND is not initialized, using triton backend"
+        )
+        LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend.TRITON
+    return LINEAR_ATTN_PREFILL_BACKEND
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) -----------------
+# The MTP / target_verify intermediate-state row selection. Kept additive: this
+# fork's GDN/KDA backends still call initialize_linear_attn_config and the two
+# get_linear_attn_*_backend accessors above, so upstream's version of this file
+# cannot simply replace ours.
+
+
+def pp_spec_stable_rows_enabled() -> bool:
+    """Whether the PP-stable intermediate-state row table is in use."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ENABLE_PP_SPEC.get()
 
 
 def select_verify_intermediate_state_indices(
@@ -120,38 +128,3 @@ def select_verify_intermediate_state_indices(
     return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
         torch.int32
     )
-
-
-def build_verify_intermediate_state_indices(pool_size: int, device):
-    """Per-request row index into the speculative intermediate scratch
-    (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
-    target_verify path: request slot i owns scratch row i.
-
-    The scratch is allocated with one extra padding row (the `+1` in
-    MambaPool.SpeculativeState, index `pool_size`). Warmup and MLP-sync
-    batches can be padded past the pool capacity — under DP attention
-    `get_eager_max_batch_size` ceil-aligns the eager warmup bs to attn_tp —
-    and the verify kernels index this table positionally up to that padded
-    bs. Size the table to the padded maximum and clamp every out-of-pool row
-    onto the padding row: pad rows race onto one discard row, which is
-    value-irrelevant (same convention as the ragged-verify ghost row).
-    """
-    import torch
-
-    from sglang.srt.utils.common import get_eager_max_batch_size
-
-    padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
-    indices = torch.arange(pool_size, dtype=torch.int32, device=device)
-    if padded_bs > pool_size:
-        indices = torch.cat(
-            [
-                indices,
-                torch.full(
-                    (padded_bs - pool_size,),
-                    pool_size,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-            ]
-        )
-    return indices
