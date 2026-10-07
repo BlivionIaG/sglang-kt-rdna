@@ -618,6 +618,23 @@ class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
+_building_neighbour_layer = False
+
+
+@contextmanager
+def building_neighbour_layer():
+    """Build a pipeline neighbour layer: on the meta device, with
+    is_building_neighbour_layer() true. Added with the qwen4 subsystem
+    (sgl-project/sglang)."""
+    global _building_neighbour_layer
+    outer, _building_neighbour_layer = _building_neighbour_layer, True
+    try:
+        with torch.device("meta"):
+            yield
+    finally:
+        _building_neighbour_layer = outer
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -627,9 +644,23 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    The local layers are built inside one layer stack, so layers that declare
+    stage boundaries connect in order without naming their neighbours. Across a
+    pipeline stage boundary the stack learns the neighbouring stage from the
+    layer itself, built again on the meta device.
+
+    The stack context was added with the qwen4 subsystem (sgl-project/sglang).
+    Qwen4-Exp decoder layers register their attn/ffn boundaries through
+    `layer_boundary.factories.append_stages`, which requires an OPEN stack and
+    otherwise raises "append_stages needs an open layer stack; build the layers
+    inside make_layers or layer_stack". This fork built the modules with no stack
+    open, so every Qwen4-Exp layer construction failed.
+    """
     # circula imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.layer_boundary.factories import layer_stack
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -643,23 +674,72 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
+
+    def neighbour(idx):
+        return functools.partial(
+            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
         )
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
+
+    with layer_stack(
+        previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
+        next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+    ):
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+            + get_offloader().wrap_modules(
+                (
+                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                    for idx in range(start_layer, end_layer)
+                ),
+                **(offloader_kwargs or {}),
+            )
+            + [
+                PPMissingLayer(return_tuple=return_tuple)
+                for _ in range(end_layer, num_hidden_layers)
+            ]
+        )
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+
+def make_pp_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.nn.Module, int, int]:
+    """Make this pipeline stage's layers, and return them with the stage's range.
+
+    Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    """
+    parallel = get_parallel()
+    return make_layers(
+        num_hidden_layers,
+        layer_fn,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        prefix=prefix,
+        return_tuple=return_tuple,
+        offloader_kwargs=offloader_kwargs,
+    )
+
+
+def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
+    """Build a layer another pipeline stage holds, only for the stage boundaries
+    it declares (see `building_neighbour_layer`). RoPE modules it adds to the
+    shared cache are meta, so they are dropped again."""
+    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+    cached = set(_ROPE_DICT)
+    try:
+        with building_neighbour_layer():
+            layer_fn(idx=idx, prefix=prefix)
+    finally:
+        for name in set(_ROPE_DICT) - cached:
+            _ROPE_DICT.pop(name, None)
 
 
 def make_layers_non_pp(
