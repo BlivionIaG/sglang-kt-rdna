@@ -718,6 +718,29 @@ class Envs:
     # attribute is False, so `--ple-offload-backend file` cannot use it. With this enabled
     # the same rows are gathered on the CPU and copied over, which works anywhere.
     SGLANG_QWEN4_PLE_HOST_SIDE_GATHER = EnvBool(False)
+
+    # --- env names the newer base references but this fork's merged environ.py lacked.
+    # Found by diffing `envs.<NAME>` references across the installed srt/ tree against the
+    # declarations here: 17 were missing, and `envs.EXA_API_KEY` alone killed the server
+    # during the FastAPI lifespan at `entrypoints/http_server.py:372`.
+    # Types inferred from each call site (.get() -> value, .is_set()/.override() -> bool,
+    # .default -> str).
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # CPU deep-normal mode int8 quantisation
+    EXA_API_KEY = EnvStr(None)  # web_search / browsing backend key (openai responses API)
+    FLASHINFER_NVFP4_4OVER6 = EnvBool(False)  # flashinfer NVFP4 4-over-6 layout
+    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)  # flashinfer NVFP4 4-over-6 E4M3 256-wide
+    MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)  # Mooncake KV transfer SSD offload
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr("")  # Mooncake SSE offload file path
+    MOONCAKE_TENANT_ID = EnvStr("default")  # Mooncake tenant
+    SGLANG_OPT_KIMI_GATE_BF16_INPUT = EnvBool(False)  # kimi gate bf16 input optimisation
+    SGLANG_OPT_LORA_FUSED_TOPK_PACK = EnvBool(False)  # LoRA fused topk pack
+    SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC = EnvBool(False)  # LoRA overlap main allocation
+    SGLANG_OPT_LORA_SHARED_ADD_OVERLAP = EnvBool(False)  # LoRA shared add overlap
+    SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE = EnvBool(False)  # JIT kernel for kimi gate
+    SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN = EnvBool(False)  # JIT kernel for MoE align
+    SGLANG_TWO_STREAM_MAX_TOKENS = EnvInt(0)  # two-stream max tokens
+    USE_ROCM_AITER_ROPE_BACKEND = EnvBool(False)  # ROCm aiter rope backend
+    VLLM_MARLIN_USE_ATOMIC_ADD = EnvBool(False)  # marlin atomic add
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
