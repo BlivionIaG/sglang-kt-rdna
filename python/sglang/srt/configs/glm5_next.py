@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any, List, Optional, Union
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 
@@ -627,3 +628,14 @@ class Glm5NextCapabilities:
 
 def get_glm5_next_capabilities(config: Any) -> Glm5NextCapabilities:
     return Glm5NextCapabilities.from_config(config)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+class Glm5NextVisionConfig(GlmOcrVisionConfig):
+    def __init__(
+        self,
+        swiglu_limit: float,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.swiglu_limit = swiglu_limit

@@ -61,6 +61,63 @@ from sglang.srt.configs.step3_vl import (
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.zaya import ZayaConfig
+from sglang.srt.configs.interns2_mobius import (
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
+    InternS2MobiusVisionConfig,
+)
+from sglang.srt.configs.iquest_q1 import (
+    IQuestQ1Config,
+    IQuestQ1MTPConfig,
+)
+from sglang.srt.configs.k2_horizon import (
+    K2HorizonConfig,
+    XllmConfig,
+)
+from sglang.srt.configs.kimi_k3 import (
+    KimiK3Config,
+)
+from sglang.srt.configs.laguna import (
+    LagunaConfig,
+)
+from sglang.srt.configs.locate_anything import (
+    LocateAnythingConfig,
+)
+from sglang.srt.configs.minicpmv4_6 import (
+    MiniCPMV4_6Config,
+    MiniCPMV4_6VisionConfig,
+)
+from sglang.srt.configs.minimax_vl import (
+    MiniMaxM3VLConfig,
+)
+from sglang.srt.configs.muse_glimmer import (
+    MuseGlimmerAssistantConfig,
+    MuseGlimmerConfig,
+)
+from sglang.srt.configs.nanbeige import (
+    NanbeigeConfig,
+)
+from sglang.srt.configs.nano_nemotron_vl import (
+    NemotronH_Nano_Omni_Reasoning_V3_Config,
+    NemotronH_Nano_VL_V2_Config,
+    NemotronH_Omni_Reasoning_V3_Config,
+)
+from sglang.srt.configs.nemotron_h import (
+    NemotronHConfig,
+    NemotronHPuzzleConfig,
+)
+from sglang.srt.configs.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
+)
+from sglang.srt.configs.spark2_5 import (
+    Spark2_5Config,
+)
+from sglang.srt.configs.step3p7 import (
+    Step3p7Config,
+)
 
 __all__ = [
     "AfmoeConfig",
@@ -118,4 +175,26 @@ __all__ = [
     "HYV4Config",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
+    "InternS2MobiusConfig",
+    "InternS2MobiusTextConfig",
+    "IQuestQ1Config",
+    "IQuestQ1MTPConfig",
+    "K2HorizonConfig",
+    "KimiK3Config",
+    "LagunaConfig",
+    "LocateAnythingConfig",
+    "MiniCPMV4_6Config",
+    "MiniCPMV4_6VisionConfig",
+    "MiniMaxM3VLConfig",
+    "MuseGlimmerAssistantConfig",
+    "MuseGlimmerConfig",
+    "NanbeigeConfig",
+    "NemotronH_Nano_Omni_Reasoning_V3_Config",
+    "NemotronH_Omni_Reasoning_V3_Config",
+    "NemotronHPuzzleConfig",
+    "Qwen3_5MoeTextConfig",
+    "Qwen3_5TextConfig",
+    "Spark2_5Config",
+    "Step3p7Config",
+    "XllmConfig",
 ]
