@@ -428,6 +428,11 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    # ModelOpt MIXED_PRECISION exports (per-layer NVFP4 + FP8 + BF16). Registered
+    # in QUANTIZATION_METHODS as of the qwen4 port; without the name here
+    # `--quantization modelopt_mixed` is rejected by argparse, and auto-detection
+    # has no CLI spelling to fall back on.
+    "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",
     "w8a8_fp8",
