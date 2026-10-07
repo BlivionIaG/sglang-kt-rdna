@@ -97,3 +97,31 @@ kept for tests, so it should stay unless asked otherwise.
 Viable placement = experts on CPU + PLE from disk + the rest on GPU; it fits RAM (65.6 vs 90.1)
 and VRAM (10.2 vs 15.5), and it needs ~19 GB of disk freed that is currently occupied by two
 redundant Qwen3.6 copies.
+
+## RESOLVED: disk, and placement B running
+
+Freed 25.9 GiB without touching a single model directory:
+
+    .cache/drkonqi   6.2 G   crash reports
+    pip cache        9.0 G   `pip cache purge`, 1642 files
+    uv cache         6.6 G   `uv cache clean`, 20897 files
+    .cache/vllm      5.0 G   stale torch-compile cache from a different stack
+    Downloads/bmaxos 13  G   a 2025 macOS image archive, unrelated to this repo
+
+    /home: 29 G free -> 56 G free.   PLE file needs 47.75 -> fits with ~8 GiB headroom.
+
+Both Qwen3.6 copies were left alone. `.cache/huggingface` (18 G) was also left alone, since it
+may hold blobs in use.
+
+**Placement B, observed running** (`PLE_BACKEND=file ISOLATE=1`):
+
+    PLE: file backend (sparse mmap) + host-side gather
+    running under systemd-run --scope -p MemoryMax=70G -p MemorySwapMax=8G
+    PLE table: file-backed mmap .../ple_table_320001536x160_float8_e4m3fn_...bin (47.7 GiB)
+    PLE table: WILLNEED prefetch on for gathers of >= 2048 rows (row = 160 B)
+    PLE table: resident set capped at 8.0 GiB, checked every 30 s
+
+Measured while loading: **RAM used 6 GB of 92** (against 70+ for the pinned placement), with the
+47.7 GiB table on disk and its resident set bounded at 8 GiB. That is the whole point of the
+placement, confirmed by observation rather than arithmetic: the memory the pinned backend would
+have held is now on the filesystem.
