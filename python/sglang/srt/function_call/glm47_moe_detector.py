@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import infer_type_from_json_schema
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -870,3 +871,188 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@lru_cache(maxsize=1)
+def _glm47_native_structural_tag_available() -> bool:
+    # "glm_4_7" is only registered in newer xgrammar, so the import can succeed
+    # while the model name stays unknown. Probe once and fall back if absent.
+    if get_model_structural_tag is None:
+        return False
+    try:
+        get_model_structural_tag(
+            model="glm_4_7", tools=[], tool_choice="auto", reasoning=False
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _json_type(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return "integer"
+    return {
+        type(None): "null",
+        bool: "boolean",
+        int: "integer",
+        float: "number",
+        str: "string",
+        list: "array",
+        dict: "object",
+    }[type(value)]
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    if _json_type(left) != _json_type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _json_equal(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_equal(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _matches_discriminators(schema: Any, root: Any, arguments: Dict[str, Any]) -> bool:
+    for name, value in arguments.items():
+        types = _argument_types(schema, root, name, value=value)
+        if types is not None and _json_type(value) not in types:
+            return False
+    return True
+
+
+def _argument_types(
+    schema: Any,
+    root: Any,
+    key: Optional[str] = None,
+    seen: frozenset[int] = frozenset(),
+    arguments: Optional[Dict[str, Any]] = None,
+    value: Any = _UNSET,
+) -> Optional[set[str]]:
+    """Keep every possible type until the argument value disambiguates a union."""
+    if not isinstance(schema, dict) or id(schema) in seen:
+        return None
+    seen = seen | {id(schema)}
+    constraints = []
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and (ref == "#" or ref.startswith("#/")):
+        target = root
+        try:
+            for part in ref[2:].split("/") if ref != "#" else []:
+                part = part.replace("~1", "/").replace("~0", "~")
+                target = target[int(part)] if isinstance(target, list) else target[part]
+            types = _argument_types(target, root, key, seen, arguments, value)
+            if types is not None:
+                constraints.append(types)
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+    if key is not None:
+        field = schema.get("properties", {}).get(key)
+        types = _argument_types(field, root, seen=seen, value=value)
+        if types is not None:
+            constraints.append(types)
+    else:
+        types = schema.get("type")
+        if isinstance(types, str):
+            constraints.append({types, "integer"} if types == "number" else {types})
+        elif isinstance(types, list):
+            constraints.append(
+                set(types) | ({"integer"} if "number" in types else set())
+            )
+        values = [schema["const"]] if "const" in schema else schema.get("enum")
+        if isinstance(values, list):
+            constraints.append(
+                {
+                    _json_type(allowed)
+                    for allowed in values
+                    if value is _UNSET or _json_equal(value, allowed)
+                }
+            )
+    for keyword in ("anyOf", "oneOf"):
+        if isinstance(schema.get(keyword), list):
+            alternatives = [
+                _argument_types(branch, root, key, seen, arguments, value)
+                for branch in schema[keyword]
+                if key is None or _matches_discriminators(branch, root, arguments or {})
+            ]
+            if alternatives and all(types is not None for types in alternatives):
+                constraints.append(set().union(*alternatives))
+    if isinstance(schema.get("allOf"), list):
+        for branch in schema["allOf"]:
+            types = _argument_types(branch, root, key, seen, arguments, value)
+            if types is not None:
+                constraints.append(types)
+    return set.intersection(*constraints) if constraints else None
+
+
+def _get_argument_types(
+    func_name, arg_key, defined_tools, arguments=None, value=_UNSET
+):
+    for tool in defined_tools:
+        if tool.function.name == func_name:
+            schema = tool.function.parameters
+            return _argument_types(
+                schema, schema, arg_key, arguments=arguments, value=value
+            )
+    return None
+
+
+def _needs_argument_context(schema: Any) -> bool:
+    keys, seen = set(), set()
+    has_union = False
+
+    def visit(node):
+        nonlocal has_union
+        if not isinstance(node, dict) or id(node) in seen:
+            return
+        seen.add(id(node))
+        keys.update(node.get("properties", {}))
+        ref = node.get("$ref")
+        if isinstance(ref, str) and (ref == "#" or ref.startswith("#/")):
+            target = schema
+            try:
+                for part in ref[2:].split("/") if ref != "#" else []:
+                    part = part.replace("~1", "/").replace("~0", "~")
+                    target = (
+                        target[int(part)] if isinstance(target, list) else target[part]
+                    )
+                visit(target)
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            branches = node.get(keyword)
+            if isinstance(branches, list):
+                has_union |= keyword != "allOf"
+                for branch in branches:
+                    visit(branch)
+
+    visit(schema)
+    for key in keys if has_union else ():
+        types = _argument_types(schema, schema, key)
+        if types is None or len(types) > 1 and types != {"number", "integer"}:
+            return True
+    return False
+
+
+def _convert_to_integer(value: str) -> Any:
+    try:
+        return int(value)
+    except (ValueError, AttributeError):
+        return value
+
+
+def _coerce_numeric_string(value: Any, arg_type: Optional[str]) -> Any:
+    # A quoted value must not become a type its schema forbids: "1.5" may coerce
+    # for number but never for integer.
+    if isinstance(value, str):
+        if arg_type == "integer":
+            return _convert_to_integer(value)
+        if arg_type == "number":
+            return _convert_to_number(value)
+    return value

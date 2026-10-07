@@ -22,6 +22,7 @@ from copy import copy
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.evict_policy import EvictionStrategy
+import hashlib
 
 
 @triton.jit

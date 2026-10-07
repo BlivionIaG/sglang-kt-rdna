@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     SpeculativeMetrics,
 )
 from sglang.version import __version__
+from functools import lru_cache
 
 router = APIRouter()
 
@@ -173,3 +174,25 @@ async def get_loads(
         "loads": loads,
         "aggregate": _compute_aggregate(loads),
     }
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@lru_cache(maxsize=1)
+def _accelerator_name() -> Optional[str]:
+    """Accelerator marketing name (e.g. "NVIDIA GB300"), None if unavailable."""
+    return get_device_name()
+
+
+def _num_accelerators_per_dp_rank() -> int:
+    """Accelerators behind one DP rank.
+
+    Not cached: the arguments were the cache key, so an ``lru_cache`` here
+    would freeze the first answer past a post-publish override.
+    """
+    parallel = get_parallel()
+    num_accelerators = parallel.tp_size * parallel.pp_size
+    if parallel.attn_dp_enabled:
+        num_accelerators //= parallel.num_dp_ranks
+    return num_accelerators

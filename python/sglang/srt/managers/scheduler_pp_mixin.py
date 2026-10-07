@@ -1384,3 +1384,42 @@ class ChunkSizePredictor:
             return None
 
         return dynamic_chunk_size
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
+    """Check if output send/recv can be skipped for this batch."""
+    return (
+        envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        and batch is not None
+        and batch.forward_mode == ForwardMode.EXTEND
+        and len(batch.reqs) == 1
+        and not batch.contains_last_prefill_chunk
+        and not batch.return_logprob
+    )
+
+
+def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    if batch.spec_algorithm.is_none():
+        return None
+    fwd_batch = batch.copy()
+    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    return fwd_batch
+
+
+def _pp_exchange_outputs_before_forward(
+    cur_batch: Optional[ScheduleBatch],
+    spec_relay: bool,
+    is_last_rank: bool,
+    async_batch_depth: int,
+) -> bool:
+    """Extend microbatches launch first: they need nothing from the relay, and
+    exchanging first caps every stage at (pp_size - 1) / pp_size. A verify round
+    must exchange first or the ring deadlocks on its tree rebuild."""
+    if async_batch_depth > 0:
+        return True
+    if not spec_relay or is_last_rank or cur_batch is None:
+        return False
+    return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)

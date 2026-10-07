@@ -2090,3 +2090,58 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class _MediaInputValidationError(ValueError):
+    pass
+
+
+def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
+    """Reshape decoded ``meta_info`` logprobs into the Responses logprob type,
+    covering every generated token."""
+    decoded = to_openai_style_logprobs(
+        output_token_logprobs=meta_info.get("output_token_logprobs"),
+        output_top_logprobs=meta_info.get("output_top_logprobs"),
+    )
+    top_lists = decoded.top_logprobs or []
+    logprobs: list[Logprob] = []
+    for index, (token, logprob) in enumerate(
+        zip(decoded.tokens, decoded.token_logprobs)
+    ):
+        top_entry = top_lists[index] if index < len(top_lists) else None
+        top_logprobs = [
+            LogprobTopLogprob(
+                token=top_token,
+                logprob=top_logprob,
+                bytes=list(top_token.encode("utf-8")),
+            )
+            for top_token, top_logprob in (top_entry or {}).items()
+        ]
+        logprobs.append(
+            Logprob(
+                token=token,
+                logprob=logprob,
+                bytes=list(token.encode("utf-8")),
+                top_logprobs=top_logprobs,
+            )
+        )
+    return logprobs
+
+
+def _should_emit_normal_text_as_message(
+    text: str, *, any_tool_call_in_progress: bool
+) -> bool:
+    """Whether ``text`` should open / extend a user-visible message item.
+
+    qwen3-coder separates adjacent tool-call blocks with ``\\n``, which the
+    streaming detector cannot tell from real content -- so whitespace arriving
+    while a call is open is treated as a separator.
+    """
+    if not text:
+        return False
+    if any_tool_call_in_progress and not text.strip():
+        return False
+    return True

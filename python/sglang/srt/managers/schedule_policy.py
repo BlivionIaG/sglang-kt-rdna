@@ -43,6 +43,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
+from dataclasses import dataclass
+from functools import lru_cache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -939,3 +941,124 @@ class PrefillAdder:
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
         return True
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@lru_cache(maxsize=1)
+def _use_exact_chunk_fill() -> bool:
+    """Whether to charge the chunked-prefill compute budget in tokens (gfx95 only).
+
+    Gated on gfx95 because that is where the win is: the aiter absorb bmm picks
+    its EVEN_MN specialization from M % BLOCK_SIZE_M, so a short batch costs 2x
+    on that kernel, against 1% for the hipBLASLt GEMMs that just run one extra
+    partial tile.
+    """
+    return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return -(-value // divisor)
+
+
+def estimate_prefill_extend_tile_metrics(
+    extend_lens: List[int], block_m: int
+) -> Dict[str, Union[int, float, List[int], None]]:
+    """Estimate extend-attention query tiles per head for a prefill batch."""
+    normalized_lens = [max(0, int(length)) for length in extend_lens]
+    q_tiles = [
+        _ceil_div(length, block_m) if length > 0 else 0 for length in normalized_lens
+    ]
+    legacy_tiles = len(q_tiles) * max(q_tiles) if q_tiles else 0
+    compact_tiles = sum(q_tiles)
+    saved_tiles = legacy_tiles - compact_tiles
+    saved_ratio = saved_tiles / legacy_tiles if legacy_tiles else None
+    return {
+        "block_m": int(block_m),
+        "request_count": len(normalized_lens),
+        "extend_lens": normalized_lens,
+        "q_tiles_per_request": q_tiles,
+        "max_extend_len": max(normalized_lens) if normalized_lens else 0,
+        "sum_extend_len": sum(normalized_lens),
+        "legacy_q_tiles_per_head": legacy_tiles,
+        "compact_q_tiles_per_head": compact_tiles,
+        "saved_q_tiles_per_head": saved_tiles,
+        "saved_q_tile_ratio": saved_ratio,
+    }
+
+
+def match_prefix_for_req(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: Optional[array[int]] = None,
+    *,
+    cow_mamba: bool = False,
+    include_req: bool = False,
+    max_prefix_len: Optional[int] = None,
+):
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    # unified_kv SWA lives in a per-request ring that's not content-stable and is
+    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
+    # the match by the trailing sliding window so it gets re-prefilled, rewriting
+    # this request's SWA ring. No-op for other layouts.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+                limit=key_limit,
+                cache_salt=req.cache_salt,
+            ),
+            cow_mamba=cow_mamba,
+            req=req if include_req else None,
+        )
+    )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
+    (
+        req.prefix_indices,
+        req.last_node,
+        req.last_host_node,
+        req.best_match_node,
+        req.host_hit_length,
+        req.swa_host_hit_length,
+        req.mamba_host_hit_length,
+    ) = (
+        match_result.device_indices,
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.best_match_node,
+        match_result.host_hit_length,
+        match_result.swa_host_hit_length,
+        match_result.mamba_host_hit_length,
+    )
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    req.num_matched_prefix_tokens = min(
+        len(req.prefix_indices) + req.host_hit_length, max_len
+    )
+    req.swa_branching_seqlen = match_result.swa_branching_seqlen
+    if match_result.mamba_branching_seqlen is not None:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if match_result.cache_protected_len is not None:
+        req.kv.cache_protected_len = match_result.cache_protected_len
+    return match_result
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefillAdmission:
+    prefix_len: int
+    extend_len: int
+    max_new_tokens: int
+    is_chunked: bool

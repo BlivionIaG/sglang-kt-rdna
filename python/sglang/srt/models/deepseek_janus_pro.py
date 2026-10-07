@@ -114,6 +114,7 @@ VQ_models = {"VQ-16": VQ_16}
 
 import collections.abc
 from dataclasses import dataclass
+from typing import List
 
 
 # From PyTorch internals

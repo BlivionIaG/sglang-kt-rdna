@@ -704,3 +704,97 @@ class AnthropicServing:
                 error_type="internal_error",
                 message="Internal server error",
             )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _cached_prompt_tokens(usage) -> int:
+    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+    return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+
+
+def _anthropic_input_tokens(usage) -> int:
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    cached = _cached_prompt_tokens(usage)
+    if cached > prompt:
+        # Upstream telemetry bug: cached cannot exceed the prompt it caches.
+        # Clamping silently here would hide the discrepancy from billing
+        # dashboards, so make it visible at WARNING level.
+        logger.warning(
+            "Cached tokens (%d) exceed prompt tokens (%d); clamping "
+            "input_tokens to 0. This usually indicates an upstream "
+            "telemetry bug.",
+            cached,
+            prompt,
+        )
+    return max(prompt - cached, 0)
+
+
+def _anthropic_usage_from_openai(
+    usage,
+    *,
+    include_input: bool,
+    include_output: bool,
+    force_zero_output: bool = False,
+) -> AnthropicUsage:
+    if usage is None:
+        return AnthropicUsage(
+            input_tokens=0 if include_input else None,
+            output_tokens=0 if include_output else None,
+        )
+
+    usage_fields: dict[str, int] = {}
+    cached_tokens = _cached_prompt_tokens(usage)
+    if include_input:
+        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
+        if cached_tokens:
+            usage_fields["cache_read_input_tokens"] = cached_tokens
+    if include_output:
+        usage_fields["output_tokens"] = (
+            0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
+        )
+    return AnthropicUsage(**usage_fields)
+
+
+def _extract_system_text(
+    content: Union[str, list[AnthropicContentBlock]],
+) -> Optional[str]:
+    """Flatten a system message's content to a trimmed string, or ``None``."""
+    if isinstance(content, str):
+        return content.strip() or None
+    texts = []
+    for block in content:
+        if isinstance(block, BaseModel) and getattr(block, "type", None) == "text":
+            text = getattr(block, "text", "")
+        elif isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text", "")
+        else:
+            continue
+        text = (text or "").strip()
+        if text:
+            texts.append(text)
+    return "\n".join(texts) if texts else None
+
+
+def _scrub_error_message(message: str, status_code: int) -> str:
+    """Return a safe outward-facing error message.
+
+    5xx is always generic — never echo upstream ``str(e)`` payloads, which
+    may contain stack frames, file paths, or PII. 4xx keeps the original
+    message (truncated and with obvious traceback lines stripped) so
+    callers see the real validation failure.
+    """
+    if status_code >= 500:
+        return "Internal server error"
+    if not message:
+        return "Request failed"
+    safe_lines = [
+        ln
+        for ln in message.splitlines()
+        if not ln.startswith("Traceback") and 'File "/' not in ln
+    ]
+    cleaned = "\n".join(safe_lines).strip()
+    if len(cleaned) > 500:
+        cleaned = cleaned[:500] + "…"
+    return cleaned or "Request failed"

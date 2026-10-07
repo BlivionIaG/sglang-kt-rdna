@@ -517,3 +517,75 @@ class _HiSparseHookAdapter:
 from sglang.srt.managers.forward_hooks_registry import register_forward_hook
 
 register_forward_hook("hisparse", _HiSparseHookAdapter())
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class HiSparseTokenStats(NamedTuple):
+    device_tokens: int
+    device_token_usage: float
+    host_tokens: int
+    host_token_usage: float
+
+
+def resolve_shared_index_layers(
+    *,
+    hf_text_config,
+    is_speculative: bool,
+) -> Optional[List[bool]]:
+    """Per-layer "reuses the previous layer's top-k index" pattern, or None.
+
+    Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
+    index_topk_freq / cli_factor); None when the model has no sharing or the
+    prefetch cannot run (PP, speculative decoding, kill-switch).
+    """
+    if not is_deepseek_dsa(hf_text_config):
+        return None
+    num_layers = hf_text_config.num_hidden_layers
+    cli_factor = getattr(hf_text_config, "cli_factor", 1) or 1
+    if cli_factor > 1:
+        pattern = [i % cli_factor != 0 for i in range(num_layers)]
+    else:
+        pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
+    if not any(pattern):
+        return None
+    if get_parallel().pp_size != 1 or is_speculative:
+        logger.warning(
+            "HiSparse shared-index prefetch is unsupported under pipeline "
+            "parallelism / speculative decoding; falling back to synchronous "
+            "swap-in."
+        )
+        return None
+    if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
+        logger.info(
+            "HiSparse shared-index prefetch disabled via "
+            "SGLANG_DISABLE_HISPARSE_PREFETCH; using synchronous swap-in."
+        )
+        return None
+    return pattern
+
+
+def _build_prefetch_groups(
+    is_shared_index_layer: List[bool],
+) -> Tuple[Dict[int, List[int]], List[int]]:
+    """Group consecutive shared-index (skip) layers under their anchor layer.
+
+    Returns (groups, slot): anchor layer_id -> ordered skip layers, and each
+    skip layer's position in its group (indexes the per-slot prefetch events).
+    """
+    groups: Dict[int, List[int]] = {}
+    slot = [0] * len(is_shared_index_layer)
+    anchor = None
+    for i, is_shared in enumerate(is_shared_index_layer):
+        if not is_shared:
+            anchor = i  # compute layer; anchors the skip layers after it
+            continue
+        assert anchor is not None, (
+            f"shared-index (skip) layer {i} has no preceding compute layer; "
+            "the model's index-topk pattern is invalid"
+        )
+        group = groups.setdefault(anchor, [])
+        slot[i] = len(group)
+        group.append(i)
+    return groups, slot

@@ -44,6 +44,9 @@ except:
     StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
+from typing import Protocol
+from pydantic import ConfigDict
+from typing import Annotated
 
 logger = logging.getLogger(__name__)
 
@@ -1516,3 +1519,300 @@ class TranscriptionStreamResponse(BaseModel):
     model: str
     choices: List[TranscriptionStreamChoice]
     usage: Optional[UsageInfo] = None
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@runtime_checkable
+class ParsedResponseFields(Protocol):
+    """Protocol for parsed response fields from custom renderers."""
+
+    content: Optional[str]
+    tool_calls: Optional[List[Dict]]
+    reasoning_content: Optional[str]
+
+
+class ResponseParserProtocol(Protocol):
+    """Protocol for custom response parsers.
+
+    Implementations parse model output tokens into structured OpenAI response fields.
+    """
+
+    def parse_response(
+        self, output_ids: List[int]
+    ) -> Union[ParsedResponseFields, ErrorResponse]:
+        """Parse complete response from output token IDs."""
+        ...
+
+    def build_streaming_sse_chunks(
+        self,
+        output_ids: List[int],
+        index: int,
+        chunk_id: str,
+        model: str,
+        usage: Optional[Dict],
+    ) -> Tuple[List[str], bool, Optional[str]]:
+        """Parse streaming tokens and build SSE chunks.
+
+        Returns: (sse_chunks, has_tool_calls, error_message)
+        """
+        ...
+
+
+class PDRoutingFields(BaseModel):
+    """PD and DP routing fields a router may inject into a request."""
+
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing -- external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    def pd_routing_kwargs(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
+
+
+class SpecTokensDetails(BaseModel):
+    """Per-request speculative decoding statistics."""
+
+    spec_accept_rate: float = 0.0
+    spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
+    spec_num_correct_drafts: int = 0
+    spec_num_proposed_drafts: int = 0
+    spec_verify_ct: int = 0
+    spec_correct_drafts_histogram: List[int] = Field(default_factory=list)
+    spec_cap_lens_histogram: List[int] = Field(default_factory=list)
+
+
+class ChatCompletionMessageContentThinkingPart(BaseModel):
+    type: Literal["thinking", "reasoning"]
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (self.thinking is None) == (self.text is None):
+            raise ValueError(
+                "thinking parts require exactly one of 'thinking' or 'text'"
+            )
+        return self
+
+
+class ChatCompletionMessageContentInputAudio(BaseModel):
+    data: str
+    format: Literal["wav", "mp3"]
+
+
+class ChatCompletionMessageContentAudioURLPart(BaseModel):
+    type: Literal["audio_url"]
+    audio_url: ChatCompletionMessageContentAudioURL
+
+
+class ChatCompletionMessageContentAudioInlinePart(BaseModel):
+    type: Literal["input_audio"]
+    input_audio: ChatCompletionMessageContentInputAudio
+
+
+def _to_audio_url_part(
+    part: Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+) -> ChatCompletionMessageContentAudioURLPart:
+    if isinstance(part, ChatCompletionMessageContentAudioURLPart):
+        return part
+
+    audio = part.input_audio
+    return ChatCompletionMessageContentAudioURLPart(
+        type="audio_url",
+        audio_url=ChatCompletionMessageContentAudioURL(
+            url=f"data:{_AUDIO_FORMAT_TO_MIME_TYPE[audio.format]};base64,{audio.data}"
+        ),
+    )
+
+
+class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
+    # GLM-specific extension used alongside `defer_loading` tools. The chat
+    # template looks up `tools[*].function.name == tr.name` and renders the
+    # referenced tool schemas inline for the current turn. Not part of any
+    # OpenAI API; included here so Pydantic accepts the content through the
+    # Chat Completions path (the Anthropic endpoint translates its
+    # `tool_name` field to `name` before forwarding).
+    type: Literal["tool_reference"]
+    name: str
+
+
+def _has_message_level_tools(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and isinstance(message.get("role"), str)
+        and message["role"].lower() in ("system", "developer")
+        and bool(message.get("tools"))
+        for message in messages
+    )
+
+
+def is_blank_decision_text(value) -> bool:
+    return not (value.strip() if isinstance(value, str) else value)
+
+
+def _nonblank_decision_text(value):
+    if is_blank_decision_text(value):
+        raise ValueError("must not be blank")
+    return value
+
+
+def check_option_names(names) -> None:
+    """Refuse option names that would make the rendered option lines ambiguous."""
+    seen = set()
+    for name in names:
+        key = name.strip().casefold()
+        if not key:
+            raise ValueError("option names must be nonempty")
+        # Each option is rendered as one prompt line.
+        if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in name):
+            raise ValueError(
+                f"option name {name!r} must not contain control or line break "
+                "characters"
+            )
+        if key in seen:
+            raise ValueError(f"option name {name!r} repeats another option")
+        seen.add(key)
+
+
+def _to_image_url(
+    image: Union[ChatCompletionMessageContentImageURL, str],
+) -> ChatCompletionMessageContentImageURL:
+    if isinstance(image, str):
+        return ChatCompletionMessageContentImageURL(url=image)
+    return image
+
+
+class DecisionOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: Optional[DecisionText] = None
+
+
+class DecisionChoiceQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["choice"]
+    question: RequiredDecisionText
+    # Options are labeled A to Z in order, so at most 26.
+    options: List[DecisionOption] = Field(min_length=2, max_length=26)
+
+    @model_validator(mode="after")
+    def _option_names_distinct(self):
+        try:
+            check_option_names(option.name for option in self.options)
+        except ValueError as e:
+            raise ValueError(f"question {self.id!r}: {e}") from None
+        return self
+
+
+class DecisionScoreQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["score"]
+    question: RequiredDecisionText
+    # Levels are labeled 0 to 9 in order, so at most 10.
+    levels: List[RequiredDecisionText] = Field(min_length=2, max_length=10)
+
+
+class DecisionYesNoQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["yes_no"]
+    question: RequiredDecisionText
+    yes: Optional[DecisionText] = None
+    no: Optional[DecisionText] = None
+
+
+class DecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: RequiredDecisionText
+    images: List[DecisionImage] = Field(default_factory=list)
+    questions: List[DecisionQuestion] = Field(min_length=1)
+    # Scales option probabilities only, not label_mass.
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    # Applied over the server defaults, with the template reasoning toggle off.
+    chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    # Pins the server-owned prompt wording. A different served version is refused.
+    prompt_format_version: Optional[int] = None
+    return_prompt_token_ids: bool = False
+    model: str = DEFAULT_MODEL_NAME
+
+    @field_validator("questions")
+    @classmethod
+    def _question_ids_distinct(cls, questions):
+        seen = set()
+        for question in questions:
+            if question.id in seen:
+                raise ValueError(
+                    f"question id {question.id!r} repeats another question"
+                )
+            seen.add(question.id)
+        return questions
+
+
+class DecisionAnswer(BaseModel):
+    type: Literal["choice", "score", "yes_no"]
+    probabilities: Dict[str, float]
+    # Full-vocabulary probability of all answer labels at the answer position.
+    label_mass: float
+    choice: Optional[str] = None
+    score: Optional[float] = None
+    # The exact /v1/score inputs, with return_prompt_token_ids.
+    prompt_token_ids: Optional[List[int]] = None
+    label_token_ids: Optional[List[int]] = None
+
+
+class DecisionResponse(BaseModel):
+    object: str = "decisions"
+    model: str
+    prompt_format_version: int
+    answers: Dict[str, DecisionAnswer]
+    usage: UsageInfo
+
+
+class ResponseInputMessageParam(EasyInputMessageParam, total=False):
+    phase: Optional[Literal["commentary", "final_answer"]]
+
+
+class ResponseOutputMessage(OpenAIResponseOutputMessage):
+    phase: Optional[Literal["commentary", "final_answer"]] = None
+
+
+class TranscriptionSegment(BaseModel):
+    """A segment with timestamp information."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseResponse(BaseModel):
+    """Verbose transcription response with timestamps (OpenAI-compatible)."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: List[TranscriptionSegment] = []
+    usage: Optional[TranscriptionUsage] = None

@@ -43,3 +43,28 @@ def start_disagg_service(
                 raise error_message
 
         return bootstrap_server
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
+    """Also called directly by the rust-server scheduler: there the KV
+    bootstrap registry is served by the embedded rust server's api listener
+    (one rust implementation covers every transfer backend — their
+    bootstrap-server subclasses are all plain ``CommonKVBootstrapServer``,
+    which the rust registry ports verbatim), leaving this store as the only
+    ``start_disagg_service`` duty left to perform."""
+    if not (
+        get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
+    ):
+        return
+    try:
+        from memfabric_hybrid import create_config_store
+
+        ascend_url = os.getenv("ASCEND_MF_STORE_URL")
+        create_config_store(ascend_url)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed create mf store, invalid ascend_url. With exception {e}"
+        )

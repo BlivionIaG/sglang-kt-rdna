@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
+import types
 
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 

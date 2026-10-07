@@ -352,3 +352,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
             end="</｜DSML｜invoke>",
             trigger=f"<｜DSML｜invoke",
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")

@@ -239,3 +239,13 @@ class KimiK2Detector(BaseFormatDetector):
             )
 
         return get_info
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _strip_special_tokens(text: str) -> str:
+    """Remove all Kimi-K2 tool-call special tokens from text."""
+    for token in _KIMI_K2_SPECIAL_TOKENS:
+        text = text.replace(token, "")
+    return text

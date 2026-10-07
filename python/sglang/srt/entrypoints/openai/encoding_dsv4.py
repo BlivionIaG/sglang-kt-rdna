@@ -870,3 +870,16 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
         "reasoning_content": reasoning_content,
         "tool_calls": tool_calls_to_openai_format(tool_calls),
     }
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) -> None:
+    """Set `task` on the most recent user/developer message; raise if none exists."""
+    idx = find_last_user_index(messages)
+    if idx == -1:
+        raise ValueError(
+            "`task` requires at least one message with role='user' or 'developer'."
+        )
+    messages[idx]["task"] = task

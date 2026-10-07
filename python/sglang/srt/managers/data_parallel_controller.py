@@ -603,3 +603,68 @@ def run_data_parallel_controller_process(
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def run_data_parallel_controller_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    pipe_writer,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+):
+    setproctitle.setproctitle("sglang::data_parallel_controller")
+    faulthandler.enable()
+    kill_itself_when_parent_died()
+    parent_process = psutil.Process().parent()
+
+    # This process reads the config namespaces before spawning schedulers.
+    publish(server_args, role="dp_controller")
+    configure_logger(server_args)
+    if get_observability().enable_trace:
+        process_tracing_init(
+            get_observability().otlp_traces_endpoint,
+            get_observability().otlp_service_name,
+            trace_modules=get_observability().trace_modules,
+        )
+        thread_label = "DP Controller"
+        if get_disagg().disaggregation_mode == "prefill":
+            thread_label = "Prefill DP Controller"
+        elif get_disagg().disaggregation_mode == "decode":
+            thread_label = "Decode DP Controller"
+        trace_set_thread_info(thread_label)
+
+    try:
+        controller = DataParallelController(
+            server_args, port_args, run_scheduler_process_func
+        )
+        scheduler_pids = [
+            proc.pid for proc in controller.scheduler_procs if proc is not None
+        ]
+        init_info = {
+            "status": "ready",
+            "max_total_num_tokens": controller.max_total_num_tokens,
+            "max_req_input_len": controller.max_req_input_len,
+            "startup_time": controller.startup_time,
+            SCHEDULER_PIDS_ARG: scheduler_pids,
+        }
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            init_info["kv_event_sources"] = sorted(
+                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
+            )
+        pipe_writer.send(init_info)
+        # The primary owns routing for the expanded scheduler set.
+        if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+            controller.event_loop()
+        for proc in controller.scheduler_procs:
+            proc.join()
+            logger.error(
+                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+            )
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"DataParallelController hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)

@@ -173,3 +173,13 @@ class DemoToolServer(ToolServer):
     @asynccontextmanager
     async def get_tool_session(self, tool_name: str):
         yield self.tools[tool_name]
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class NativeToolServer(DemoToolServer):
+    """Built-in SGLang hosted tools that do not require an external MCP server."""
+
+    def __init__(self):
+        super().__init__(enable_python=False)

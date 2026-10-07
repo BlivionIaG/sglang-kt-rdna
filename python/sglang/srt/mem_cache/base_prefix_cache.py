@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+import types
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req

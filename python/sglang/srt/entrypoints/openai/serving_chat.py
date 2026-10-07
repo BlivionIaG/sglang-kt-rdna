@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from enum import Enum
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -1567,3 +1568,122 @@ class OpenAIServingChat(OpenAIServingBase):
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class ThinkingMode(str, Enum):
+    """Mode for message encoding - chat vs thinking/reasoning."""
+
+    CHAT = "chat"
+    THINKING = "thinking"
+
+
+def normalize_tool_content(role: str, content):
+    """Normalize tool message content from OpenAI array format to plain string.
+
+    OpenAI clients may send tool content as a list of content parts
+    (e.g. [{"type":"text","text":"..."}]) but most chat templates expect
+    a plain string for tool messages. Only flatten when ALL items are
+    pure OpenAI text parts; preserve lists containing non-text-type items
+    that some templates intentionally iterate over.
+    """
+    if role != "tool" or not isinstance(content, list):
+        return content
+    parts = content
+    is_openai_text_parts = all(
+        (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
+        for p in parts
+    )
+    if is_openai_text_parts:
+        text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
+        return " ".join(text_parts)
+    return content
+
+
+def parse_tool_call_arguments(arguments: str) -> dict[str, Any]:
+    """Parse OpenAI tool call arguments for chat templates."""
+    try:
+        parsed_arguments = orjson.loads(arguments)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError(
+            "Assistant tool call function.arguments must be valid JSON."
+        ) from exc
+
+    if not isinstance(parsed_arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
+
+    return parsed_arguments
+
+
+def normalize_assistant_tool_call_arguments(
+    message: dict[str, Any], *, strict: bool = True
+) -> None:
+    """Normalize assistant history tool call arguments in-place."""
+    if message.get("role") != "assistant" or not isinstance(
+        message.get("tool_calls"), list
+    ):
+        return
+
+    for item in message["tool_calls"]:
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict):
+            continue
+        if "arguments" in function and isinstance(function["arguments"], str):
+            try:
+                function["arguments"] = parse_tool_call_arguments(function["arguments"])
+            except ValueError:
+                if strict:
+                    raise
+
+
+def neutralize_kimi_k3_image_placeholder(text: str) -> str:
+    return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
+
+
+def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return neutralize_kimi_k3_image_placeholder(value)
+    if isinstance(value, list):
+        return [neutralize_kimi_k3_image_placeholder_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: neutralize_kimi_k3_image_placeholder_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _extract_video_question(request: ChatCompletionRequest) -> str | None:
+    """Return text paired with a video in the last user turn."""
+    for message in reversed(request.messages or []):
+        if not isinstance(message, ChatCompletionMessageUserParam):
+            continue
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        has_video = any(
+            isinstance(part, ChatCompletionMessageContentVideoPart) for part in content
+        )
+        if not has_video:
+            continue
+        return "".join(
+            part.text
+            for part in content
+            if isinstance(part, ChatCompletionMessageContentTextPart)
+        )
+    return None
+
+
+def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None:
+    """Build request-scoped video processor config without model-specific fields."""
+    config = dict(request.video_config or {})
+    question = _extract_video_question(request)
+    if question is not None:
+        # Internal metadata derived from the message must not be overridden by
+        # a model-specific public processor option.
+        config["_question"] = question
+    return config or None

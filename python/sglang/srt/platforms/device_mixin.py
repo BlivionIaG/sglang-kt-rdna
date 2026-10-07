@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+import types
 
 
 class PlatformEnum(enum.Enum):

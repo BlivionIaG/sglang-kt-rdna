@@ -105,3 +105,187 @@ def resolve_dsv4_reasoning_effort_profile(
         )
         or "preview"
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
+    """Check model_type before matching the DeepseekV4 architecture substring;
+    V4.1 configs can also use the V4 architecture name.
+    """
+    return model_type == "deepseek_v41" or "DeepseekV41" in arch
+
+
+def resolve_chat_encoding_spec(
+    *,
+    hf_config: Any,
+    tokenizer: Any,
+    tool_call_parser: Optional[str] = None,
+) -> Optional[str]:
+    """Return the chat encoding spec for a model.
+
+    None means the default path (HF chat template); any non-None spec also owns
+    reasoning-history rendering (:func:`spec_owns_reasoning_history`).
+    """
+    if tool_call_parser == "deepseekv41":
+        return "dsv41"
+    if tool_call_parser == "deepseekv4":
+        return "dsv4"
+    if tool_call_parser == "deepseekv32":
+        return "dsv32"
+    if tool_call_parser == "kimi_k3":
+        return "kimi_k3"
+
+    architectures = hf_config.architectures
+    arch = architectures[0] if architectures else ""
+
+    if is_deepseek_v41_arch(arch=arch, model_type=hf_config.model_type):
+        return "dsv41"
+    if "DeepseekV4" in arch:
+        return "dsv4"
+    if "KimiK3" in arch:
+        return "kimi_k3"
+
+    # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
+    # overlay + negative MM placeholders, so it can't go through apply_chat_template;
+    # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
+    if "InklingForConditionalGeneration" in arch:
+        return "inkling"
+
+    has_chat_template = tokenizer is not None and tokenizer.chat_template is not None
+    if "DeepseekV3" in arch and not has_chat_template:
+        return "dsv32"
+    return None
+
+
+def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
+    """Map an API ``reasoning_effort`` onto what the V4.1 encoder accepts.
+
+    An int budget only reaches here through ``chat_template_kwargs``; None
+    means unsupported, and the caller applies its default.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 100 else None
+    if isinstance(value, float):
+        return max(1, round(value * 100)) if 0.0 <= value <= 0.99 else None
+    if value in encoding_dsv41.REASONING_EFFORT_MAPPINGS:
+        return value
+    return None
+
+
+def dsv41_tool_payload(tool: Any) -> Dict[str, Any]:
+    """The tool dict the V4.1 encoder renders verbatim into the prompt.
+
+    Only fields the client sent, in the OpenAI field order; pydantic would
+    otherwise add defaults (strict=false) and reorder keys by declaration.
+    """
+    payload = tool.model_dump(exclude_unset=True, exclude_none=True)
+    function = dict(payload.get("function") or {})
+    ordered = {
+        k: function.pop(k) for k in _OPENAI_FUNCTION_FIELD_ORDER if k in function
+    }
+    ordered.update(function)
+    payload["function"] = ordered
+    return payload
+
+
+def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, int]:
+    """Parse ``SGLANG_DSV41_REASONING_EFFORT``; raises so a bad value fails at boot."""
+    if raw is None or not raw.strip():
+        return encoding_dsv41.DEFAULT_REASONING_EFFORT
+    value: Any = int(raw) if raw.strip().isdigit() else raw.strip()
+    effort = parse_dsv41_reasoning_effort(value)
+    if effort is None:
+        raise ValueError(
+            f"Invalid SGLANG_DSV41_REASONING_EFFORT={raw!r}; expected one of "
+            f"{list(encoding_dsv41.REASONING_EFFORT_MAPPINGS)} or an integer in [1, 100]"
+        )
+    return effort
+
+
+def spec_supports_inline_system(spec: Optional[str]) -> bool:
+    """Native encoders verified to render mid-conversation system messages in place."""
+    # K3's tokenizer renders in Python, so there is no Jinja source to probe.
+    return spec == "kimi_k3"
+
+
+def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
+    """Whether the encoder for ``spec`` renders assistant reasoning history itself.
+
+    Custom encoders frame the reasoning and content channels, so history must be
+    passed as assistant ``reasoning_content``. Splicing a detector's markers into
+    content instead nests a reasoning block inside the content channel and leaves
+    the real one empty, teaching the model to emit raw markers as visible text.
+
+    Answered for the whole family rather than a list of specs, so a new spec gets
+    the safe default: worst case is dropped history, not a leak.
+    """
+    return spec is not None
+
+
+def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
+    """Whether the encoder for ``spec`` returns pre-tokenized prompt ids.
+
+    Token-first encoders leave the text prompt empty; the MM processor
+    expands their single placeholder ids rather than re-tokenizing text.
+    """
+    return spec in ("inkling", "kimi_k3", "dsv41")
+
+
+def encode_simple_chat(
+    *,
+    tokenizer: Any,
+    spec: Optional[str],
+    messages: List[Dict[str, Any]],
+    thinking_mode: str = "chat",
+) -> List[int]:
+    """Encode a plain-text chat conversation into prompt token ids.
+
+    Minimal encode for offline tools: no tools, no multimodal content, no
+    continue_final_message; the serving path keeps its full request-level
+    pipeline in ``serving_chat``. System-message handling matches
+    ``serving_chat``: dsv4/dsv32 get an empty one prepended, dsv41 does not
+    (it renders a system token even for empty content).
+    """
+    if spec == "inkling":
+        from sglang.srt.parser.inkling_renderer import render_inkling_messages
+        from sglang.srt.parser.inkling_tokenizer import InklingTokenizer
+
+        return render_inkling_messages(
+            messages,
+            InklingTokenizer(tokenizer=tokenizer),
+            add_generation_prompt=False,
+        )
+
+    if spec in ("dsv4", "dsv32", "dsv41"):
+        if spec != "dsv41" and messages and messages[0]["role"] != "system":
+            messages = [{"role": "system", "content": ""}] + list(messages)
+        if spec == "dsv4":
+            from sglang.srt.entrypoints.openai import encoding_dsv4
+
+            real_input = encoding_dsv4.encode_messages(
+                messages, thinking_mode=thinking_mode
+            )
+        elif spec == "dsv41":
+            real_input = encoding_dsv41.encode_messages(
+                messages, thinking_mode=thinking_mode
+            )
+        else:
+            from sglang.srt.entrypoints.openai import encoding_dsv32
+
+            real_input = encoding_dsv32.encode_messages(
+                messages, thinking_mode=thinking_mode
+            )
+        return tokenizer.encode(real_input)
+
+    if getattr(tokenizer, "chat_template", None) is None:
+        raise ValueError(
+            "This model has no HF chat template and no custom chat encoder; "
+            f"cannot encode chat messages with {getattr(tokenizer, 'name_or_path', tokenizer)!r}."
+        )
+    return tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True
+    )

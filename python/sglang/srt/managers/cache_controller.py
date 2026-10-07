@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -1040,3 +1041,43 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def storage_model_name(
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
+) -> Optional[str]:
+    """The model name storage backends key pages on, tagged with the host
+    pool's page format when it has one of its own."""
+    tag = host_pool.storage_format_tag
+    if tag is None:
+        return model_name
+    return f"{model_name}-{tag}" if model_name else tag
+
+
+@dataclass
+class PrefetchAck:
+    """ACK for prefetch operation.
+
+    A sequence of PrefetchAck is sent to the scheduler thread via ack_prefetch_queue,
+    indicating progress or completion of the prefetch operation.
+
+    For example, a prefetch operation may results into the following sequence of PrefetchAck:
+
+    1. PrefetchAck(completed_tokens = 128)
+    2. PrefetchAck(completed_tokens = 256)
+    3. PrefetchAck(pool_hits={INDEXER: 256})
+    4. PrefetchAck(completed_req = True)
+
+    The last PrefetchAck always specifies completed_req = True.
+    """
+
+    rid: str
+    operation: PrefetchOperation
+    # Number of hits in KV pool.
+    completed_tokens: Optional[int] = None
+    # Number of hits in extra pools.
+    pool_hits: Optional[dict[str, int]] = None
+    completed_req: Optional[bool] = None

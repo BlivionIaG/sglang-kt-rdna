@@ -53,3 +53,36 @@ def get_mm_processor(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def get_mm_processor_cls(hf_config, model_config=None):
+    """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
+    architecture has no registered processor."""
+    model_impl = str(get_model().model_impl).lower()
+    uses_transformers_backend = model_impl == "transformers"
+    if model_impl == "auto" and model_config is not None:
+        from sglang.srt.model_loader.utils import get_resolved_model_impl
+
+        uses_transformers_backend = (
+            get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
+        )
+
+    for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+        if model_cls.__name__ not in hf_config.architectures:
+            continue
+        if not uses_transformers_backend or getattr(
+            processor_cls, "supports_transformers_backend", False
+        ):
+            return processor_cls
+
+    if uses_transformers_backend:
+        from sglang.srt.multimodal.processors.transformers_auto import (
+            TransformersAutoMultimodalProcessor,
+        )
+
+        return TransformersAutoMultimodalProcessor
+
+    return None

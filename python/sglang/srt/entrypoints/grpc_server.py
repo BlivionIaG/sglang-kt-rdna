@@ -1206,3 +1206,122 @@ def _wait_and_warmup_grpc(
         health_servicer.set_serving()
 
     logger.info("The server is fired up and ready to roll!")
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _add_metrics_routes(app):
+    """Add Prometheus /metrics endpoint to the aiohttp app."""
+    from prometheus_client import (
+        CollectorRegistry,
+        multiprocess,
+    )
+    from prometheus_client.openmetrics.exposition import (
+        CONTENT_TYPE_LATEST,
+        generate_latest,
+    )
+
+    async def metrics_handler(request):
+        try:
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry)
+            data = generate_latest(registry)
+            return web.Response(
+                body=data,
+                headers={"Content-Type": CONTENT_TYPE_LATEST},
+            )
+        except Exception:
+            logger.exception("Failed to generate Prometheus metrics")
+            return web.Response(status=500, text="Failed to generate metrics")
+
+    app.router.add_get("/metrics", metrics_handler)
+
+
+def _check_communicator_results(results, action):
+    """Return a web.Response error if results indicate failure, else None."""
+    if not results:
+        return web.Response(status=500, text="No response from scheduler\n")
+    failures = [r for r in results if not r.success]
+    if failures:
+        msgs = " | ".join(r.message for r in failures)
+        return web.Response(status=500, text=f"{action} failed: {msgs}\n")
+    return None
+
+
+def _add_admin_routes(app, request_manager):
+    """Add admin endpoints to the aiohttp app.
+
+    Endpoints: /start_profile, /stop_profile.
+    Business logic (request construction, env var handling, response interpretation)
+    lives here; request_manager only provides the transport to the scheduler.
+    """
+
+    async def start_profile_handler(request):
+        try:
+            if request.content_length and request.content_length > 0:
+                try:
+                    body = await request.json()
+                except json.JSONDecodeError as e:
+                    return web.Response(
+                        status=400,
+                        text=f"Invalid JSON in request body: {e}",
+                    )
+            else:
+                body = {}
+
+            # Build ProfileReq with env var overrides (same as tokenizer_communicator_mixin)
+            with_stack = body.get("with_stack")
+            env_with_stack = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
+            with_stack = (with_stack is not False) and env_with_stack
+            record_shapes = body.get("record_shapes")
+            env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "true")
+            record_shapes = (record_shapes is not False) and env_record_shapes
+
+            req = ProfileReq(
+                req_type=ProfileReqType.START_PROFILE,
+                output_dir=body.get("output_dir"),
+                start_step=body.get("start_step"),
+                num_steps=body.get("num_steps"),
+                activities=body.get("activities"),
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+                profile_by_stage=body.get("profile_by_stage", False),
+                profile_id=str(time.time()),
+                merge_profiles=body.get("merge_profiles", False),
+                profile_prefix=body.get("profile_prefix"),
+                profile_stages=body.get("profile_stages"),
+            )
+            results = await request_manager.send_communicator_req(
+                req, "profile_communicator", timeout=600.0
+            )
+            err = _check_communicator_results(results, "Start Profile")
+            if err:
+                return err
+            return web.Response(text="Start profiling.\n")
+        except Exception as e:
+            logger.exception("Failed to start profile")
+            return web.Response(
+                status=500,
+                text=f"Internal error: {type(e).__name__}. Check server logs.\n",
+            )
+
+    async def stop_profile_handler(request):
+        try:
+            req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
+            results = await request_manager.send_communicator_req(
+                req, "profile_communicator", timeout=600.0
+            )
+            err = _check_communicator_results(results, "Stop profile")
+            if err:
+                return err
+            return web.Response(text="Stop profiling. This will take some time.\n")
+        except Exception as e:
+            logger.exception("Failed to stop profile")
+            return web.Response(
+                status=500,
+                text=f"Internal error: {type(e).__name__}. Check server logs.\n",
+            )
+
+    app.router.add_post("/start_profile", start_profile_handler)
+    app.router.add_post("/stop_profile", stop_profile_handler)

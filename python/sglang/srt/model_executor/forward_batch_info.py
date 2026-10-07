@@ -60,6 +60,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
+import hashlib
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend

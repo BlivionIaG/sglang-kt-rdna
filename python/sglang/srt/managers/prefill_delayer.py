@@ -254,3 +254,33 @@ def _record_single_pass_result(
             output_reason=output.output_reason,
             actual_execution=actual_execution,
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class RecentPrefillBatchSizeTracker:
+    """Track the largest of the latest non-empty prefill attempts.
+
+    The default window keeps 16 attempts. Successful admissions use their
+    actual batch size; rejected attempts use a conservative local estimate.
+    Decode-only and idle scheduler passes do not age the high-watermark.
+    """
+
+    def __init__(self, window_size: int = 16):
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size}")
+        self._recent_attempt_sizes = deque(maxlen=window_size)
+
+    @property
+    def max_prefill_bs(self) -> int:
+        return max(self._recent_attempt_sizes, default=0)
+
+    def observe_attempt(self, attempted_prefill_bs: int) -> int:
+        if attempted_prefill_bs <= 0:
+            raise ValueError(
+                "attempted_prefill_bs must be positive for a non-empty attempt, "
+                f"got {attempted_prefill_bs}"
+            )
+        self._recent_attempt_sizes.append(attempted_prefill_bs)
+        return self.max_prefill_bs

@@ -56,3 +56,17 @@ __all__ = [
     "create_remote_connector",
     "get_connector_type",
 ]
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _is_azure_blob_url(url: str, connector_type: str) -> bool:
+    """Detect Azure Blob Storage URLs.
+
+    Matches ``az://...`` URLs and ``https://<account>.blob.core.windows.net/...``
+    URLs, which are the two forms accepted by the ``blobfile`` library.
+    """
+    if connector_type == "az":
+        return True
+    return connector_type == "https" and ".blob.core.windows.net" in url

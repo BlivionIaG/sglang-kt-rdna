@@ -518,3 +518,111 @@ class SenderWrapper:
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(obj)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class MultiDetokenizerRouter:
+    """Route scheduler outputs to one of N DetokenizerManager workers.
+
+    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
+    ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
+    always land on the same detokenizer and ``decode_status`` stays consistent.
+    """
+
+    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+        self.ipc_name_list = ipc_name_list
+        self.num_workers = len(ipc_name_list)
+        self.socket_mapping = SocketMapping()
+        context = zmq.Context(2)
+        self.recv_from_scheduler = get_zmq_socket(
+            context, zmq.PULL, port_args.detokenizer_ipc_name, True
+        )
+
+    def _pick(self, key: str) -> str:
+        return self.ipc_name_list[zlib.crc32(key.encode()) % self.num_workers]
+
+    def _send(self, ipc_name: str, obj: Any) -> None:
+        self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
+
+    def event_loop(self):
+        while True:
+            recv_obj = sock_recv(self.recv_from_scheduler)
+
+            # FreezeGCReq must freeze every detokenizer process.
+            if isinstance(recv_obj, FreezeGCReq):
+                for ipc in self.ipc_name_list:
+                    self._send(ipc, recv_obj)
+                continue
+
+            # Single request: route by its own http_worker_ipc.
+            if isinstance(recv_obj, BaseReq):
+                assert recv_obj.http_worker_ipc is not None, (
+                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                )
+                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                continue
+
+            # Batch request.
+            if isinstance(recv_obj, BaseBatchReq):
+                # Idle/no-op batch (rids=[]): broadcast to all detokenizers
+                if not recv_obj.rids:
+                    for ipc in self.ipc_name_list:
+                        self._send(ipc, recv_obj)
+                    continue
+
+                ipcs = recv_obj.http_worker_ipcs
+                assert (
+                    ipcs is not None
+                    and len(ipcs) == len(recv_obj.rids)
+                    and all(x is not None for x in ipcs)
+                ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+
+                # Split per-item and route each by its own ipc.
+                for i, ipc_key in enumerate(ipcs):
+                    one = _handle_output_by_index(recv_obj, i)
+                    if one is recv_obj:
+                        raise TypeError(f"Cannot split {type(recv_obj)}")
+                    one.http_worker_ipcs = [ipc_key]
+                    self._send(self._pick(ipc_key), one)
+                continue
+
+            raise ValueError(
+                f"MultiDetokenizerRouter got unsupported type {type(recv_obj)}"
+            )
+
+
+def run_multi_detokenizer_router_process(
+    ipc_name_list: List[str],
+    server_args: ServerArgs,
+    port_args: PortArgs,
+):
+    kill_itself_when_parent_died()
+    setproctitle.setproctitle("sglang::detokenizer_router")
+    configure_logger(server_args)
+    parent_process = psutil.Process().parent()
+
+    router = None
+    try:
+        router = MultiDetokenizerRouter(ipc_name_list, port_args)
+        router.event_loop()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
+        if router is not None:
+            router.socket_mapping.clear_all_sockets()
+        parent_process.send_signal(signal.SIGQUIT)
+
+
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerWorker
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
+            f"subclass, got {worker_class!r}"
+        )
+
+    return worker_class

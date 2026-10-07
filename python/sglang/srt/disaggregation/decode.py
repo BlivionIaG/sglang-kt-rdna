@@ -67,6 +67,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+import hashlib
 
 logger = logging.getLogger(__name__)
 

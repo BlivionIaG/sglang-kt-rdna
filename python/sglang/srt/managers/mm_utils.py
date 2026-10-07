@@ -1603,3 +1603,368 @@ def unwrap_shm_features(obj):
             if isinstance(item.feature, ShmPointerMMData):
                 item.feature = item.feature.tensor
     return obj
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def duplicate_pad_mm_input_ids(
+    input_ids: array,
+    mm_inputs: MultimodalInputs,
+    pad_input_ids_func: Callable[[array, MultimodalInputs], array],
+) -> array:
+    """Validate and duplicate model-padded tokens for scheduler ownership."""
+    padded_ids = pad_input_ids_func(input_ids, mm_inputs)
+    assert_int64_array(padded_ids, "pad_input_ids result")
+    # Preserve scheduler ownership: no-op models return the unpadded input,
+    # and other models can retain the result in multimodal metadata.
+    return padded_ids[:]
+
+
+def _scatter_mm_embedding(
+    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
+) -> None:
+    # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
+    src = src.to(dest.device, dest.dtype)
+    num_src_rows = src.size(0)
+    flat_mask = mask.view(-1)
+    ranks = torch.cumsum(flat_mask, dim=0) - 1
+    # False rows collapse into the discard slot num_src_rows; a mask/src
+    # row-count mismatch device-asserts in scatter_/index_copy_ (poison init).
+    ranks = ranks.masked_fill(~flat_mask, num_src_rows)
+    rows = torch.full(
+        (num_src_rows + 1,), dest.size(0), dtype=torch.long, device=dest.device
+    )
+    rows.scatter_(0, ranks, torch.arange(flat_mask.numel(), device=dest.device))
+    dest.index_copy_(0, rows[:num_src_rows], src)
+
+
+def _embed_mm_inputs_with_split(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    input_embedding: nn.Embedding,
+    multimodal_model: nn.Module = None,
+    data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
+    use_deepstack: Dict[Modality, bool] = {},
+):
+    """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
+    precomputed_req_indices = []
+    non_precomputed_req_indices = []
+    for idx, mm_input in enumerate(mm_inputs_list):
+        items = [item for item in mm_input.mm_items if item is not None]
+        if items and all(
+            getattr(item, "precomputed_embeddings", None) is not None for item in items
+        ):
+            precomputed_req_indices.append(idx)
+        else:
+            non_precomputed_req_indices.append(idx)
+
+    embed_kwargs = dict(
+        multimodal_model=multimodal_model,
+        input_embedding=input_embedding,
+        data_embedding_func_mapping=data_embedding_func_mapping,
+        placeholder_tokens=placeholder_tokens,
+        use_deepstack=use_deepstack,
+    )
+
+    if not precomputed_req_indices or not non_precomputed_req_indices:
+        return embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            **embed_kwargs,
+        )
+
+    all_seq_lens = forward_batch.extend_seq_lens_cpu
+    mm_batch_indices = [
+        i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None
+    ]
+    token_starts = []
+    cumulative = 0
+    for sl in all_seq_lens:
+        token_starts.append(cumulative)
+        cumulative += sl
+
+    vocab_size = input_embedding.num_embeddings
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
+    other_info = {}
+
+    input_deepstack_embeds = None
+    if use_deepstack and multimodal_model is not None:
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+        input_deepstack_embeds = torch.zeros(
+            input_ids.shape[0],
+            input_embedding.embedding_dim * num_deepstack_embeddings,
+            device=input_ids.device,
+            dtype=input_embedding.weight.dtype,
+        )
+        other_info["input_deepstack_embeds"] = input_deepstack_embeds
+
+    for group_req_indices in [precomputed_req_indices, non_precomputed_req_indices]:
+        sub_mm_inputs = [mm_inputs_list[i] for i in group_req_indices]
+        sub_prefix_lens = [extend_prefix_lens[i] for i in group_req_indices]
+        sub_seq_lens = [extend_seq_lens[i] for i in group_req_indices]
+        group_batch_indices = [mm_batch_indices[i] for i in group_req_indices]
+        sub_slices = [
+            input_ids[token_starts[bi] : token_starts[bi] + all_seq_lens[bi]]
+            for bi in group_batch_indices
+        ]
+        sub_input_ids = torch.cat(sub_slices)
+
+        sub_embeds, sub_info = embed_mm_inputs(
+            mm_inputs_list=sub_mm_inputs,
+            extend_prefix_lens=sub_prefix_lens,
+            extend_seq_lens=sub_seq_lens,
+            input_ids=sub_input_ids,
+            **embed_kwargs,
+        )
+
+        offset = 0
+        for bi in group_batch_indices:
+            req_len = all_seq_lens[bi]
+            start = token_starts[bi]
+            input_embeds[start : start + req_len] = sub_embeds[
+                offset : offset + req_len
+            ]
+            if (
+                input_deepstack_embeds is not None
+                and "input_deepstack_embeds" in sub_info
+            ):
+                input_deepstack_embeds[start : start + req_len] = sub_info[
+                    "input_deepstack_embeds"
+                ][offset : offset + req_len]
+            offset += req_len
+
+    return input_embeds, other_info
+
+
+def _is_rank2_grid(value):
+    """True if `value` is a rank-2 grid ([N, dims]) suitable for per-row prod.
+
+    Tensors/arrays must have ndim == 2; nested lists/tuples must have each row
+    be a sequence. Anything flat (1-D / scalars) is rejected so callers fall
+    back to a simple split instead of mis-collapsing it with prod(dim=-1).
+    """
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) > 0 and all(
+            isinstance(row, (list, tuple, torch.Tensor, np.ndarray)) for row in value
+        )
+    return False
+
+
+def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
+    """Compute per-item patch slice boundaries from 'num_patches' metadata.
+
+    Returns (patch_slices, total_num_patches) where patch_slices is a list of
+    (start, end) tuples for each item, or (None, None) if not applicable.
+    This function can be replaced or extended by model-specific plugins that
+    need custom patch-level splitting logic.
+    """
+    num_patches = model_specific_data.get("num_patches")
+    if _get_length(num_patches) != num_items:
+        return None, None
+
+    if isinstance(num_patches, torch.Tensor):
+        patch_counts = [int(x) for x in num_patches.flatten().cpu().tolist()]
+    elif isinstance(num_patches, np.ndarray):
+        patch_counts = [int(x) for x in num_patches.reshape(-1).tolist()]
+    else:
+        patch_counts = [
+            int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+            for x in num_patches
+        ]
+
+    if not all(count >= 0 for count in patch_counts):
+        return None, None
+
+    patch_slices = []
+    patch_start = 0
+    for count in patch_counts:
+        patch_end = patch_start + count
+        patch_slices.append((patch_start, patch_end))
+        patch_start = patch_end
+    return patch_slices, patch_start
+
+
+def _split_model_data_for_item(
+    model_specific_data: dict,
+    index: int,
+    num_items: int,
+    patch_slices,
+    total_num_patches,
+) -> dict:
+    """Split model_specific_data for a single item during simple-split expansion.
+
+    This function encapsulates the per-item splitting logic for model-specific
+    data fields. It handles three categories:
+      1. Patch-aligned fields (dim-0 == total_num_patches): sliced by patch boundaries.
+      2. Item-aligned fields (dim-0 == num_items): sliced by item index.
+      3. Shared/scalar fields: copied as-is.
+
+    To support additional models, extend `_PATCH_ALIGNED_KEYS` or override this
+    function with a model-specific variant.
+    """
+    new_data = {}
+    for k, v in model_specific_data.items():
+        if (
+            k in _PATCH_ALIGNED_KEYS
+            and patch_slices is not None
+            and _get_length(v) == total_num_patches
+        ):
+            patch_start, patch_end = patch_slices[index]
+            new_data[k] = _slice_value(v, patch_start, patch_end)
+        elif isinstance(v, (list, tuple)) and len(v) == num_items:
+            new_data[k] = [v[index]]
+        elif (
+            isinstance(v, (torch.Tensor, np.ndarray))
+            and len(v.shape) > 0
+            and v.shape[0] == num_items
+        ):
+            new_data[k] = v[index : index + 1]
+        else:
+            new_data[k] = v
+    return new_data
+
+
+def _try_simple_split(item, num_items, expanded_mm_items):
+    """Try to split a bundled item by matching feature dim-0 to offset count.
+    Returns True if split succeeded, False otherwise."""
+    feature = item.feature if item.feature is not None else item.precomputed_embeddings
+    if feature is None:
+        return False
+
+    if isinstance(feature, (torch.Tensor, np.ndarray)):
+        feature_count = feature.shape[0]
+    elif isinstance(feature, (list, tuple)):
+        feature_count = len(feature)
+    else:
+        return False
+
+    if feature_count != num_items:
+        return False
+
+    patch_slices, total_num_patches = _compute_patch_slices(
+        item.model_specific_data, num_items
+    )
+
+    for i in range(num_items):
+        new_item = copy.copy(item)
+        if item.feature is not None:
+            if isinstance(item.feature, (list, tuple)):
+                new_item.feature = [item.feature[i]]
+            else:
+                new_item.feature = item.feature[i : i + 1]
+        if item.precomputed_embeddings is not None:
+            if isinstance(item.precomputed_embeddings, (list, tuple)):
+                new_item.precomputed_embeddings = [item.precomputed_embeddings[i]]
+            else:
+                new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
+        new_item.offsets = [item.offsets[i]]
+        new_item.model_specific_data = _split_model_data_for_item(
+            item.model_specific_data, i, num_items, patch_slices, total_num_patches
+        )
+        new_item.hash = None
+        expanded_mm_items.append(new_item)
+    return True
+
+
+def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
+    transport when shared memory cannot be allocated, e.g. /dev/shm is full
+    under a burst of multimodal requests."""
+    try:
+        return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+    except OSError as e:
+        print_warning_once(
+            f"Failed to allocate shared memory for multimodal feature transport "
+            f"({e}); falling back to inline transport. "
+            f"Consider increasing /dev/shm size."
+        )
+        return tensor
+
+
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
+
+    ``precomputed_hash`` is only forwarded for the single-tensor case.
+    For list features the item-level hash covers all elements jointly,
+    so per-element hashes are not applicable.
+    """
+    if isinstance(value, torch.Tensor) and value.is_cpu:
+        return _wrap_shm_or_inline(value, precomputed_hash=precomputed_hash)
+    elif isinstance(value, (list, tuple)):
+        wrapped = [
+            (_wrap_shm_or_inline(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            for t in value
+        ]
+        return type(value)(wrapped) if isinstance(value, tuple) else wrapped
+    return value
+
+
+def _feature_has_shm(feat) -> bool:
+    """Check whether a single feature (tensor, ShmPointer, or list) contains ShmPointerMMData."""
+    if isinstance(feat, ShmPointerMMData):
+        return True
+    if isinstance(feat, (list, tuple)):
+        return any(isinstance(t, ShmPointerMMData) for t in feat)
+    return False
+
+
+def has_shm_features(recv_reqs):
+    """Return True if any request in the list contains ShmPointerMMData."""
+    for req in recv_reqs:
+        if isinstance(req, BaseBatchReq):
+            if has_shm_features(req.batch):
+                return True
+        elif isinstance(
+            req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+        ) and isinstance(req.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
+            for item in req.mm_inputs.mm_items:
+                if _feature_has_shm(item.feature):
+                    return True
+                if _feature_has_shm(item.precomputed_embeddings):
+                    return True
+    return False
+
+
+def _discard_tensor_or_list(value) -> None:
+    if isinstance(value, ShmPointerMMData):
+        value.close_and_unlink()
+    elif isinstance(value, (list, tuple)):
+        for tensor in value:
+            if isinstance(tensor, ShmPointerMMData):
+                tensor.close_and_unlink()
+
+
+def discard_shm_features(obj) -> None:
+    """Release SHM features that will not be consumed by this request."""
+    if isinstance(obj, BaseBatchReq):
+        for sub_obj in obj.batch:
+            discard_shm_features(sub_obj)
+        return
+    if not isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+        return
+    if not isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
+        return
+    for item in obj.mm_inputs.mm_items:
+        _discard_tensor_or_list(item.feature)
+        _discard_tensor_or_list(item.precomputed_embeddings)
+
+
+def _unwrap_tensor_or_list(value):
+    """Restore ShmPointerMMData wrappers back into standard torch.Tensors."""
+    if isinstance(value, ShmPointerMMData):
+        return value.materialize()
+    elif isinstance(value, (list, tuple)):
+        unwrapped = [
+            t.materialize() if isinstance(t, ShmPointerMMData) else t for t in value
+        ]
+        return type(value)(unwrapped) if isinstance(value, tuple) else unwrapped
+    return value
