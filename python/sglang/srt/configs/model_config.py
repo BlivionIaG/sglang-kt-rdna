@@ -799,8 +799,18 @@ class ModelConfig:
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
-            # Identify modelopt quantization
-            if "quant_method" not in quant_cfg:
+            # Identify modelopt quantization. A ModelOpt export in config.json
+            # spells `quant_method: "modelopt"` AND carries `quant_algo`, and for
+            # MIXED_PRECISION the quant_algo is what decides which config class
+            # the checkpoint needs (`modelopt_mixed` vs `w4afp8`), so the parser
+            # has to run for that case too -- testing only for a MISSING
+            # quant_method skipped it and left quantization at the default
+            # "modelopt" (=> ModelOptFp8Config), which then rejected the
+            # checkpoint.
+            if (
+                "quant_method" not in quant_cfg
+                or quant_cfg["quant_method"] == "modelopt"
+            ):
                 parsed_cfg = self._parse_modelopt_quant_config(
                     {"quantization": quant_cfg}
                 )
@@ -907,6 +917,23 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
+            # A MIXED_PRECISION export declares a scheme per layer. When any of
+            # them is NVFP4/W4A16_NVFP4 the checkpoint is a ModelOpt mixed
+            # NVFP4+FP8+BF16 export and has to route to
+            # `ModelOptMixedPrecisionConfig` (registered as "modelopt_mixed"),
+            # which dispatches each layer to its own method. W4AFP8 is the other
+            # mixed family and keeps its own method. Without this branch a
+            # mixed-NVFP4 checkpoint fell through to "w4afp8", whose config class
+            # rejects the checkpoint.
+            quantized_layers = json_quant_configs.get("quantized_layers") or {}
+            has_nvfp4_layers = any(
+                str(layer_info.get("quant_algo", "")).upper()
+                in ("NVFP4", "W4A16_NVFP4")
+                for layer_info in quantized_layers.values()
+                if isinstance(layer_info, dict)
+            )
+            if has_nvfp4_layers:
+                return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
             return {"quant_method": "w4afp8"}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4"}
