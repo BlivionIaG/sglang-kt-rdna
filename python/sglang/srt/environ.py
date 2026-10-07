@@ -711,6 +711,13 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+
+    # Host-side PLE gather (added with this fork's qwen4 port). The default Triton gather
+    # reads the offloaded PLE table through a device-side pointer, which requires unified
+    # memory (cudaDevAttrPageableMemoryAccessUsesHostPageTables); on a discrete GPU that
+    # attribute is False, so `--ple-offload-backend file` cannot use it. With this enabled
+    # the same rows are gathered on the CPU and copied over, which works anywhere.
+    SGLANG_QWEN4_PLE_HOST_SIDE_GATHER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

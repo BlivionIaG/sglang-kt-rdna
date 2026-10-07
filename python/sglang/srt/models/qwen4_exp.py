@@ -116,6 +116,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 
 
+# Host-side PLE gather. See `Qwen4ExpPinnedHostEmbedding._gather_host_side`: the default
+# Triton gather dereferences the host table pointer from the GPU, which needs unified
+# memory (cudaDevAttrPageableMemoryAccessUsesHostPageTables). Set this to 1 to gather the
+# same rows on the CPU instead, which works on discrete GPUs and makes the sparse-mmap
+# (`--ple-offload-backend file`) table usable there.
+_PLE_HOST_SIDE_GATHER_ENABLED = envs.SGLANG_QWEN4_PLE_HOST_SIDE_GATHER.get()
+
+
 def _ple_table_is_fp8(
     config: Qwen4ExpTextConfig,
     quant_config: Optional[QuantizationConfig],
@@ -1023,17 +1031,53 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
-                output,
-                embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                BLOCK_D=self._block_d,
-            )
+            if _PLE_HOST_SIDE_GATHER_ENABLED:
+                # Host-side gather: read the rows on the CPU and copy the result over.
+                #
+                # The Triton kernel above dereferences the host table pointer FROM THE GPU,
+                # which requires cudaDevAttrPageableMemoryAccessUsesHostPageTables (unified
+                # memory: GB10 / DGX Spark). On a discrete GPU that attribute is False, so
+                # the file-backed (sparse mmap) backend cannot use that kernel at all.
+                #
+                # This path reads the same rows through the mmap on the host instead. The
+                # traffic is small by construction: 16 rows per token (8 two-gram + 8
+                # three-gram heads) of head_dim_per_ngram values, i.e. ~2.5 KB in fp8 at
+                # 160 B/row. It is a correctness path, not a fast one -- it adds a host
+                # gather plus one H2D copy per call -- but it is what makes the sparse-mmap
+                # PLE table usable on hardware without unified memory.
+                self._gather_host_side(flat_ids, output)
+            else:
+                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    BLOCK_D=self._block_d,
+                )
         return output
+
+    # Set from the environment once at import; see the branch in `gather`.
+    def _gather_host_side(self, flat_ids: torch.Tensor, output: torch.Tensor) -> None:
+        """Gather PLE rows on the host and copy them to `output` (device, bf16).
+
+        Mirrors `_gather_ple_embedding_from_pinned_kernel` exactly, including the
+        out-of-shard masking: rows outside [org_vocab_start_index, org_vocab_end_index)
+        contribute zero.
+        """
+        start = int(self.shard_indices.org_vocab_start_index)
+        end = int(self.shard_indices.org_vocab_end_index)
+        ids = flat_ids.detach().to("cpu", torch.long)
+        in_range = (ids >= start) & (ids < end)
+        local = torch.where(in_range, ids - start, torch.zeros_like(ids))
+
+        # `self.weight` is the host table (pinned or mmap); index it on the host. Clone so
+        # the result is a normal owned tensor rather than a view into shared storage.
+        rows = self.weight.detach()[local].to(torch.bfloat16)
+        rows = torch.where(in_range.view(-1, 1), rows, torch.zeros_like(rows))
+        output.copy_(rows.view(output.shape))
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
