@@ -15,12 +15,16 @@
 
 import dataclasses
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Set, Sequence
 
 import torch
 import triton
 import triton.language as tl
 from torch import nn
+from functools import reduce
+from contextlib import contextmanager
+from enum import IntEnum
+from copy import copy
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -1234,3 +1238,225 @@ def fused_softcap(full_logits, final_logit_softcapping):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class SamplingMaskStatus(IntEnum):
+    """Ordered by severity so distributed MAX reaches one policy decision."""
+
+    OK = 0
+    OVERFLOW = 1
+    INVALID = 2
+
+
+@dataclasses.dataclass
+class SamplingMaskOutput:
+    """Sampling-support IDs and optional full-support behavior logprobs."""
+
+    token_ids: torch.Tensor
+    lengths: torch.Tensor
+    selected_logprobs: torch.Tensor
+    support_logprobs: Optional[torch.Tensor]
+    statuses: torch.Tensor
+    num_accept_tokens: Optional[torch.Tensor] = None
+
+    def map_device_tensors(self, fn) -> None:
+        self.token_ids = fn(self.token_ids)
+        self.lengths = fn(self.lengths)
+        self.selected_logprobs = fn(self.selected_logprobs)
+        if self.support_logprobs is not None:
+            self.support_logprobs = fn(self.support_logprobs)
+        self.statuses = fn(self.statuses)
+        if self.num_accept_tokens is not None:
+            self.num_accept_tokens = fn(self.num_accept_tokens)
+
+
+def _trace_e2e_logits(stage: str, **fields) -> None:
+    if not envs.SGLANG_TRACE_LOGITS_E2E.get():
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_LOGITS_E2E {rank} stage={stage} {details}", flush=True)
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # Some draft models share an unquantized target lm_head tensor while still
+    # carrying the draft model's stale ModelOpt quant_method. Only use the
+    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if method_name == "ModelOptFp4LinearMethod":
+        if quant_method.quant_mode == "w4a16":
+            return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+                lm_head,
+                (
+                    "weight_scale_interleaved",
+                    "alpha",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                ),
+            )
+        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        ):
+            return True
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale_interleaved",
+                "alpha",
+                "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptNvFp4A16LinearMethod":
+        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptFp8LinearMethod":
+        return (
+            lm_head.weight.dtype == torch.float8_e4m3fn
+            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
+
+    return True
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _autotune_run_lm_head is not None
+
+
+@contextmanager
+def autotune_dummy_run_mode(*, run_lm_head: bool):
+    global _autotune_run_lm_head
+    _autotune_run_lm_head = run_lm_head
+    try:
+        yield
+    finally:
+        _autotune_run_lm_head = None
+
+
+def _reassemble_tp_lm_head_all_to_all_output(
+    all_to_all_output: torch.Tensor,
+) -> torch.Tensor:
+    """Convert source-major all-to-all output to row-major full-vocab logits.
+
+    Each source TP rank contributes ``[local_rows, vocab_shard]`` for this
+    destination DP rank. ``all_to_all_single`` concatenates those contributions
+    along dim 0, while the sampler expects the vocab shards concatenated along
+    dim 1.
+    """
+    tp_size = get_parallel().tp_size
+    assert all_to_all_output.shape[0] % tp_size == 0
+    local_rows = all_to_all_output.shape[0] // tp_size
+    vocab_shard = all_to_all_output.shape[1]
+    return (
+        all_to_all_output.view(tp_size, local_rows, vocab_shard)
+        .permute(1, 0, 2)
+        .reshape(local_rows, tp_size * vocab_shard)
+    )
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # Some draft models share an unquantized target lm_head tensor while still
+    # carrying the draft model's stale ModelOpt quant_method. Only use the
+    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if method_name == "ModelOptFp4LinearMethod":
+        if quant_method.quant_mode == "w4a16":
+            return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+                lm_head,
+                (
+                    "weight_scale_interleaved",
+                    "alpha",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                ),
+            )
+        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        ):
+            return True
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale_interleaved",
+                "alpha",
+                "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptNvFp4A16LinearMethod":
+        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptFp8LinearMethod":
+        return (
+            lm_head.weight.dtype == torch.float8_e4m3fn
+            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
+
+    return True

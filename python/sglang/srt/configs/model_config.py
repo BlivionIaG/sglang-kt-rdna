@@ -18,10 +18,13 @@ import math
 import os
 from enum import Enum, IntEnum, auto
 from pathlib import Path
-from typing import Any, List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Union, Callable
 
 import torch
 from transformers import PretrainedConfig
+from functools import lru_cache
+from dataclasses import field
+from copy import copy
 
 from sglang.srt.configs.glm5_next import get_glm5_next_capabilities
 from sglang.srt.environ import envs
@@ -1674,3 +1677,317 @@ def get_dsa_index_kpool(config: PretrainedConfig) -> int:
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_topk
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def register_model_config_factory(
+    server_args_type: type[ServerArgs], factory: Callable[..., "ModelConfig"]
+) -> None:
+    """Register a factory with the same signature as ModelConfig.from_server_args.
+
+    Register before resolution or model construction in each process. The nearest
+    registered type in the argument record's MRO wins, so registrations cover
+    subclasses too. Repeating the same registration is harmless; replacing a
+    different factory for the same type is an error.
+    """
+    if not issubclass(server_args_type, ServerArgs):
+        raise TypeError("model-config factories require a ServerArgs subclass")
+    previous = _MODEL_CONFIG_FACTORIES.get(server_args_type)
+    if previous is not None and previous is not factory:
+        raise ValueError(
+            f"A model-config factory is already registered for {server_args_type.__qualname__}"
+        )
+    _MODEL_CONFIG_FACTORIES[server_args_type] = factory
+
+
+def _quant_config_to_dict(quant_config):
+    if quant_config is not None and not isinstance(quant_config, dict):
+        return quant_config.to_dict()
+    return quant_config
+
+
+def requires_mm_token_modalities(
+    model_architectures: Optional[List[str]], hf_text_config: PretrainedConfig
+) -> bool:
+    """Whether a Bailing multimodal wrapper uses modality-specific routers."""
+    return bool(
+        model_architectures
+        and any(arch in BAILING_MULTI_GATE_MM_ARCHS for arch in model_architectures)
+        and is_bailing_multi_gate_enabled(hf_text_config)
+    )
+
+
+def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
+    quantization = quant_config.get("quantization", quant_config)
+    if not isinstance(quantization, dict):
+        return {}
+    nested = quantization.get("quantization")
+    return nested if isinstance(nested, dict) else quantization
+
+
+def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
+    layout = getattr(hf_config, "attention_projection_layout", None)
+    if layout is None:
+        return None
+    if layout != "fused_qkv":
+        raise ValueError(
+            "MiMoV2 hf_config has unsupported "
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
+            "or unset."
+        )
+
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
+    text_config = getattr(hf_config, "text_config", None)
+    if num_key_value_heads is None and text_config is not None:
+        num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
+    if num_key_value_heads is None:
+        raise ValueError(
+            "MiMoV2 hf_config has attention_projection_layout='fused_qkv' "
+            "but num_key_value_heads is missing; this value is required to "
+            "derive the fused qkv_proj TP size."
+        )
+    return num_key_value_heads
+
+
+def _hf_arch(config) -> Optional[str]:
+    """First architecture from a HF config dict or PretrainedConfig (or None)."""
+    archs = (
+        config.get("architectures")
+        if isinstance(config, dict)
+        else getattr(config, "architectures", None)
+    )
+    return archs[0] if archs else None
+
+
+def _hf_attr(config, name):
+    """Read an arbitrary field from a HF config dict or PretrainedConfig."""
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def is_glm_moe_dsa(config) -> bool:
+    """True for GLM-5.2, both the main arch and the NextN draft head."""
+    return _hf_arch(config) in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    )
+
+
+def is_kimi_k3(config) -> bool:
+    return _hf_arch(config) in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
+
+
+def uses_kda_attention(config) -> bool:
+    configs = [config]
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        configs.append(get_text_config())
+    else:
+        text_config = _hf_attr(config, "text_config")
+        if text_config is not None:
+            configs.append(text_config)
+    for config in configs:
+        linear_attn_config = _hf_attr(config, "linear_attn_config")
+        if isinstance(linear_attn_config, dict) and linear_attn_config.get(
+            "kda_layers"
+        ):
+            return True
+        layer_types = _hf_attr(config, "layer_types") or []
+        if (
+            "linear_attention" in layer_types
+            and _hf_attr(config, "linear_num_heads") is not None
+            and _hf_attr(config, "linear_head_dim") is not None
+        ):
+            return True
+    return False
+
+
+def is_dspark_draft(config) -> bool:
+    return _hf_arch(config) == "DSparkDraftModel"
+
+
+@lru_cache
+def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """decision_config.json of a checkpoint whose LM head is a decision readout."""
+    path = cached_file(
+        model_path,
+        "decision_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+    )
+    if path is None:
+        return None
+    with open(path) as f:
+        config = json.load(f)
+    if config["format_version"] != 1:
+        raise ValueError(
+            f"decision_config.json format_version {config['format_version']} "
+            "is not supported, only version 1 is"
+        )
+    return config
+
+
+def is_qwen3_5(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+    )
+
+
+def resolve_spec_hidden_size(
+    hf_config, hidden_size: int, hc_mult: int
+) -> tuple[int, Optional[int]]:
+    # DSV4 and Qwen4-Exp carry the hc-flattened stream across the target->draft
+    # boundary; other hc models (hy_v4) collapse to hidden_size first.
+    if hc_mult <= 1 or not (is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)):
+        return hidden_size, None
+    hc_hidden_size = hidden_size * hc_mult
+    return hc_hidden_size, hc_hidden_size
+
+
+def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
+    return config.index_head_dim
+
+
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the previous layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        )
+
+    # LongCat computes fresh top-k indices every cli_factor layers.
+    cli_factor = getattr(config, "cli_factor", 1)
+    if cli_factor is None:
+        cli_factor = 1
+    assert cli_factor > 0, f"cli_factor must be positive, got {cli_factor}"
+    if cli_factor > 1:
+        return layer_id % cli_factor != 0
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if freq is None:
+        freq = 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, (
+            "index_skip_topk_offset must be positive; offset <= 0 "
+            "marks layer 0 as skip_topk with no prior topk to reuse"
+        )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
+def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
+    return config.index_n_heads
+
+
+def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_compress", False)
+
+
+def get_num_indexer_layers(config) -> int:
+    """Layer count for the global indexer-topk capturer's host buffer.
+
+    DSA models (V3.2) expose one capturer slot per transformer layer. With
+    index_topk_freq > 1 some layers reuse prev layer's topk; those still get a
+    slot mirrored at the MLA call site even if no Indexer module is built.
+    DSv4 has C4 indexers only on layers whose compress_ratio == 4. Other
+    architectures: set num_indexer_layers on hf_text_config; 0 disables the
+    capturer.
+    """
+    if is_deepseek_dsa(config):
+        return config.num_hidden_layers
+    if is_deepseek_v4(config):
+        compress_ratios = getattr(config, "compress_ratios", None) or []
+        return sum(1 for r in compress_ratios if r == 4)
+    return getattr(config, "num_indexer_layers", 0)
+
+
+def is_embedding_gemma(config) -> bool:
+    """Whether ``config`` is Google's bidirectional EmbeddingGemma checkpoint.
+
+    EmbeddingGemma uses the otherwise generative ``Gemma3TextModel``
+    architecture, so its model type alone is insufficient for dispatch.  The
+    upstream ``use_bidirectional_attention`` flag is the defining distinction.
+    """
+    return getattr(config, "model_type", None) == "gemma3_text" and getattr(
+        config, "use_bidirectional_attention", False
+    )
+
+
+def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
+    return any(
+        arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
+
+
+def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
+    return any(
+        arch in multimodal_piecewise_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
+def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill breakable CUDA graph enabled."""
+    return any(
+        arch in multimodal_breakable_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
+def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
+    return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
+
+
+def is_score_and_pool_model(model_architectures: List[str]) -> bool:
+    return any(arch in _score_and_pool_archs for arch in model_architectures)
+
+
+def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float:
+    """Compute MLA attention scaling factor from rope_scaling with mscale.
+
+    Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
+    Transformers v5 also exposes the default RoPE parameters through
+    ``rope_scaling``. Those parameters do not request any scaling.
+    Warns if 'factor' is missing from a scaling request (common in v5 configs).
+    """
+    # v5 uses "rope_type", v4 uses "type"
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type == "default":
+        return base_scaling
+
+    if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
+        "apply_scale", True
+    ):
+        return base_scaling
+
+    mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+    if "factor" not in rope_scaling:
+        logger.warning(
+            "rope_scaling missing 'factor', defaulting to 1.0. Check model accuracy.",
+        )
+    scaling_factor = rope_scaling.get("factor", 1.0)
+    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+    return base_scaling * mscale * mscale

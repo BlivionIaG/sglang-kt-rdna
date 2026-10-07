@@ -33,6 +33,8 @@ import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
+from functools import partial, reduce
+from copy import copy
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
@@ -1427,3 +1429,384 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    if not os.path.isdir(model_path):
+        return None
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    target_key = None
+    target_shard_path = None
+
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {}) or {}
+        for k, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(k):
+                target_key = k
+                target_shard_path = os.path.join(model_path, shard)
+                break
+        if target_key is None:
+            return None
+    else:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+        if not shards:
+            return None
+        target_shard_path = str(shards[0])
+
+    with open(target_shard_path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+
+    if target_key is not None:
+        meta = header.get(target_key)
+        return meta.get("dtype") if meta else None
+
+    for k, meta in header.items():
+        if k == "__metadata__" or not isinstance(meta, dict):
+            continue
+        if _ROUTED_EXPERT_KEY_RE.search(k):
+            return meta.get("dtype")
+    return None
+
+
+def _get_prefetch_block_size() -> int:
+    global _PREFETCH_BLOCK_SIZE
+    if _PREFETCH_BLOCK_SIZE is None:
+        from sglang.srt.environ import envs
+
+        _PREFETCH_BLOCK_SIZE = envs.SGLANG_PREFETCH_BLOCK_SIZE_MB.get() * 1024 * 1024
+    return _PREFETCH_BLOCK_SIZE
+
+
+def _resolve_explicit_draft_quant_config(
+    model_config: ModelConfig,
+    quant_config: QuantizationConfig,
+) -> QuantizationConfig:
+    if not (
+        model_config.is_draft_model and model_config.is_draft_quantization_explicit
+    ):
+        return quant_config
+
+    if model_config.quantization == "modelopt_fp4" and (
+        isinstance(quant_config, ModelOptFp4Config)
+        and quant_config.is_checkpoint_nvfp4_serialized
+        and quant_config.is_layer_excluded("mtp.layers.0.mlp.experts")
+    ):
+        return ModelOptFp4Config.for_online_weight_quantization(
+            quant_config.packed_modules_mapping
+        )
+
+    return quant_config
+
+
+def _quark_draft_online_quant_config(
+    model_config: ModelConfig, hf_quant_config: dict
+) -> Optional[QuantizationConfig]:
+    """Explicit ``--speculative-draft-model-quantization quark_mxfp4`` on a Quark
+    checkpoint whose MTP/NextN draft experts were exported in bf16 (listed under
+    ``exclude``): quantize the draft's routed experts online to MXFP4 instead of
+    running them through the bf16 MoE path. Only the draft model is affected; the
+    target model keeps its serialized Quark scheme."""
+    if not (
+        model_config.is_draft_model
+        and model_config.is_draft_quantization_explicit
+        and model_config.quantization == "quark_mxfp4"
+        and hf_quant_config.get("quant_method") == "quark"
+        # ROCm + Qwen3.5 MTP draft only (validated combination); anything else is
+        # left exactly as before.
+        and is_hip()
+        and is_qwen3_5_mtp_draft(model_config.hf_config)
+    ):
+        return None
+    excluded = hf_quant_config.get("exclude") or []
+    if not any(str(name).startswith("mtp.layers.0.mlp.experts") for name in excluded):
+        return None
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    logger.info(
+        "Draft MTP experts are unquantized in the Quark checkpoint; "
+        "quantizing them online to MXFP4 (quark_mxfp4) for the draft model."
+    )
+    return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
+
+
+def _modelopt_quant_section(config: dict) -> dict:
+    """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
+
+    Nested LLM format::
+
+        {"quantization": {"quant_algo": "FP8", "exclude_modules": [...]}}
+
+    Flat format (``config.json`` ``quantization_config`` / Cosmos3-style exports)::
+
+        {"quant_algo": "FP8", "ignore": [...], "quant_method": "modelopt", ...}
+    """
+    quantization = config.get("quantization")
+    if isinstance(quantization, dict):
+        return quantization
+    return config
+
+
+def _prefetch_checkpoint_file(
+    file_path: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """Prefetch a checkpoint file into the OS page cache.
+
+    Reads the file sequentially in 16 MB blocks so the kernel caches its pages
+    before workers load the same file via mmap.
+    """
+    with open(file_path, "rb") as f:
+        while cancel_event is None or not cancel_event.is_set():
+            if not f.read(_get_prefetch_block_size()):
+                break
+
+
+class CheckpointFilePrefetchHandle:
+    """Lifecycle handle for background checkpoint page-cache prefetching."""
+
+    def __init__(
+        self,
+        *,
+        thread: threading.Thread,
+        cancel_event: threading.Event,
+        succeeded_event: threading.Event,
+        errors: List[Tuple[str, Exception]],
+    ) -> None:
+        self._thread = thread
+        self._cancel_event = cancel_event
+        self._succeeded_event = succeeded_event
+        self._errors = errors
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
+    def cancel(self) -> None:
+        """Stop scheduling shards and interrupt reads at the next block."""
+        self._cancel_event.set()
+
+    def stop(self, timeout: Optional[float] = _PREFETCH_STOP_TIMEOUT_SECONDS) -> None:
+        """Cancel prefetching and wait for the background worker to finish."""
+        self.cancel()
+        self.wait(timeout)
+
+    @property
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
+    @property
+    def failed(self) -> bool:
+        return bool(self._errors) or (self.done and not self._succeeded_event.is_set())
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @property
+    def errors(self) -> Tuple[Tuple[str, Exception], ...]:
+        return tuple(self._errors)
+
+
+def _prefetch_all_checkpoints(
+    sorted_files: List[str],
+    num_threads: int = 4,
+) -> CheckpointFilePrefetchHandle:
+    """Start prefetching checkpoint files into page cache in a background thread.
+
+    When multiple ranks on the same node load the same checkpoint (e.g.
+    DP-attention), each rank independently mmaps the same files, causing
+    redundant NFS/Lustre reads. By distributing the prefetch across ranks
+    (each rank reads 1/Nth of the shards), the total network I/O is reduced
+    from N * checkpoint_size to 1 * checkpoint_size, with subsequent
+    mmap accesses hitting the shared OS page cache.
+
+    The prefetch runs in a background thread so that loading can start
+    immediately and benefit from pages that have already been cached,
+    rather than blocking until all files are prefetched. This pipelining
+    naturally adapts to any RAM size — even if the full checkpoint does
+    not fit in page cache, the prefetch thread stays ahead of the loader.
+    """
+    import time
+
+    if num_threads < 1:
+        raise ValueError("weight loader prefetch num_threads must be >= 1")
+
+    # Use node-local rank so that each node independently prefetches the
+    # full checkpoint into its own page cache. Global rank would split files
+    # across nodes, but page cache is not shared across nodes.
+    if torch.distributed.is_initialized():
+        world_group = get_parallel().world_group
+        local_rank = world_group.local_rank
+        local_world_size = world_group.local_size or get_parallel().launch_world_size
+    else:
+        local_rank = 0
+        local_world_size = 1
+
+    my_files = sorted_files[local_rank::local_world_size]
+    total_for_rank = len(my_files)
+    cancel_event = threading.Event()
+    succeeded_event = threading.Event()
+    errors: List[Tuple[str, Exception]] = []
+
+    logger.debug(
+        "Rank %d: prefetching %d/%d checkpoint shards into page cache "
+        "(background, %d local ranks sharing the work, %d threads per rank)...",
+        local_rank,
+        total_for_rank,
+        len(sorted_files),
+        local_world_size,
+        num_threads,
+    )
+
+    def _prefetch_all() -> None:
+        completed = 0
+        next_log_pct = 10
+
+        def record_complete() -> None:
+            nonlocal completed, next_log_pct
+
+            completed += 1
+            if total_for_rank > 0 and next_log_pct <= 100:
+                pct = 100 * completed / total_for_rank
+                while pct >= next_log_pct and next_log_pct <= 100:
+                    logger.debug(
+                        "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                        local_rank,
+                        next_log_pct,
+                        completed,
+                        total_for_rank,
+                    )
+                    next_log_pct += 10
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            file_iter = iter(my_files)
+            pending: Dict[concurrent.futures.Future, str] = {}
+
+            for path in itertools.islice(file_iter, num_threads):
+                if cancel_event.is_set():
+                    break
+                pending[
+                    executor.submit(_prefetch_checkpoint_file, path, cancel_event)
+                ] = path
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    path = pending.pop(future)
+                    exc = future.exception()
+                    if exc is not None:
+                        errors.append((path, exc))
+                        logger.warning(
+                            "Failed to prefetch checkpoint file %r: %s",
+                            path,
+                            exc,
+                        )
+                    record_complete()
+
+                    next_path = None if cancel_event.is_set() else next(file_iter, None)
+                    if next_path is not None:
+                        pending[
+                            executor.submit(
+                                _prefetch_checkpoint_file,
+                                next_path,
+                                cancel_event,
+                            )
+                        ] = next_path
+
+    def _run_prefetch() -> None:
+        start = time.perf_counter()
+        _prefetch_all()
+        succeeded_event.set()
+        logger.debug(
+            "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
+            local_rank,
+            time.perf_counter() - start,
+        )
+
+    thread = threading.Thread(target=_run_prefetch, daemon=True)
+    handle = CheckpointFilePrefetchHandle(
+        thread=thread,
+        cancel_event=cancel_event,
+        succeeded_event=succeeded_event,
+        errors=errors,
+    )
+    thread.start()
+    return handle
+
+
+def _drop_file_cache_after_load(path: str) -> None:
+    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        return
+
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        posix_fadvise(fd, 0, 0, dontneed)
+    except OSError as e:
+        logger.debug("Failed to drop file cache for %s: %s", path, e)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+@torch.no_grad()
+def initialize_capture_safe_weights(
+    model: torch.nn.Module,
+    value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
+) -> None:
+    """Fill floating-point parameters with finite values for graph warmup.
+
+    Persistent buffers are intentionally left intact: unlike parameters, they
+    are not guaranteed to be replaced by ``model.load_weights()``.
+    """
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            param.fill_(value)
+
+
+def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
+    # This function is for padding zeros when loaded_weight is less than output_sizes.
+    # Most cases, sum(output_sizes) = loaded_weight.size(output_dim),
+    # while in some TP cases like TP6, output_sizes will be padded, thus loaded_weight needs padding.
+    total_output_size = sum(output_sizes)
+    raw_output_size = loaded_weight.size(output_dim)
+    if total_output_size > raw_output_size:
+        loaded_weight_pad = []
+        weight_split_size = [
+            int(output_size / total_output_size * raw_output_size)
+            for output_size in output_sizes
+        ]
+        assert sum(weight_split_size) == raw_output_size, (
+            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        )
+
+        split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
+        for i, output_size in enumerate(output_sizes):
+            pad_size = output_size - weight_split_size[i]
+            target_pad_shape = list(loaded_weight.size())
+            target_pad_shape[output_dim] = pad_size
+            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            loaded_weight_pad.append(
+                torch.cat([split_weight[i], pad_tensor], dim=output_dim)
+            )
+        return torch.cat(loaded_weight_pad, dim=output_dim)
+    else:
+        return loaded_weight

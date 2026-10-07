@@ -27,7 +27,7 @@ import random
 import signal
 import threading
 import time
-from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union, Any, Set
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -35,6 +35,9 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import torch
 import uvloop
 import zmq
+from functools import reduce
+from dataclasses import field
+from copy import copy
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
@@ -1131,3 +1134,89 @@ def _launch_subprocesses(
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
     return tokenizer_manager, template_manager, scheduler_infos, port_args
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@dataclasses.dataclass
+class SchedulerInitResult:
+    """Result from launching schedulers."""
+
+    scheduler_infos: List[Dict[str, Any]]
+    all_child_pids: List[int] = dataclasses.field(default_factory=list)
+    wait_for_ready: Callable[[], None] = lambda: None
+    block_until_scheduler_exits: Callable[[], None] = lambda: None
+    engine_info_bootstrap_server: Optional[Any] = None
+    grpc_server: Optional[Any] = None
+
+    def stop_grpc_server(self) -> None:
+        if self.grpc_server is not None:
+            self.grpc_server.shutdown()
+            self.grpc_server = None
+
+
+def _scheduler_died_error(rank: int, proc) -> RuntimeError:
+    """Build a descriptive error for a scheduler process that died during init."""
+    proc.join(timeout=10)
+    return RuntimeError(
+        f"Rank {rank} scheduler died during initialization "
+        f"(exit code: {proc.exitcode}). "
+        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
+        f"Run `dmesg -T | grep -i oom` to check."
+    )
+
+
+def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
+    """Calculate pp_rank_range and tp_rank_range for a given node.
+
+    `node_rank` stays an argument because the Ray launchers size every node
+    from the driver, not just their own.
+
+    Args:
+        node_rank: The rank of the node to compute ranges for.
+
+    Returns:
+        A tuple of (pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node):
+        - pp_rank_range: range of pipeline-parallel ranks assigned to this node.
+        - tp_rank_range: range of tensor-parallel ranks assigned to this node.
+        - pp_size_per_node: number of PP ranks per node.
+        - tp_size_per_node: number of TP ranks per node.
+    """
+    parallel = get_parallel()
+    nnodes = parallel.nnodes
+    pp_size_per_node = max(parallel.pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // parallel.pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
+    )
+
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+    )
+
+    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def node_hosts_rust_server() -> bool:
+    """Whether this node contains a Rust listener rank, assuming Rust mode."""
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    if 0 not in pp_rank_range:
+        return False
+
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch the full local TP group, including its first rank.
+        return True
+
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    ranks_per_dp_group = parallel.attn_tp_size * parallel.attn_cp_size
+    for tp_rank in tp_rank_range:
+        rank_within_dp_group = tp_rank % ranks_per_dp_group
+        if rank_within_dp_group == 0:
+            return True
+    return False

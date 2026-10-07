@@ -18,12 +18,13 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Set
 
 import psutil
 import pybase64
 import setproctitle
 import zmq
+from copy import copy
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -460,3 +461,10 @@ def run_detokenizer_process(
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def is_health_check_request(rid: Optional[str]) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)

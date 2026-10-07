@@ -287,3 +287,144 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@register_attention_backend("tokenspeed_mla")
+def create_tokenspeed_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+        TokenspeedMLABackend,
+    )
+
+    return TokenspeedMLABackend(runner)
+
+
+@register_attention_backend("cutedsl_mla")
+def create_cutedsl_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("cutedsl_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
+
+    return CuteDslMLABackend(runner)
+
+
+@register_attention_backend("dsa")
+def create_dsa_backend(runner):
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+    return DeepseekSparseAttnBackend(runner)
+
+
+@register_attention_backend("qsa")
+def create_qsa_backend(runner):
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    return QwenSparseAttnBackend(runner)
+
+
+@register_attention_backend("nsa")
+def _create_nsa_compat(runner):
+    warnings.warn(
+        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
+        "The alias will be removed in a future release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return create_dsa_backend(runner)
+
+
+@register_attention_backend("dsv4")
+def create_dsv4_backend(runner):
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+            DeepseekV4AscendAttnBackend,
+        )
+
+        return DeepseekV4AscendAttnBackend(runner)
+    elif _is_hip:
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+
+        logger.info(
+            "Using DeepseekV4HipRadixBackend for compressed attention backend (HIP)."
+        )
+        return DeepseekV4HipRadixBackend(runner)
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
+        )
+
+        backend = create_deepseek_v4_attn_backend(runner)
+        logger.info(
+            f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
+        )
+        return backend
+
+
+@register_attention_backend("hpc_ops")
+def create_hpc_ops_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("hpc_ops backend can only be used with non-MLA models.")
+    if runner.model_config.is_encoder_decoder:
+        raise ValueError(
+            "Cross attention is not supported in the hpc_ops attention backend."
+        )
+    if get_spec().speculative_algorithm is not None:
+        raise ValueError(
+            "hpc_ops backend does not support speculative decoding for now."
+        )
+    from sglang.srt.layers.attention.hpc_ops_backend import HPCOpsAttnBackend
+
+    return HPCOpsAttnBackend(runner)
+
+
+def attn_backend_wrapper_for_draft_extend(
+    runner: "ModelRunner", full_attn_backend: "AttentionBackend"
+):
+    """Apply the model's attention wrapper to a DRAFT-EXTEND backend, if it needs one.
+
+    ``DraftBackendFactory`` skips :func:`attn_backend_wrapper`, which is right for
+    the mamba hybrids whose MTP draft is all softmax attention. Inkling's draft has
+    its own short convs, so it must expose ``conv_state_metadata`` too.
+    """
+    from sglang.srt.configs.dots3 import Dots3Config
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    if isinstance(runner.model_config.hf_text_config, Dots3Config):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    return full_attn_backend
+
+
+def attn_backend_wrapper_for_draft_decode(runner: "ModelRunner", backend):
+    """Apply the Dots model wrapper to per-step draft backends."""
+    from sglang.srt.configs.dots3 import Dots3Config
+
+    if not hasattr(runner, "model_config"):
+        return backend
+    hf_text_config = runner.model_config.hf_text_config
+    if isinstance(hf_text_config, Dots3Config):
+        return hf_text_config.wrap_draft_decode_attention_backend(backend)
+    return backend
+
+
+@register_attention_backend("minicpm_flashattn")
+def create_minicpm_flashattn_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=False)
+
+
+@register_attention_backend("minicpm_flashinfer")
+def create_minicpm_flashinfer_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=True)

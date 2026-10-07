@@ -29,14 +29,15 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from functools import total_ordering
+from functools import total_ordering, reduce
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
+from copy import copy
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -1249,3 +1250,207 @@ def _attn_tp_local_shard_bounds(
     parallel = get_parallel()
     tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
     return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _build_forward_token_modalities(
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not mm_inputs or extend_prefix_lens is None or extend_seq_lens is None:
+        return None
+    if not (len(mm_inputs) == len(extend_prefix_lens) == len(extend_seq_lens)):
+        raise ValueError(
+            "Multimodal metadata batch dimensions do not match: "
+            f"mm_inputs={len(mm_inputs)}, prefixes={len(extend_prefix_lens)}, "
+            f"extend_lens={len(extend_seq_lens)}"
+        )
+
+    modalities = []
+    has_multimodal_tokens = False
+    for mm_input, prefix_len, extend_len in zip(
+        mm_inputs, extend_prefix_lens, extend_seq_lens
+    ):
+        if mm_input is None or mm_input.token_modalities is None:
+            modalities.extend([0] * extend_len)
+            continue
+        end = prefix_len + extend_len
+        request_modalities = mm_input.token_modalities[prefix_len:end]
+        if len(request_modalities) != extend_len:
+            raise ValueError(
+                "Multimodal token metadata is shorter than the active forward span: "
+                f"prefix_len={prefix_len}, extend_len={extend_len}, "
+                f"metadata_len={len(mm_input.token_modalities)}"
+            )
+        has_multimodal_tokens |= any(request_modalities)
+        modalities.extend(request_modalities)
+
+    if len(modalities) != num_tokens:
+        raise ValueError(
+            "Multimodal token metadata does not match the forward batch: "
+            f"metadata_tokens={len(modalities)}, forward_tokens={num_tokens}"
+        )
+    if not has_multimodal_tokens:
+        return None
+    return torch.tensor(
+        modalities,
+        dtype=torch.int8,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
+
+
+def _maybe_build_forward_token_modalities(
+    model_config: ModelConfig,
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not model_config.requires_mm_token_modalities:
+        return None
+    return _build_forward_token_modalities(
+        mm_inputs,
+        extend_prefix_lens,
+        extend_seq_lens,
+        num_tokens,
+        device,
+    )
+
+
+def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
+    """Whether aiter MegaMoE needs this idle rank to carry a token anyway.
+
+    MegaMoE's dispatch is rank-synchronous: when the batch is globally a
+    prefill, a rank with nothing to do still has to enter the collective, so it
+    runs a fabricated one-token extend instead of sitting the forward out.
+    """
+    return bool(
+        _is_hip
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        and batch.is_extend_in_batch
+        and batch.forward_mode.is_idle()
+    )
+
+
+def _elastic_should_preserve_local_token_counts(
+    *,
+    model_runner: ModelRunner,
+    dp_padding_mode: DpPaddingMode,
+    global_num_tokens: List[int],
+) -> bool:
+    if not getattr(model_runner, "enable_elastic_ep", False):
+        return False
+    if not world_dp_gather_enabled():
+        return False
+    if not dp_padding_mode.is_max_len():
+        return False
+    if len(global_num_tokens) <= 1:
+        return False
+
+    uneven_token_count = len(set(global_num_tokens)) > 1
+    return uneven_token_count
+
+
+def _localize_npu_dcp_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    *,
+    interleave_size: int,
+) -> torch.Tensor:
+    """Map allocator-global NPU DCP slots to this target rank."""
+    parallel = get_parallel()
+    return localize_dcp_indices(
+        out_cache_loc,
+        parallel.dcp_size,
+        parallel.dcp_rank,
+        interleave_size,
+    )
+
+
+@dataclass
+class DSV4OutCacheLoc:
+    """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
+
+    Bundles slot indices for full/SWA pools and the two compressed-KV pools
+    (C4/C128). Compressor state uses fixed ring storage and explicit
+    ``state_loc`` metadata, so it is not part of the token-allocation bundle.
+    Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
+    the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
+    otherwise.
+
+    All fields are token-level slot ids in their respective pools (NOT page
+    ids). Attention backends convert to page ids via ``// page_size`` when
+    constructing PA_ND block tables.
+
+    """
+
+    out_full_loc: torch.Tensor
+    out_swa_loc: torch.Tensor
+    out_c4_loc: torch.Tensor
+    out_c128_loc: torch.Tensor
+
+
+def build_inner_fb_view(
+    forward_batch: ForwardBatch,
+    *,
+    bs: int,
+    forward_mode: ForwardMode,
+    encoder_lens: Optional[torch.Tensor] = None,
+):
+    """Build a ForwardBatch-like view for MultiStep draft wrapper dispatch.
+
+    MultiStep draft wrappers (FlashInferMultiStepDraftBackend,
+    AiterMultiStepDraftBackend, TritonMultiStepDraftBackend, etc.) need
+    to dispatch to per-step inner backends'
+    :py:meth:`AttentionBackend.init_forward_metadata_out_graph` with an
+    overridden ``forward_mode`` (typically pinned to ``DECODE``) and
+    sometimes overridden ``encoder_lens``. The result is a thin
+    namespace mirroring just the fields backend init reads, avoiding
+    the cost of allocating a real ``ForwardBatch``.
+
+    ``actual_forward_mode`` carries the original runtime
+    ``forward_batch.forward_mode`` (e.g., spec-decode draft) so backends
+    that check it for IDLE substitution (DSV4) see the unaltered value.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
+        input_ids=getattr(forward_batch, "input_ids", None),
+        positions=getattr(forward_batch, "positions", None),
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_sum=forward_batch.seq_lens_sum,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        encoder_lens=encoder_lens,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        # A caller may hand in another view that does not carry this field.
+        out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
+        origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        spec_info=forward_batch.spec_info,
+    )
+
+
+def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
+    values: List[int] = [_stable_hash_str_to_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _bootstrap_rooms_to_tensor(
+    *, bootstrap_rooms: List[Optional[int]], device: torch.device
+) -> torch.Tensor:
+    values: List[int] = [room if room is not None else -1 for room in bootstrap_rooms]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _stable_hash_str_to_i64(rid: str) -> int:
+    digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)

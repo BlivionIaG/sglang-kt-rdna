@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
+from copy import copy
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -1157,3 +1158,159 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             self.waiting_queue.extend(transferred_reqs)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _bootstrap_addr(req: Req) -> str:
+    # FIXME: make a property of a req
+    return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Start a decode-radix request that owns its whole KV row at the root."""
+    req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+    req.last_node = tree_cache.root_node_handle(req.extra_key)
+    req.last_host_node = req.last_node
+    req.best_match_node = req.last_node
+    req.lock = None
+    req.kv.cache_protected_len = 0
+    req.kv.cache_inserted_len = 0
+    req.num_matched_prefix_tokens = 0
+    req.host_hit_length = 0
+
+
+def alloc_for_decode_prealloc_hisparse(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> torch.Tensor:
+    req.kv.kv_allocated_len = fill_len
+    device = allocator.device
+    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+    seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    if uses_swa_tail:
+        kv_loc = allocator.alloc_extend_swa_tail(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+            swa_tail_len=swa_tail_len,
+        )
+        swa_evicted_seqlen = fill_len - swa_tail_len
+        assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
+        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+    else:
+        kv_loc = allocator.alloc_logical_only(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+        )
+    return kv_loc
+
+
+def alloc_for_decode_prealloc(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+    delta_len: int,
+    prefix_len: int,
+    total_prefix_len: int,
+    prefix_indices: Optional[torch.Tensor],
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+    req_to_token_pool: Optional[ReqToTokenPool] = None,
+) -> torch.Tensor:
+    req.kv.kv_allocated_len = fill_len
+    if allocator.page_size == 1:
+        kv_loc = allocator.alloc(delta_len)
+    else:
+        device = allocator.device
+        last_loc = (
+            prefix_indices[-1:].to(dtype=torch.int64, device=device)
+            if prefix_len > 0
+            else torch.tensor([-1], dtype=torch.int64, device=device)
+        )
+        extra_kwargs = {}
+        dsv4_unwrap_prealloc = None
+        if hasattr(allocator, "c128_attn_allocator"):
+            assert req_to_token_pool is not None
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                dsv4_prealloc_kwargs,
+                dsv4_unwrap_prealloc,
+            )
+
+            extra_kwargs = dsv4_prealloc_kwargs(
+                allocator,
+                req,
+                fill_len,
+                req_to_token_pool,
+                device=device,
+            )
+        if uses_swa_tail:
+            # Full-attention layers reuse prefix KV; SWA layers allocate only
+            # the live window tail.
+            kv_loc = allocator.alloc_extend_swa_tail(
+                prefix_lens=torch.tensor(
+                    [total_prefix_len], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=delta_len,
+                swa_tail_len=swa_tail_len,
+                **extra_kwargs,
+            )
+            swa_evicted_seqlen = fill_len - swa_tail_len
+            assert (
+                swa_evicted_seqlen >= 0
+                and swa_evicted_seqlen % allocator.page_size == 0
+            )
+            req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+        else:
+            kv_loc = allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [total_prefix_len], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=delta_len,
+                **extra_kwargs,
+            )
+        if dsv4_unwrap_prealloc is not None:
+            kv_loc = dsv4_unwrap_prealloc(
+                kv_loc, req_to_token_pool, req, total_prefix_len, fill_len
+            )
+    return kv_loc
+
+
+def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
+    """Generate a deterministic synthetic handoff token for fake-PD requests.
+
+    Fake-PD skips prefill and KV transfer, so its allocated prompt KV has no
+    request-specific state and its metadata output token remains zero. Reusing
+    token 0 for every request can unrealistically correlate decode workloads.
+    Hash the request ID so every TP rank gets the same request-diverse token.
+    """
+    if req.vocab_size is None or req.vocab_size <= 0:
+        raise ValueError("Fake-PD requests require a positive vocabulary size")
+    digest = hashlib.blake2b(
+        req.rid.encode(), digest_size=8, person=b"fake-pd"
+    ).digest()
+    return int.from_bytes(digest, byteorder="little") % req.vocab_size

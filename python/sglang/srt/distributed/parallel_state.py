@@ -33,12 +33,14 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Set, overload
 from unittest.mock import patch
 
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
+from functools import reduce
+from copy import copy
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
@@ -2297,3 +2299,267 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def get_torch_distributed_pg_options(group_name=None):
+    if not _is_npu:
+        return None
+
+    # Only create HCCL options for default group or MoE-related groups
+    if group_name is not None and "moe" not in group_name:
+        return None
+
+    import torch_npu
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    hccl_buffer_size = int(
+        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
+    )
+    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    return options
+
+
+@register_custom_op(out_shape="tensor")
+def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """FlashInfer kAllReduce over ``group_name``.
+
+    Registered as a custom op so it stays opaque under Dynamo and can run inside
+    piecewise CUDA graphs. Applicability is decided by
+    ``GroupCoordinator._can_use_flashinfer_allreduce`` before the call -- this op
+    has no fallback of its own.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._flashinfer_allreduce(tensor)
+
+
+@register_custom_op(mutates_args=["output"])
+def reg_all_to_all_single(
+    output: torch.Tensor, input: torch.Tensor, group_name: str
+) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_to_all_single(output, input)
+
+
+@contextmanager
+def pdmux_prefill_tp_group():
+    """Use the duplicate TP communicator for the prefill stream.
+
+    PD multiplexing keeps prefill and decode on separate communicators with
+    the same ranks. Only the TP handle changes within this scope.
+    """
+    assert _PDMUX_PREFILL_TP_GROUP is not None, (
+        "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+    )
+    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
+        yield
+
+
+def get_shared_experts_tp_group() -> GroupCoordinator:
+    return get_parallel().shared_experts_tp_group
+
+
+def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DCP
+
+
+def get_dcp_group() -> GroupCoordinator:
+    return get_parallel().dcp_group
+
+
+def get_self_pp_group() -> GroupCoordinator:
+    assert _SELF_PP is not None, "self pipeline group is not initialized"
+    return _SELF_PP
+
+
+def set_mscclpp(enable: bool):
+    global _ENABLE_MSCCLPP
+    _ENABLE_MSCCLPP = enable
+
+
+def set_flashinfer_allreduce_only(enable: bool):
+    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
+    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
+
+
+def _tag_groups_for_flashinfer_allreduce_only():
+    """Stamp _fi_workspace_hint on the group coordinators that own a FlashInfer
+    fusion workspace, so all_reduce() can dispatch to flashinfer_allreduce()
+    without touching the call sites.
+
+    Only two workspaces exist (see ``_get_workspace_manager``): one for
+    attention TP and one for MoE. A group may only be tagged for the workspace
+    that was rendezvoused on its own peers -- reducing over a workspace built
+    for a different set of peers silently returns wrong data.
+
+    - ``_TP`` is deliberately absent: it *is* ``_ATTN_TP`` when
+      ``attn_tp_size == tp_size``, and a strict superset of it otherwise (DP
+      attention), where the attention workspace addresses the wrong peers.
+    - The MoE workspace rendezvouses on the EP group when ``moe_ep_size > 1``
+      and on the MoE-TP group otherwise, so exactly one of ``_MOE_EP`` /
+      ``_MOE_TP`` is eligible. Tagging both makes a MoE-TP allreduce reduce
+      across the EP peers under hybrid EP+TP (e.g. tp=4, ep=2).
+    """
+    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
+        return
+
+    moe_group = _MOE_EP if (_MOE_EP is not None and _MOE_EP.world_size > 1) else _MOE_TP
+    # Attention is tagged last on purpose: when a coordinator backs both roles
+    # (e.g. _ATTN_TP is _MOE_EP is _TP at tp=4, ep=4) either workspace spans the
+    # same peers and is correct, so we just pick one deterministically.
+    for group, hint in ((moe_group, "moe"), (_ATTN_TP, "attn_tp")):
+        if group is not None:
+            group._fi_workspace_hint = hint
+
+
+def _create_global_tcp_store(
+    rank: int,
+    world_size: int,
+    dist_init_addr: Optional[str] = None,
+    allow_dynamic_membership: bool = False,
+) -> None:
+    """Create a global TCPStore for coordination across ranks.
+
+    This function creates a TCPStore that all ranks can use for coordination
+    (e.g., for NIXL buffer setup).
+    """
+    from torch.distributed import TCPStore
+
+    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
+
+    master_ip = os.environ.get("MASTER_ADDR")
+    if not master_ip and allow_dynamic_membership and dist_init_addr:
+        addr = dist_init_addr
+        if addr.startswith("tcp://"):
+            addr = addr[len("tcp://") :]
+        master_ip = addr.rsplit(":", 1)[0]
+    if not master_ip:
+        logger.warning(
+            "Could not determine master IP for global TCPStore. "
+            "Broadcasting from rank 0 to all ranks."
+        )
+        if rank == 0:
+            master_ip = get_local_ip_auto()
+            ip_list = [master_ip]
+        else:
+            ip_list = [None]
+        torch.distributed.broadcast_object_list(ip_list, src=0)
+        master_ip = ip_list[0]
+
+    try:
+        if allow_dynamic_membership:
+            is_master = rank == 0
+            tcp_store = TCPStore(
+                host_name=master_ip,
+                port=base_store_port,
+                is_master=is_master,
+                wait_for_workers=False,
+            )
+        else:
+            is_master = rank == 0
+            tcp_store = TCPStore(
+                host_name=master_ip,
+                port=base_store_port,
+                world_size=world_size,
+                is_master=is_master,
+            )
+        set_global_tcp_store(tcp_store)
+        logger.info(
+            "Created global TCPStore at %s:%d (rank=%d, is_master=%s)",
+            master_ip,
+            base_store_port,
+            rank,
+            is_master,
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to create global TCPStore at %s:%d: %s. "
+            "Components requiring TCPStore (like NIXL) may not work.",
+            master_ip,
+            base_store_port,
+            e,
+        )
+
+
+@contextmanager
+def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
+    """Patch the pp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, whose model does not
+    span pipeline stages and must not read the target's pp topology.
+    """
+    global _PP_STATE_PATCHED
+    assert not _PP_STATE_PATCHED, "Should not call when it's already patched"
+
+    _PP_STATE_PATCHED = True
+    global _PP
+    old_pp_group = _PP
+    _PP = pp_group
+    try:
+        with get_parallel().override(
+            pp_size=pp_group.world_size,
+            pp_rank=pp_group.rank_in_group,
+            pp_group=pp_group,
+        ):
+            yield
+    finally:
+        _PP_STATE_PATCHED = False
+        _PP = old_pp_group
+
+
+def get_dcp_world_size():
+    return get_dcp_group().world_size
+
+
+def get_dcp_rank():
+    return get_dcp_group().rank_in_group
+
+
+def abort_distributed_environment() -> None:
+    """Drop this rank's communicators locally.
+
+    ``destroy_process_group`` is collective and blocks when a peer is gone,
+    which on a shutdown path is the common case.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
+    if abort is None:
+        # Older torch exposes no non-collective teardown,
+        # and the collective one is what this function exists to avoid.
+        return
+    try:
+        # No argument aborts every group, the default one included.
+        abort()
+    except Exception as e:
+        logger.warning(f"NCCL abort on shutdown failed, {type(e).__name__}: {e}")
+
+
+def _warn_if_called_from_outside(name: str, replacement: str):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if name not in _ALREADY_WARNED:
+                caller = sys._getframe(1).f_globals.get("__name__", "")
+                if not caller.startswith(_EXEMPT_CALLERS):
+                    _ALREADY_WARNED.add(name)
+                    warnings.warn(
+                        f"{name}() is deprecated; read "
+                        f"get_parallel().{replacement} instead, which answers the "
+                        "same thing and can be redirected by a scope",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate

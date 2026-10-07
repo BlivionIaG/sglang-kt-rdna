@@ -29,13 +29,16 @@ from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union, Set, Iterable
 
 import fastapi
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from functools import lru_cache, reduce
+from dataclasses import field
+from copy import copy
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
@@ -2537,3 +2540,137 @@ class SignalHandler:
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
+    """Do not silently turn a failed EPD request into local vision work."""
+    disagg = get_disagg()
+    if (
+        mm_inputs is None
+        and disagg.language_only
+        and disagg.encoder_transfer_backend == "zmq_to_tokenizer"
+        and request_obj.need_wait_for_mm_inputs
+    ):
+        raise fastapi.HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=(
+                "The encoder did not return multimodal embeddings. "
+                "The request was not run locally in language-only mode."
+            ),
+        )
+
+
+@lru_cache(maxsize=1)
+def _ragged_verify_cap_accept() -> bool:
+    # The mode env is fixed at server launch; cache to keep it off the
+    # per-request metrics path.
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+
+
+def _slice_streaming_output_meta_info(
+    meta_info: Dict[Any, Any],
+    last_output_offset: int,
+    customized_info_keys: Optional[Iterable[str]] = None,
+) -> None:
+    """Align output-side metadata with the current incremental streaming chunk."""
+    streaming_meta_info_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
+    if customized_info_keys is not None:
+        streaming_meta_info_keys.update(customized_info_keys)
+    for key in meta_info.keys() & streaming_meta_info_keys:
+        meta_info[key] = meta_info[key][last_output_offset:]
+
+
+def _build_flat_input_top_logprobs_fields(
+    input_top_logprobs_val: List[Optional[List[float]]],
+    input_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat raw prompt top logprob response fields.
+
+    `input_top_logprobs_shape` is the literal [rows, k] shape of the flat
+    arrays. The leading null positions (counted by
+    `input_top_logprobs_null_prefix`) precede the arrays, so covered position
+    i, entry j lives at flat[(i - null_prefix) * k + j] and the covered range
+    spans null_prefix + rows positions. With ``return_b64``, the arrays are
+    base64 contiguous little-endian binary; the dtype marker fields let the
+    widths change later without a wire break.
+    """
+    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        input_top_logprobs_val, input_top_logprobs_idx, top_logprobs_num
+    )
+    if return_b64:
+        return _build_flat_input_top_logprobs_fields_from_arrays(
+            val_arr, idx_arr, null_prefix, return_b64=True
+        )
+    # Flatten the original python rows so the JSON numbers keep their full
+    # (float64) precision, matching the pre-scheduler-flat output.
+    return {
+        "input_top_logprobs_val_flat": [
+            v for row in input_top_logprobs_val[null_prefix:] for v in row
+        ],
+        "input_top_logprobs_idx_flat": [
+            i for row in input_top_logprobs_idx[null_prefix:] for i in row
+        ],
+        "input_top_logprobs_shape": [val_arr.shape[0], val_arr.shape[1]],
+        "input_top_logprobs_null_prefix": null_prefix,
+    }
+
+
+def _build_flat_input_top_logprobs_fields_from_arrays(
+    val_arr: np.ndarray,
+    idx_arr: np.ndarray,
+    null_prefix: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat response fields from scheduler-assembled [rows, k]
+    arrays (see `_build_flat_input_top_logprobs_fields` for the field
+    semantics)."""
+    fields: Dict[str, Any] = {}
+    if return_b64:
+        fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
+            val_arr.tobytes()
+        ).decode("utf-8")
+        fields["input_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
+            idx_arr.tobytes()
+        ).decode("utf-8")
+        fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
+        fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
+    else:
+        fields["input_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
+        fields["input_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
+    fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
+    fields["input_top_logprobs_null_prefix"] = null_prefix
+    return fields
+
+
+def get_processor_wrapper():
+    return get_processor(
+        get_serving().tokenizer_path,
+        tokenizer_mode=get_serving().tokenizer_mode,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_model().revision,
+        image_processor_backend=resolve_image_processor_backend(get_mm()),
+        tokenizer_backend=get_serving().tokenizer_backend,
+        model_name=get_model().model_path,
+    )
+
+
+def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
+    if isinstance(obj, BaseReq):
+        obj.http_worker_ipc = ipc_name
+    elif isinstance(
+        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+    ):
+        for req in obj:
+            req.http_worker_ipc = ipc_name
+    elif isinstance(obj, BaseBatchReq):
+        obj.http_worker_ipcs = [ipc_name] * len(obj.rids)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any, Sequence
 
 import torch
+from functools import wraps
+from copy import copy
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import get_compiler_backend, is_npu
@@ -175,3 +177,214 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def decide_needs_cpu_seq_lens(
+    attn_backends: Sequence[AttentionBackend],
+) -> bool:
+    """Whether FutureMap must publish seq_lens_cpu / sum.
+
+    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
+    CPU mirror outside the backend layer to split the batch) or ngram (its
+    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    """
+    # Local import: keep overlap_utils' module-level deps leaf-only so it stays
+    # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    if get_exec().overlap.enable_two_batch_overlap:
+        # FIXME: support TBO without seq lens cpu value
+        return True
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    if algo.is_ngram():
+        # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
+        # the tree mask, regardless of the attn backend (e.g. Triton opts out).
+        return True
+    # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
+    # missing flag -> True so undeclared backends stay on the legacy path.
+    return any(
+        getattr(b, "needs_cpu_seq_lens", True) for b in attn_backends if b is not None
+    )
+
+
+def decide_needs_confidence_relay() -> bool:
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    if not algo.is_dspark():
+        return False
+    return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+
+
+@torch.compile(dynamic=True, disable=_is_npu)
+def _assert_nonneg_and_invalidate(
+    values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Fused: assert all `values >= 0` and scatter -1 into `buf[indices]`.
+    Compiled so the reduction + assert + scatter run as one kernel launch."""
+    torch._assert_async((values >= 0).all())
+    buf[indices] = -1
+
+
+def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+    """Materialize input_ids at forward entry. Two sources:
+
+    - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
+    - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
+    """
+    if batch.prefill_input_ids_cpu is not None:
+        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        if batch.mix_running_indices is not None:
+            if batch.enable_overlap and not batch.spec_algorithm.is_none():
+                future_map.resolve_mixed_spec_tails(batch)
+            decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    decode_gpu,
+                    future_map.output_tokens_buf,
+                    batch.mix_running_indices,
+                )
+            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+        else:
+            batch.input_ids = prefill_gpu
+        batch.prefill_input_ids_cpu = None
+        batch.mix_running_indices = None
+    elif batch.input_ids is None and future_map.spec_algo.is_none():
+        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+            )
+
+    # Only the overlap path relays spec extras through the future_map; the
+    # synchronous (non-overlap) V2 path installs next_draft_input directly.
+    if batch.enable_overlap and not batch.spec_algorithm.is_none():
+        future_map._resolve_spec_extras(batch)
+
+
+class ResolvedConfidence(msgspec.Struct):
+    confidence: torch.Tensor
+    generation: torch.Tensor
+
+
+@dataclass
+class RelayPayload:
+    """Per-iteration stash payload for the FutureMap bufs. Non-spec fills only
+    `bonus_tokens`; which spec extras get relayed is decided by
+    `FutureMap.spec_algo`, not by this payload's shape."""
+
+    bonus_tokens: Optional[torch.Tensor]
+    topk_p: Optional[torch.Tensor] = None
+    topk_index: Optional[torch.Tensor] = None
+    hidden_states: Optional[torch.Tensor] = None
+    draft_probs: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    # ngram delays the draft extend (ngram update)
+    accept_tokens: Optional[torch.Tensor] = None
+    accept_lens: Optional[torch.Tensor] = None
+
+    @classmethod
+    def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:
+        return cls(
+            bonus_tokens=None,
+            accept_tokens=draft_input.accept_tokens.reshape(
+                -1, draft_input.draft_token_num
+            ),
+            accept_lens=draft_input.accept_lens,
+        )
+
+    @classmethod
+    def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
+        return cls(
+            bonus_tokens=draft_input.bonus_tokens,
+            topk_p=draft_input.topk_p,
+            topk_index=draft_input.topk_index,
+            hidden_states=draft_input.hidden_states,
+            draft_probs=getattr(draft_input, "draft_probs", None),
+            dsa_topk_indices=draft_input.dsa_topk_indices,
+        )
+
+
+class ConfidenceRelay(msgspec.Struct):
+    device: torch.device
+    req_pool_size: int
+    pool: Any
+    confidence_buf: Optional[torch.Tensor] = None
+    conf_ring: Optional[torch.Tensor] = None
+    gen_ring: Optional[torch.Tensor] = None
+    copy_done: Optional[list] = None
+    ring_pos: int = 0
+    initialized: bool = False
+
+    def _lazy_init(self, confidence: torch.Tensor) -> None:
+        self.initialized = True
+        gamma = confidence.shape[-1]
+        self.confidence_buf = torch.empty(
+            (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
+        )
+        if _is_cuda:
+            depth = CONFIDENCE_RELAY_RING_DEPTH
+            self.conf_ring = torch.empty(
+                (depth, self.req_pool_size, gamma),
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+            self.gen_ring = torch.zeros((depth, self.req_pool_size), dtype=torch.int64)
+            self.copy_done = [
+                torch.get_device_module(self.device).Event() for _ in range(depth)
+            ]
+
+    def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
+        if not self.initialized:
+            self._lazy_init(confidence)
+        self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
+
+    def issue_ring_copy(self, *, stream, publish_ready) -> None:
+        if not self.initialized or stream is None or publish_ready is None:
+            return
+        slot = self.ring_pos % CONFIDENCE_RELAY_RING_DEPTH
+        stream.wait_event(publish_ready)
+        with torch.get_device_module(self.device).stream(stream):
+            self.conf_ring[slot].copy_(self.confidence_buf, non_blocking=True)
+            self.copy_done[slot].record()
+        self.gen_ring[slot].copy_(self.pool.req_generation)
+        self.ring_pos += 1
+
+    def resolve(
+        self, batch: ScheduleBatch, *, stream, publish_ready
+    ) -> Optional[ResolvedConfidence]:
+        if not self.initialized:
+            return None
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return None
+        fi = draft_input.future_indices
+        if fi is None or fi.shape[0] == 0:
+            return None
+
+        if stream is None or publish_ready is None:
+            idx = batch.req_pool_indices
+            idx_cpu = batch.req_pool_indices_cpu
+            return ResolvedConfidence(
+                confidence=self.confidence_buf[idx].cpu(),
+                generation=self.pool.req_generation[idx_cpu].clone(),
+            )
+
+        if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
+            return None
+        slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
+        if not self.copy_done[slot].query():
+            return None
+
+        idx_cpu = batch.req_pool_indices_cpu
+        return ResolvedConfidence(
+            confidence=self.conf_ring[slot][idx_cpu],
+            generation=self.gen_ring[slot][idx_cpu],
+        )

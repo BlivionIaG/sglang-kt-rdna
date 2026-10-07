@@ -23,9 +23,10 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union, Tuple, Type
 
 import torch
+from copy import copy
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -1991,3 +1992,299 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class MMInputsProcessError(msgspec.Struct, frozen=True):
+    """Request-local multimodal input failure produced after tokenizer fanout."""
+
+    message: str
+
+
+class BeamSearchOutput(BaseBatchReq, kw_only=True):
+    sequences: List[BeamSearchSequence]
+
+
+class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
+    """Wraps an arbitrary Python object as pickle-serialized bytes for msgpack IPC.
+
+    In msgpack mode, fields that carry opaque or non-msgspec-typed payloads
+    (e.g. multimodal inputs, time stats, customized info) are stored as
+    PickleWrapper so the outer struct can still be msgpack-encoded.  In pickle
+    mode (_USE_PICKLE_IPC=True), wrap_as_pickle / unwrap_from_pickle are no-ops
+    and this class is not used on the wire.
+    """
+
+    data: bytes
+
+
+def build_flat_input_top_logprobs_arrays(
+    input_top_logprobs_val: List[Optional[List[float]]],
+    input_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Convert nested per-position prompt top logprob rows into the flat
+    arrays of the `return_flat_raw_top_logprobs` response format.
+
+    Returns (float32 values [rows, k], int32 token ids [rows, k],
+    null_prefix). The leading null rows are counted into null_prefix and
+    excluded from the arrays. Raises ValueError when the rows are not
+    representable by (shape, null_prefix): interior nulls or ragged k,
+    e.g. multi-item scoring.
+    """
+    num_rows = len(input_top_logprobs_val)
+    null_prefix = 0
+    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
+        null_prefix += 1
+    val_rows = input_top_logprobs_val[null_prefix:]
+    idx_rows = input_top_logprobs_idx[null_prefix:]
+    k = len(val_rows[0]) if val_rows else top_logprobs_num
+    for offset, row in enumerate(val_rows):
+        if row is None or len(row) != k:
+            raise ValueError(
+                "return_flat_raw_top_logprobs requires rectangular top logprob "
+                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                f"has {None if row is None else len(row)} entries (expected {k})."
+            )
+    val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
+    idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
+    return val_arr, idx_arr, null_prefix
+
+
+class AddExternalCorpusReqInput(BaseReq, kw_only=True):
+    corpus_id: Optional[str] = None
+    file_path: Optional[str] = None
+    documents: Optional[List[str]] = None
+    token_chunks: Optional[List[List[int]]] = None
+
+
+class AddExternalCorpusReqOutput(BaseReq, kw_only=True):
+    success: bool
+    corpus_id: str = ""
+    message: str = ""
+    loaded_token_count: int = 0
+
+
+class RemoveExternalCorpusReqInput(BaseReq, kw_only=True):
+    corpus_id: str
+
+
+class RemoveExternalCorpusReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
+class ListExternalCorporaReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
+    success: bool
+    corpus_token_counts: Dict[str, int] = msgspec.field(default_factory=dict)
+    message: str = ""
+
+
+class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
+    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+
+    worker_ipc_name: str
+
+
+class PauseContinueBroadcastReq(BaseReq, kw_only=True):
+    """Broadcast from router to all workers to set is_pause state."""
+
+    is_pause: bool
+
+
+class UpdateExpertBackupReq(BaseReq, kw_only=True):
+    pass
+
+
+class ExpertWeightPointer(msgspec.Struct, kw_only=True, array_like=True):
+    # One expert weight's pointer + byte length in the DRAM backup buffer.
+    # array_like: the map has tens of thousands of entries, so positional
+    # encoding drops the repeated field names from the wire.
+    weight_ptr: int
+    byte_size: int
+
+
+class BackupDramReq(BaseReq, kw_only=True):
+    rank: int
+    weight_pointer_map: Dict[str, ExpertWeightPointer]
+    session_id: str
+    buffer_size: int
+
+
+class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
+    pass
+
+
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Open a weight-update session: restore in-place-packed weights so new ones can load."""
+
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class ParallelismInfo(msgspec.Struct, kw_only=True):
+    # "target", or a draft role such as "draft" / "draft_step_0"
+    role: str
+    tp_rank: int
+    tp_size: int
+    dp_rank: int
+    dp_size: int
+    pp_rank: int
+    pp_size: int
+    rank: int
+    size: int
+
+
+class ChecksumInfo(msgspec.Struct, kw_only=True):
+    checksums: Dict[str, str]
+    per_gpu_checksum: str
+    # one entry per role (target plus each draft runner); all share the GPU rank
+    parallelism_info: List[ParallelismInfo]
+
+
+class PdRoleSwitchReqInput(BaseReq, kw_only=True):
+    # Target role; "" is an invalid sentinel rejected by the handler.
+    new_role: Literal["prefill", "decode", ""] = ""
+    # Optional decode bs to capture on a flip to decode (capture-to-fit);
+    # None uses the server's configured decode bs list.
+    decode_cuda_graph_bs: Optional[List[int]] = None
+    # Measured graph footprint from a matching decode peer.
+    decode_cuda_graph_memory_gb: Optional[float] = None
+
+
+class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
+
+
+class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+    """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
+
+    error_msg: str
+    error_code: int
+
+
+class ElasticScaleUpdateReq(BaseReq, kw_only=True):
+    """Report asynchronous Elastic EP scale completion or failure."""
+
+    success: bool
+    effective_ep_size: int
+    slot_offset: int = 0
+    slot_count: int = 0
+    error: Optional[str] = None
+
+
+class ScaleElasticEPReqInput(BaseReq, kw_only=True):
+    """Request to scale EP by changing the effective EP size (dp_attention mode)."""
+
+    new_ep_size: int
+
+
+class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    old_ep_size: int = 0
+    new_ep_size: int = 0
+    pending_ep_size: Optional[int] = None
+    scale_phase: str = "idle"
+
+
+class ShutdownReq(BaseReq, kw_only=True):
+    # Broadcast across TP ranks via the normal recv path, so all ranks break
+    # the scheduler loop on the same iteration.
+    pass
+
+
+def wrap_as_pickle(obj: object) -> object:
+    if obj is None:
+        return None
+    if _USE_PICKLE_IPC:
+        return obj
+    return PickleWrapper(pickle.dumps(obj))
+
+
+def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
+    if obj is None:
+        return None
+    if _USE_PICKLE_IPC:
+        return obj
+    if not isinstance(obj, PickleWrapper):
+        # Already materialized: the embedded Rust server attaches in-process
+        # objects (native-MM `mm_inputs`) without a pickle hop.
+        return obj
+    return pickle.loads(obj.data)
+
+
+def hook_custom_types(*new_types: Type):
+    global _msgpack_decoder, _all_types
+    _all_types = tuple(dict.fromkeys(_all_types + new_types))
+    _msgpack_decoder = msgspec.msgpack.Decoder(
+        Union[_all_types], dec_hook=dec_hook, ext_hook=ext_hook
+    )
+
+
+def _maybe_wrap_pickle(obj: Any) -> Any:
+    if isinstance(obj, (msgspec.Struct, *_primitive_types)):
+        return obj
+
+    raise TypeError(
+        f"Cannot serialize object of type {type(obj)} over msgpack IPC. "
+        "Add a precise msgspec-compatible type, or use an explicit PickleWrapper "
+        "field via wrap_as_pickle(...) for the opaque payload."
+    )
+
+
+def _maybe_unwrap_pickle(obj: Any) -> Any:
+    if isinstance(obj, PickleWrapper):
+        obj = pickle.loads(obj.data)
+        if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
+            logger.info(f"Object of type {type(obj)} is unwrapped from PickleWrapper.")
+        return obj
+
+    return obj
+
+
+def msgpack_encode(obj: Any) -> bytes:
+    return _msgpack_encoder.encode(_maybe_wrap_pickle(obj))
+
+
+def msgpack_decode(data: bytes) -> Any:
+    return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
+
+
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+    if _USE_PICKLE_IPC:
+        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+
+    socket.send(msgpack_encode(obj), flags=flags)
+
+
+def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
+    if _USE_PICKLE_IPC:
+        return socket.recv_pyobj(flags=flags)
+
+    data = socket.recv(flags=flags)
+    return msgpack_decode(data)

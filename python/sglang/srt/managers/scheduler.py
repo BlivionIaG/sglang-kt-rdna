@@ -20,9 +20,9 @@ import signal
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union, Set
 
 import psutil
 import setproctitle
@@ -32,6 +32,8 @@ import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
+from functools import reduce
+from copy import copy
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.grammar_manager import GrammarManager
@@ -3270,3 +3272,155 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _prewarm_hccl_group(device, group, device_module):
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=group)
+    device_module.synchronize()
+
+
+@dataclasses.dataclass(frozen=True)
+class _MultimodalInputBroadcast:
+    inputs: Optional[MultimodalInputs] = None
+    error: Optional[str] = None
+
+
+class _MultimodalInputProcessingError(RuntimeError):
+    pass
+
+
+def _accumulate_decode_moment(
+    totals: list[float],
+    batch_size: int,
+    step_us: int,
+    generated: int,
+) -> None:
+    if batch_size <= 0 or step_us <= 0:
+        return
+    b = float(batch_size)
+    t = float(step_us)
+    g = float(generated)
+    totals[0] += 1.0
+    totals[1] += b
+    totals[2] += t
+    totals[3] += b * b
+    totals[4] += b * t
+    totals[5] += g
+
+
+def dispatch_event_loop(scheduler: Scheduler):
+    if scheduler.server_args.enable_pd_role_switch:
+        return role_switch.run_event_loop_supervisor(
+            scheduler,
+            _dispatch_event_loop_once,
+        )
+    return _dispatch_event_loop_once(scheduler)
+
+
+def _dispatch_event_loop_once(scheduler: Scheduler):
+    # A PD role switch can select a different loop on the same scheduler.
+    scheduler.enable_continuous_input_polling = False
+    disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    if disaggregation_mode == DisaggregationMode.NULL:
+        if scheduler.enable_pdmux:
+            scheduler.event_loop_pdmux()
+        elif get_parallel().pp_size > 1:
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap_mlx:
+            scheduler.event_loop_overlap_mlx()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
+    elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if get_parallel().pp_size > 1:
+            scheduler.event_loop_pp_disagg_prefill()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            scheduler.event_loop_normal_disagg_prefill()
+    elif disaggregation_mode == DisaggregationMode.DECODE:
+        if get_parallel().pp_size > 1:
+            scheduler.event_loop_pp_disagg_decode()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
+
+
+def resolve_spawn_dp_rank(dp_rank: Optional[int]) -> Optional[int]:
+    """Resolve the launcher DP rank, falling back to ``SGLANG_DP_RANK``."""
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        return int(os.environ["SGLANG_DP_RANK"])
+    return dp_rank
+
+
+def configure_scheduler_process(
+    server_args: ServerArgs,
+    gpu_id: int,
+    display_tp_rank: Optional[int] = None,
+    display_dp_rank: Optional[int] = None,
+    display_moe_ep_rank: Optional[int] = None,
+) -> None:
+    """Configure scheduler worker logging and process title.
+
+    Runs after `publish`, so every rank it labels the process with comes from
+    the context. display_* ranks are cosmetic; runtime ranks stay local.
+    """
+    kill_itself_when_parent_died()
+
+    # Generate the logger prefix
+    parallel = get_parallel()
+    shown_dp = display_dp_rank if display_dp_rank is not None else parallel.dp_rank
+    shown_tp = display_tp_rank if display_tp_rank is not None else parallel.tp_rank
+    shown_moe_ep = (
+        display_moe_ep_rank if display_moe_ep_rank is not None else parallel.moe_ep_rank
+    )
+
+    prefix = ""
+    if shown_dp is not None:
+        prefix += f" DP{shown_dp}"
+    if parallel.pp_size > 1:
+        prefix += f" PP{parallel.pp_rank}"
+    if parallel.attn_cp_size > 1:
+        prefix += f" ATTN_CP{parallel.attn_cp_rank}"
+    if parallel.moe_dp_size > 1:
+        prefix += f" MOE_DP{parallel.moe_dp_rank}"
+    if parallel.tp_size > 1:
+        prefix += f" TP{shown_tp}"
+    if parallel.ep_size > 1:
+        prefix += f" EP{shown_moe_ep}"
+
+    # Config the process
+    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
+    faulthandler.enable()
+
+    # Configure the logger
+    configure_logger(server_args, prefix=prefix)
+    suppress_other_loggers()
+
+    # Set cpu affinity to this gpu process
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        set_gpu_proc_affinity(gpu_id)
+    if not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        if numa_node is not None:
+            numa_bind_to_node(numa_node)
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(
+        rid=req.rid,
+        finished_reason=finished_reason,
+        weight_versions=compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=get_serving().weight_version,
+            num_output_tokens=len(req.output_ids),
+        ),
+    )

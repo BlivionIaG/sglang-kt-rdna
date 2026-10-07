@@ -211,3 +211,23 @@ def create_dummy_verify_input(
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
     return spec_info
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def spec_scale_global_num_tokens(
+    spec_info: SpecInput,
+    global_num_tokens: List[int],
+    global_num_tokens_for_logprob: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Scale the raw per-rank sync values (request counts on decode-family
+    rounds) into this forward's token units using the spec input's uniform
+    per-request widths."""
+    return (
+        [x * spec_info.num_tokens_per_req for x in global_num_tokens],
+        [
+            x * spec_info.num_tokens_for_logprob_per_req
+            for x in global_num_tokens_for_logprob
+        ],
+    )

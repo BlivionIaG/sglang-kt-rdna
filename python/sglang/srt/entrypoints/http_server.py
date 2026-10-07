@@ -34,6 +34,9 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
+    Tuple,
+    Type,
     Union,
 )
 
@@ -59,6 +62,9 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from dataclasses import dataclass, field
+from enum import auto
+from copy import copy
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -2069,3 +2075,474 @@ def launch_server(
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
+def _anthropic_validation_message(raw_errors) -> str:
+    """Render Pydantic-style errors for an Anthropic /v1/messages route.
+
+    Builds a short ``loc: msg`` digest that names the offending fields without
+    leaking file paths or Python internals (the default ``str(exc)`` includes
+    the dispatcher's ``File "/.../http_server.py"`` line).
+    """
+    parts: list[str] = []
+    for err in raw_errors or []:
+        loc = err.get("loc") or ()
+        if loc:
+            loc_str = ".".join(str(p) for p in loc if p not in ("body",))
+        else:
+            loc_str = ""
+        msg = (err.get("msg") or "").strip()
+        if loc_str and msg:
+            parts.append(f"{loc_str}: {msg}")
+        elif msg:
+            parts.append(msg)
+    text = "; ".join(parts) or "Invalid request"
+    if len(text) > 500:
+        text = text[:500] + "…"
+    return text
+
+
+def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
+    """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
+    return ORJSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+    )
+
+
+def _get_vlm_warmup_image_base64(model_info: dict) -> str:
+    """Choose the VLM image used by the startup warmup request.
+
+    A 512x512 image triggers Kimi K2.5/K2.7's representative compiled
+    position-interpolation path during startup. Kimi K3 uses a 448x448 image
+    matching its native vision patch grid. This keeps one-time vision setup
+    work out of the first external image request.
+    Other VLMs retain the minimal image to avoid changing their startup cost.
+    """
+
+    architectures = model_info.get("architectures") or []
+    if (
+        "KimiK3ForConditionalGeneration" in architectures
+        or model_info.get("model_type") == "kimi_k3"
+    ):
+        logger.info(
+            "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
+            "its native 32x32 vision patch grid."
+        )
+        return KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64
+    if "KimiK25ForConditionalGeneration" in architectures:
+        logger.info(
+            "Using a 512x512 image for Kimi VLM startup warmup to compile "
+            "MoonViT position interpolation."
+        )
+        return KIMI_VLM_WARMUP_PNG_PICTURE_BASE64
+    return MINIMUM_PNG_PICTURE_BASE64
+
+
+def _freeze_gc_after_server_warmup(server_args: ServerArgs):
+    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    freeze_key = get_serving().admin_api_key or get_serving().api_key
+    freeze_headers = {}
+    if freeze_key:
+        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+
+
+def _run_granian_server(
+    host,
+    port,
+    log_level,
+    http2_max_concurrent_streams,
+    http2_initial_connection_window_size,
+    tokenizer_manager=None,
+    tokenizer_worker_num=1,
+    ssl_certfile=None,
+    ssl_keyfile=None,
+    ssl_ca_certs=None,
+    ssl_keyfile_password=None,
+    ssl_verify=False,  # MTls is not supported
+    backlog=2048,
+    backpressure=2048,
+):
+    """Serve the in-process ASGI app with Granian (embedded mode) over HTTP/2.
+
+    Unlike Granian's default multi-process server, the embedded server runs a
+    single worker as an asyncio task inside the current process. It therefore
+    serves the live ``app`` object directly and reuses the already-initialized
+    global state (tokenizer manager, templates, ...) through the normal
+    single-tokenizer lifespan path -- no shared memory or worker re-init needed.
+    The event loop is uvloop. The default backlog and backpressure values are set
+    exactly like uvicorn's defaults.
+    """
+    import signal
+
+    from granian import Granian
+    from granian.constants import HTTPModes, Interfaces, Loops
+    from granian.http import HTTP2Settings
+    from granian.server.embed import Server as GranianEmbeddedServer
+
+    Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
+    target = (
+        app if tokenizer_worker_num == 1 else "sglang.srt.entrypoints.http_server:app"
+    )
+    granian_kwargs = dict(
+        target=target,
+        address=host,
+        port=port,
+        interface=Interfaces.ASGI,
+        http=HTTPModes.auto,
+        http2_settings=HTTP2Settings(
+            initial_connection_window_size=http2_initial_connection_window_size,
+            max_concurrent_streams=http2_max_concurrent_streams,
+        ),
+        log_level=log_level,
+        ssl_cert=ssl_certfile,
+        ssl_key=ssl_keyfile,
+        ssl_key_password=ssl_keyfile_password,
+        ssl_ca=ssl_ca_certs,
+        ssl_client_verify=ssl_verify,
+        backlog=backlog,
+        backpressure=backpressure,
+    )
+
+    if tokenizer_worker_num > 1:
+        granian_kwargs["workers"] = tokenizer_worker_num
+        granian_kwargs["loop"] = Loops.uvloop
+
+    server = Server(**granian_kwargs)
+
+    if tokenizer_worker_num == 1:
+        if tokenizer_manager is not None:
+            # auto_create_handle_loop replaces the signal handler wired below,
+            # so shutdown can only reach this server through the hook.
+            tokenizer_manager.set_server_stop_hook(server.stop)
+
+        async def serve():
+            # The embedded server does not install its own signal handlers, so wire
+            # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, server.stop)
+                except (NotImplementedError, ValueError):
+                    pass
+            await server.serve()
+
+        uvloop.run(serve())
+    else:
+        server.serve()
+
+
+def _setup_and_run_http_server(
+    server_args: ServerArgs,
+    tokenizer_manager,
+    template_manager,
+    port_args: PortArgs,
+    scheduler_infos: List[Dict],
+    subprocess_watchdog: Optional[SubprocessWatchdog],
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """Set up global state, configure middleware, and run uvicorn.
+
+    Called by launch_server after subprocesses have been launched.
+    """
+    # Set global states
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_infos[0],
+        )
+    )
+
+    # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
+    if tokenizer_manager is not None:
+        tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+
+    if get_observability().enable_metrics:
+        add_prometheus_track_response_middleware(app)
+
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    if get_serving().tokenizer_worker_num == 1:
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_kwargs = dict(
+            server_args=server_args,
+            launch_callback=launch_callback,
+            execute_warmup_func=execute_warmup_func,
+        )
+
+        # Add api key authorization
+        # This is only supported in single tokenizer mode.
+        #
+        # Backward compatibility:
+        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+        #   admin_api_key is not configured.
+        if (
+            get_serving().api_key
+            or get_serving().admin_api_key
+            or app_has_admin_force_endpoints(app)
+        ):
+            from sglang.srt.utils.auth import add_api_key_middleware
+
+            add_api_key_middleware(
+                app,
+                api_key=get_serving().api_key,
+                admin_api_key=get_serving().admin_api_key,
+            )
+    else:
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args,
+            server_args,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
+        )
+
+    try:
+        # Update logging configs
+        set_uvicorn_logging_configs(server_args)
+
+        if get_serving().ssl_certfile:
+            logger.info(
+                f"SSL enabled: certfile={get_serving().ssl_certfile}, "
+                f"keyfile={get_serving().ssl_keyfile}"
+            )
+
+        # Listen for HTTP requests
+        if get_serving().tokenizer_worker_num == 1:
+            if get_serving().enable_http2:
+                logger.info(
+                    f"Starting embedded Granian HTTP/2 server on "
+                    f"{get_serving().host}:{get_serving().port}"
+                )
+                _run_granian_server(
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    http2_max_concurrent_streams=(
+                        get_serving().http2_max_concurrent_streams
+                    ),
+                    http2_initial_connection_window_size=(
+                        get_serving().http2_initial_connection_window_size
+                    ),
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                    ssl_verify=False,  # No MTLS supported for now.
+                    tokenizer_manager=tokenizer_manager,
+                )
+            elif get_serving().enable_ssl_refresh:
+                # Use Config/Server API for access to the SSLContext.
+                config = uvicorn.Config(
+                    app,
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    root_path=get_serving().fastapi_root_path,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                )
+                config.load()  # Creates the SSLContext
+
+                from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
+
+                server = uvicorn.Server(config)
+                tokenizer_manager.set_server_stop_hook(
+                    lambda: setattr(server, "should_exit", True)
+                )
+
+                async def _run_with_ssl_refresh():
+                    refresher = SSLCertRefresher(
+                        config.ssl,
+                        get_serving().ssl_keyfile,
+                        get_serving().ssl_certfile,
+                        get_serving().ssl_ca_certs,
+                    )
+                    logger.info("SSL certificate auto-refresh enabled.")
+                    try:
+                        await server.serve()
+                    finally:
+                        refresher.stop()
+
+                import asyncio
+
+                asyncio.run(_run_with_ssl_refresh())
+            else:
+                # Default case, one tokenizer process.
+                # A Server rather than uvicorn.run(), so shutdown can ask it to stop.
+                server = uvicorn.Server(
+                    uvicorn.Config(
+                        app,
+                        host=get_serving().host,
+                        port=get_serving().port,
+                        root_path=get_serving().fastapi_root_path,
+                        log_level=get_observability().log_level_http
+                        or get_observability().log_level,
+                        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                        loop="uvloop",
+                        ssl_keyfile=get_serving().ssl_keyfile,
+                        ssl_certfile=get_serving().ssl_certfile,
+                        ssl_ca_certs=get_serving().ssl_ca_certs,
+                        ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                    )
+                )
+                tokenizer_manager.set_server_stop_hook(
+                    lambda: setattr(server, "should_exit", True)
+                )
+                server.run()
+        else:
+            # Multiple tokenizer and http processes.
+            # Child processes re-import the app, so no stop hook here.
+            from uvicorn.config import LOGGING_CONFIG
+
+            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
+
+            if get_serving().enable_ssl_refresh:
+                logger.warning(
+                    "--enable-ssl-refresh is not supported with multiple "
+                    "tokenizer workers (--tokenizer-worker-num > 1). "
+                    "SSL refresh will be disabled."
+                )
+
+            if get_serving().enable_http2:
+                logger.info(
+                    f"Starting embedded Granian HTTP/2 server on "
+                    f"{get_serving().host}:{get_serving().port}"
+                )
+                _run_granian_server(
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    http2_max_concurrent_streams=(
+                        get_serving().http2_max_concurrent_streams
+                    ),
+                    http2_initial_connection_window_size=(
+                        get_serving().http2_initial_connection_window_size
+                    ),
+                    tokenizer_worker_num=get_serving().tokenizer_worker_num,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                )
+            else:
+                uvicorn.run(
+                    "sglang.srt.entrypoints.http_server:app",
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    root_path=get_serving().fastapi_root_path,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
+                    loop="uvloop",
+                    workers=get_serving().tokenizer_worker_num,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                )
+    finally:
+        if get_serving().tokenizer_worker_num > 1:
+            if multi_tokenizer_args_shm is not None:
+                multi_tokenizer_args_shm.unlink()
+            if _global_state is not None:
+                _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+    grpc_port,
+):
+    from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
+
+    runtime_handle = RuntimeHandle(
+        tokenizer_manager=tokenizer_manager,
+        template_manager=template_manager,
+        server_args=server_args,
+        scheduler_info=scheduler_info or {},
+    )
+
+    grpc_handle = grpc_native.start_server(
+        host=get_serving().host,
+        port=grpc_port,
+        runtime_handle=runtime_handle,
+        worker_threads=get_serving().grpc_worker_threads,
+        response_timeout_secs=get_serving().grpc_response_timeout_secs,
+    )
+    logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
+    return grpc_handle
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")

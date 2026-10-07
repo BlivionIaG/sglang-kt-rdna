@@ -23,12 +23,15 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Tuple, Union, Set
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from functools import reduce
+from enum import auto
+from copy import copy
 
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -2836,3 +2839,41 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@dataclass(frozen=True)
+class SamplingPrewarmResult:
+    """Memory requirements observed while pre-warming a sampling path."""
+
+    sampling_input_bytes: int = 0
+    sampling_headroom_bytes: int = 0
+
+
+def _prefill_cuda_graph_allows_context_parallel(
+    prefill_runner, forward_batch: ForwardBatch
+) -> bool:
+    """Allow CP only through a runner that captured the validated CP body."""
+    return get_cp_strategy() is None or (
+        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
+        and is_cp_active(forward_batch)
+    )
+
+
+def resolve_draft_attention_backend(
+    *,
+    draft_attention_backend: Optional[str],
+    is_draft_worker: bool,
+) -> Optional[str]:
+    """The attention backend a runner uses because it is a draft runner.
+
+    ``None`` for a target runner. For a draft: the backend the algorithm that
+    built it resolved (the supported-backend fallback in
+    ``build_draft_tp_worker``), else ``--speculative-draft-attention-backend``.
+    It belongs to the runner, not the process: target and draft coexist.
+    """
+    if not is_draft_worker:
+        return None
+    return draft_attention_backend or get_spec().speculative_draft_attention_backend

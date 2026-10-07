@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+from copy import copy
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -110,3 +111,11 @@ class SWAChunkCache(ChunkCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class PureSWAChunkCache(SWAChunkCache):
+    """ChunkCache for all-SWA models (no full attention layers): no
+    full_to_swa_index_mapping, so free_kv_row must skip the window-evicted span."""

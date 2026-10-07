@@ -40,13 +40,14 @@ import dataclasses
 import logging
 import re
 from enum import Enum, auto
-from functools import lru_cache
+from functools import lru_cache, partial, reduce
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union, NamedTuple
 
 import numpy as np
 import torch
+from copy import copy
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
@@ -2493,3 +2494,354 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def get_return_hidden_states_mode(
+    return_hidden_states: ReturnHiddenStatesMode,
+) -> CaptureHiddenMode:
+    if return_hidden_states is True:
+        return CaptureHiddenMode.FULL
+    if return_hidden_states == "last":
+        return CaptureHiddenMode.LAST
+    if return_hidden_states is False:
+        return CaptureHiddenMode.NULL
+    raise ValueError(
+        "return_hidden_states must be a boolean or the string literal 'last'."
+    )
+
+
+def get_request_return_hidden_states_mode(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> CaptureHiddenMode:
+    if isinstance(return_hidden_states, list):
+        return max(
+            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
+            default=CaptureHiddenMode.NULL,
+        )
+    return get_return_hidden_states_mode(return_hidden_states)
+
+
+def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
+    mode = CaptureHiddenMode.NULL
+    for req in reqs:
+        mode = max(mode, req.return_hidden_states_mode)
+    return mode
+
+
+def need_return_hidden_states(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> bool:
+    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
+
+
+def split_cached_prefix_by_tier(
+    prefix_len: int,
+    host_hit_len: int,
+    storage_hit_len: int,
+    storage_hit_start: Optional[int] = None,
+    host_hit_is_storage: bool = False,
+) -> tuple[int, int, int]:
+    """Split a request's cached prefix into (device, host, storage) tokens.
+
+    ``host_hit_len`` is the materialized host hit. An exact L3-loaded span is
+    preserved after H2D promotion, while an evicted tail is clipped by
+    ``prefix_len``. In buffer mode host memory is only L3 staging.
+    """
+    host_hit_len = min(prefix_len, host_hit_len)
+    host_start = prefix_len - host_hit_len
+    if storage_hit_start is None:
+        if host_hit_is_storage:
+            storage = host_hit_len
+            host = 0
+        else:
+            storage = min(host_hit_len, storage_hit_len)
+            host = host_hit_len - storage
+    else:
+        storage_end = storage_hit_start + storage_hit_len
+        storage = max(
+            0,
+            min(prefix_len, storage_end) - max(0, storage_hit_start),
+        )
+        storage_in_host = max(
+            0,
+            min(prefix_len, storage_end) - max(host_start, storage_hit_start),
+        )
+        host = 0 if host_hit_is_storage else host_hit_len - storage_in_host
+    device = prefix_len - host - storage
+    return device, host, storage
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqLogprob:
+    top_logprobs_num: int
+    token_ids_logprob: Optional[List[int]]
+    input_token_logprobs_val: Optional[List[float]] = None
+    input_token_logprobs_idx: Optional[List[int]] = None
+    input_top_logprobs_val: Optional[List[List[float]]] = None
+    input_top_logprobs_idx: Optional[List[List[int]]] = None
+    # Flat replacements for the rows above (see
+    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # emptied and the arrays ship instead.
+    input_top_logprobs_val_flat: Optional[np.ndarray] = None
+    input_top_logprobs_idx_flat: Optional[np.ndarray] = None
+    input_top_logprobs_flat_null_prefix: Optional[int] = None
+    input_token_ids_logprobs_val: Optional[List[List[float]]] = None
+    input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
+    output_token_logprobs_val: Optional[list] = None
+    output_token_logprobs_idx: Optional[list] = None
+    output_top_logprobs_val: Optional[list] = None
+    output_top_logprobs_idx: Optional[list] = None
+    # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+    output_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
+        None
+    )
+    output_token_ids_logprobs_idx: Optional[list] = None
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqKvInfo:
+    # Device KV a request holds outside the prefix cache. Always present on the Req;
+    # whether any KV is held is `holds_kv` (a row is registered).
+    # Match observations and scheduling state stay on the Req itself.
+    req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
+
+    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
+    # This request already inserted [0, here) into the tree; later inserts count
+    # a hit only on the nodes past it, so a request counts each node once.
+    cache_inserted_len: int = 0
+    kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
+    kv_allocated_len: int = 0
+
+    # SWA slots in [swa_dead_lo(page_size), get_evicted_seqlen(SWA)) are freed.
+    swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict
+    )
+
+    # Host-side KV backup the request holds across a retraction (unified cache).
+    retraction_backup: Optional[RetractionBackup] = None
+
+    # Mamba state: an independent resource; whether it is held is `holds_mamba`.
+    mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    mamba_next_track_idx: Optional[int] = None  # 0 or 1
+    mamba_last_track_idx: Optional[int] = None  # 0 or 1
+    # Seq len of the last cached mamba state
+    mamba_last_track_seqlen: Optional[int] = None
+    # Seq len of the other ping-pong slot's state. None means what is in
+    # that slot cannot be named (never written, donated, freed).
+    mamba_prev_track_seqlen: Optional[int] = None
+    # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
+    mamba_cow_src_index: Optional[torch.Tensor] = None
+    # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
+    mamba_needs_clear: bool = False
+
+    def swa_dead_lo(self, page_size: int) -> int:
+        # Lowest SWA position this request may free itself: above the tree-owned
+        # prefix and above the eviction shield, page-aligned upward.
+        lo = max(self.cache_protected_len, self.swa_evict_floor)
+        if page_size > 1 and lo > self.cache_protected_len:
+            lo = ceil_align(lo, page_size)
+        return lo
+
+    @property
+    def holds_kv(self) -> bool:
+        return self.req_pool_idx is not None
+
+    @property
+    def holds_mamba(self) -> bool:
+        return self.mamba_pool_idx is not None
+
+    @property
+    def is_kv_released(self) -> bool:
+        return self.kv_allocated_len == 0 and self.max_evicted_seqlen == 0
+
+    @property
+    def max_evicted_seqlen(self) -> int:
+        return max(self.component_evicted_seqlens.values(), default=0)
+
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        self.component_evicted_seqlens[component_type] = length
+
+    def clamp_evicted_seqlens(self, length: int) -> None:
+        for component, cursor in self.component_evicted_seqlens.items():
+            self.component_evicted_seqlens[component] = min(cursor, length)
+
+    def mark_kv_released(self) -> None:
+        self.kv_allocated_len = 0
+        self.component_evicted_seqlens.clear()
+
+
+class _MambaRadixCacheV2TrackEntry(NamedTuple):
+    track_mask: bool
+    track_index: int
+    track_seqlen: int
+
+
+def mamba_lazy_spec_in_window(
+    req, mamba_track_interval: int, max_draft_tokens: int
+) -> bool:
+    """Whether a track-interval crossing is reachable by an in-flight verify.
+
+    kv_committed_len lags device seq_lens by up to one verify under overlap;
+    the 2x window absorbs it.
+    """
+    seq_len = req.kv.kv_committed_len
+    window = 2 * max_draft_tokens
+    return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
+
+
+def set_mamba_track_indices_from_reqs(
+    batch, track_positions: Optional[List[int]] = None
+):
+    """Build mamba_track_indices from req objects (authoritative source).
+
+    track_positions: optional per-req ping-pong position override (the lazy
+    spec track plan, see mamba_lazy_spec_prepare).
+    """
+    req_to_token_pool = batch.req_to_token_pool
+    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+        batch.req_pool_indices
+    ]  # (bs, ping_pong_size), int64, on device
+    if track_positions is None:
+        # Guard: mamba_next_track_idx may be None for requests that haven't
+        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+        # Keep the gather in bounds for those requests. Freed rows are
+        # invalidated below so they cannot scatter into a recycled slot.
+        track_positions = [
+            (
+                req.kv.mamba_next_track_idx
+                if req.kv.mamba_next_track_idx is not None
+                else 0
+            )
+            for req in batch.reqs
+        ]
+    freed_rows = [
+        i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
+    ]
+    batch.mamba_track_buffer_indices = list(track_positions)
+    idx = (
+        torch.tensor(
+            track_positions,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        .unsqueeze(1)
+        .to(device=all_buffers.device, non_blocking=True)
+    )
+    batch.mamba_track_indices = (
+        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    )
+    if freed_rows:
+        # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
+        # been freed and reused by another request. The downstream scatter
+        # treats a negative destination as a no-op, while the old fallback to
+        # position 0 could overwrite the reused live slot.
+        batch.mamba_track_indices[freed_rows] = -1
+
+
+def release_req(
+    *,
+    req: Req,
+    remaing_req_count: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    tree_cache: BasePrefixCache,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+    offload_kv: bool = True,
+) -> bool:
+    """Returns False when the KV backup failed and the request cannot be resumed."""
+    if hisparse_coordinator is not None and not req.finished():
+        hisparse_coordinator.retract_req(req)
+
+    # In decode disaggregation the retracted KV is offloaded to host so it can be
+    # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
+    # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
+    # pass offload_kv=False to skip the wasteful device->host copy.
+    backup_saved = True
+    # The config bag reflects role flips; server_args keeps the launch role.
+    if get_disagg().disaggregation_mode == "decode" and offload_kv:
+        backup_saved = backup_kv_cache(
+            req,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            get_disagg().disaggregation_decode_retraction_backup,
+        )
+    # TODO (csy): for preempted requests, we may want to insert into the tree
+    release_kv_cache(req, tree_cache, checkpoint=False)
+    # NOTE(lsyin): we should use the newly evictable memory instantly.
+    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    req.reset_for_retract()
+    return backup_saved
+
+
+def retract_all(
+    *,
+    reqs: List[Req],
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    tree_cache: BasePrefixCache,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+    offload_kv: bool = True,
+) -> None:
+    for idx in range(len(reqs)):
+        release_req(
+            req=reqs[idx],
+            remaing_req_count=len(reqs) - idx,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            hisparse_coordinator=hisparse_coordinator,
+            offload_kv=offload_kv,
+        )
+
+
+def compute_extend_logprob_start_len(
+    *,
+    logprob_start_len: int,
+    prefix_len: int,
+    extend_len: int,
+    full_untruncated_fill_len: int,
+) -> int:
+    # Key variables:
+    # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+    # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+    # - extend_input_len: Number of tokens that need to be processed in this extend batch
+    if logprob_start_len == -1:
+        resolved_start = full_untruncated_fill_len
+    else:
+        # logprob_start_len should be at least the length of the prefix indices
+        resolved_start = max(logprob_start_len, prefix_len)
+    return min(resolved_start - prefix_len, extend_len)
+
+
+def _compute_chunked_req_next_prompt_token(
+    chunked_req: Optional[Req],
+    vocab_size: int,
+) -> Optional[int]:
+    """Return the next real prompt token after the fill boundary, skipping
+    multimodal placeholder (hash) tokens that lie outside the model vocab."""
+    if chunked_req is None:
+        return None
+    fill_len = chunked_req.extend_range.end
+    origin_ids = chunked_req.origin_input_ids
+    if fill_len >= len(origin_ids):
+        return None
+    if origin_ids[fill_len] < vocab_size:
+        return int(origin_ids[fill_len])
+    return None
+
+
+class NextBatchPlan(msgspec.Struct):
+    batch_to_run: Optional[ScheduleBatch]
+    running_batch: ScheduleBatch

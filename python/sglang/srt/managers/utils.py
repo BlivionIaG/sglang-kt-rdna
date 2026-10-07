@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union, Any
 
 import torch
+from dataclasses import dataclass, field
+from enum import auto
+from copy import copy
 
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -204,3 +207,138 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         raise NotImplementedError(
             "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def allocate_distinct_stream(device_module, avoid_streams):
+    """Draw a stream that aliases none of ``avoid_streams``.
+
+    CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
+    may hand back one that is already in use.
+    """
+    avoid = {stream.cuda_stream for stream in avoid_streams}
+    for _ in range(65):
+        stream = device_module.Stream(priority=0)
+        if stream.cuda_stream not in avoid:
+            return stream
+    raise RuntimeError("Unable to allocate a distinct stream")
+
+
+@dataclass
+class EmbeddingBatchResult:
+    """Result from an embedding/classification forward pass.
+
+    Attributes:
+        embeddings: Model output — pooled embeddings or classification logits.
+        pooled_hidden_states: Raw hidden states before the task head.  Present
+            only when the batch contained ``return_pooled_hidden_states=True``
+            requests.  Tensor (uniform shapes) or list of tensors (MIS).
+        copy_done: CUDA event recorded after the async CPU copy completes.
+    """
+
+    embeddings: torch.Tensor
+    pooled_hidden_states: Optional[torch.Tensor] = None
+    copy_done: Optional[torch.cuda.Event] = None
+    can_run_cuda_graph: bool = False
+
+    @torch.profiler.record_function("copy_embedding_to_cpu")
+    def copy_to_cpu(self):
+        """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
+        if isinstance(self.embeddings, torch.Tensor):
+            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
+            self.embeddings = _async_d2h(self.embeddings)
+        else:
+            assert isinstance(self.embeddings, list)
+            if len(self.embeddings) == 0:
+                return
+
+            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
+            self.embeddings = [_async_d2h(emb) for emb in self.embeddings]
+
+        if self.pooled_hidden_states is not None:
+            if isinstance(self.pooled_hidden_states, list):
+                self.pooled_hidden_states = [
+                    _async_d2h(t) for t in self.pooled_hidden_states
+                ]
+            else:
+                self.pooled_hidden_states = _async_d2h(self.pooled_hidden_states)
+
+        self.copy_done.record()
+
+
+def is_health_check_generate_req(recv_req):
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+class MsgpackDecodeError(ValueError):
+    """A msgpack frame the typed decoder rejected, with the failure explained:
+    ``rid`` (when recoverable from the raw tagged array) and a human-readable
+    ``reason`` whose leading ``$[<n>]`` array index is resolved to the struct
+    field name.
+    """
+
+    def __init__(self, rid: Optional[str], reason: str):
+        super().__init__(reason)
+        self.rid = rid
+        self.reason = reason
+
+
+def msgpack_decode_explained(data: bytes) -> Any:
+    """`io_struct.msgpack_decode`, but a rejected frame raises
+    `MsgpackDecodeError` carrying the rid (recovered via an untyped re-decode of
+    the tagged array) and a reason with the failing field named — for callers
+    that must report the failure back to a client (e.g. the rust ingress)
+    instead of just crashing."""
+    # TODO: the hook_custom_types() currently only apply for unit tests, once it
+    # esclate to the main code, we can provide a function to access the _all_types
+
+    try:
+        return io_struct.msgpack_decode(data)
+    except Exception as e:
+        msg = str(e)
+        try:
+            arr = msgspec.msgpack.decode(data)
+        except Exception:
+            arr = None
+        if not (isinstance(arr, (list, tuple)) and arr):
+            raise MsgpackDecodeError(None, msg) from e
+        # Tagged array_like layout is [tag, *fields]; rid is the first field of
+        # every BaseReq struct.
+        rid = str(arr[1]) if len(arr) > 1 and arr[1] is not None else None
+        tag_to_fields = {
+            cls.__struct_config__.tag: cls.__struct_fields__
+            for cls in io_struct._all_types
+            if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
+        }
+        fields = tag_to_fields.get(arr[0])
+        if fields is not None:
+            # Leading ``$[<n>]`` in a msgspec ValidationError path, e.g.
+            # ``$[12][0]``.
+            m = re.search(r"\$\[(\d+)\]", msg)
+            if m is not None:
+                idx = int(m.group(1))
+                if 1 <= idx <= len(fields):
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
+        raise MsgpackDecodeError(rid, msg) from e
+
+
+def compute_num_reserved_tokens() -> int:
+    """Output token slots reserved per request, on top of its input.
+
+    The current eagle implementation stores draft tokens in the output token
+    slots, so the context budget has to account for them; every other algorithm
+    reserves nothing. Shared by `TokenizerManager` and the rust server's
+    `server_args` handoff (`RustServer._build_server_args`), which needs the same
+    number to run the total-token check in Rust.
+    """
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not algorithm.is_eagle():
+        return 0
+    return max(
+        spec.speculative_eagle_topk * spec.speculative_num_steps,
+        max_speculative_num_draft_tokens(),
+    )
