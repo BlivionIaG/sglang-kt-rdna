@@ -2004,7 +2004,13 @@ class MMInputsProcessError(msgspec.Struct, frozen=True):
     message: str
 
 
-class BeamSearchOutput(BaseBatchReq, kw_only=True):
+# `kw_only=True` dropped for this fork: upstream's BaseBatchReq is a
+# msgspec.Struct (which accepts it), while this fork's is a @dataclass whose
+# fields already declare `kw_only=True` individually -- `rids` and
+# `http_worker_ipcs` -- so the generated signature is keyword-only either way,
+# and passing the class-level argument to a dataclass base raises
+# "__init_subclass__() takes no keyword arguments".
+class BeamSearchOutput(BaseBatchReq):
     sequences: List[BeamSearchSequence]
 
 
@@ -2054,52 +2060,52 @@ def build_flat_input_top_logprobs_arrays(
     return val_arr, idx_arr, null_prefix
 
 
-class AddExternalCorpusReqInput(BaseReq, kw_only=True):
+class AddExternalCorpusReqInput(BaseReq):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
     documents: Optional[List[str]] = None
     token_chunks: Optional[List[List[int]]] = None
 
 
-class AddExternalCorpusReqOutput(BaseReq, kw_only=True):
+class AddExternalCorpusReqOutput(BaseReq):
     success: bool
     corpus_id: str = ""
     message: str = ""
     loaded_token_count: int = 0
 
 
-class RemoveExternalCorpusReqInput(BaseReq, kw_only=True):
+class RemoveExternalCorpusReqInput(BaseReq):
     corpus_id: str
 
 
-class RemoveExternalCorpusReqOutput(BaseReq, kw_only=True):
+class RemoveExternalCorpusReqOutput(BaseReq):
     success: bool
     message: str = ""
 
 
-class ListExternalCorporaReqInput(BaseReq, kw_only=True):
+class ListExternalCorporaReqInput(BaseReq):
     pass
 
 
-class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
+class ListExternalCorporaReqOutput(BaseReq):
     success: bool
     corpus_token_counts: Dict[str, int] = msgspec.field(default_factory=dict)
     message: str = ""
 
 
-class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
+class TokenizerWorkerRegistrationReq(BaseReq):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
 
-class PauseContinueBroadcastReq(BaseReq, kw_only=True):
+class PauseContinueBroadcastReq(BaseReq):
     """Broadcast from router to all workers to set is_pause state."""
 
     is_pause: bool
 
 
-class UpdateExpertBackupReq(BaseReq, kw_only=True):
+class UpdateExpertBackupReq(BaseReq):
     pass
 
 
@@ -2111,33 +2117,33 @@ class ExpertWeightPointer(msgspec.Struct, kw_only=True, array_like=True):
     byte_size: int
 
 
-class BackupDramReq(BaseReq, kw_only=True):
+class BackupDramReq(BaseReq):
     rank: int
     weight_pointer_map: Dict[str, ExpertWeightPointer]
     session_id: str
     buffer_size: int
 
 
-class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
+class UpdateWeightVersionReqOutput(BaseReq):
     pass
 
 
-class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+class BeginWeightUpdateReqInput(BaseReq):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 
     selector: Literal["target", "draft", "all"] = "all"
 
 
-class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+class BeginWeightUpdateReqOutput(BaseReq):
     success: bool
     message: str
 
 
-class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+class EndWeightUpdateReqInput(BaseReq):
     """Close the weight-update session opened by BeginWeightUpdateReqInput."""
 
 
-class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+class EndWeightUpdateReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -2162,7 +2168,7 @@ class ChecksumInfo(msgspec.Struct, kw_only=True):
     parallelism_info: List[ParallelismInfo]
 
 
-class PdRoleSwitchReqInput(BaseReq, kw_only=True):
+class PdRoleSwitchReqInput(BaseReq):
     # Target role; "" is an invalid sentinel rejected by the handler.
     new_role: Literal["prefill", "decode", ""] = ""
     # Optional decode bs to capture on a flip to decode (capture-to-fit);
@@ -2172,7 +2178,7 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     decode_cuda_graph_memory_gb: Optional[float] = None
 
 
-class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
+class PdRoleSwitchReqOutput(BaseReq):
     success: bool = False
     message: str = ""
     old_role: str = ""
@@ -2180,14 +2186,14 @@ class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
     safe_to_restore: bool = False
 
 
-class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+class EncoderDispatchErrorReq(BaseReq):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
 
     error_msg: str
     error_code: int
 
 
-class ElasticScaleUpdateReq(BaseReq, kw_only=True):
+class ElasticScaleUpdateReq(BaseReq):
     """Report asynchronous Elastic EP scale completion or failure."""
 
     success: bool
@@ -2197,13 +2203,13 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     error: Optional[str] = None
 
 
-class ScaleElasticEPReqInput(BaseReq, kw_only=True):
+class ScaleElasticEPReqInput(BaseReq):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
 
 
-class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
+class ScaleElasticEPReqOutput(BaseReq):
     success: bool
     message: str
     old_ep_size: int = 0
@@ -2212,7 +2218,7 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     scale_phase: str = "idle"
 
 
-class ShutdownReq(BaseReq, kw_only=True):
+class ShutdownReq(BaseReq):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
     pass
