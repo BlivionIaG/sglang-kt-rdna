@@ -23,6 +23,7 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.model_executor.forward_context import get_attn_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -132,3 +133,83 @@ def unified_linear_attention_with_output(
 
     output.view(ret.shape).copy_(ret)
     return
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _linear_attention_with_output_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    attention_layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Run linear attention on the real prefix and initialize physical padding."""
+    real_num_tokens = min(
+        forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
+    )
+    if real_num_tokens == 0:
+        # A fully masked batch (an idle DP rank) needs no attention or state
+        # update, and GDN prefill kernels reject an empty varlen batch.
+        output.zero_()
+        return
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    logical_output = output[:, :real_num_tokens]
+    try:
+        ret = get_attn_backend().forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a.narrow(0 if a.ndim == 2 else 1, 0, real_num_tokens),
+            b=b.narrow(0 if b.ndim == 2 else 1, 0, real_num_tokens),
+            linear_attn_output=logical_output,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+    # FlashInfer GDN can write directly into the physical output's logical
+    # prefix. Other backends return their own tensor and keep the copy fallback.
+    if ret.data_ptr() != logical_output.data_ptr():
+        logical_output.copy_(ret)
+    # Physical padding participates in following residual, router, expert/MoE,
+    # and collective operations. Keep those inputs finite and deterministic.
+    output[:, real_num_tokens:].zero_()
+
+
+def _unified_linear_attention_with_output_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Eager implementation kept separate for backend-independent tests."""
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    _linear_attention_with_output_impl(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        attention_layer=attention_layer,
+        forward_batch=forward_batch,
+    )
+    return
+
+
+def _linear_attention_capture_stub(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    output.zero_()

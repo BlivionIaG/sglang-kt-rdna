@@ -235,3 +235,29 @@ def minimax_sparse_decode(
                 sm_scale=sm_scale,
             )
     return idx_o, o
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _warn_msa_fallback(err: Exception) -> None:
+    global _msa_fallback_warned
+    if _msa_fallback_warned:
+        return
+    logger.warning(
+        "MiniMax MSA backend is unavailable (%s); falling back to Triton sparse attention.",
+        err,
+    )
+    _msa_fallback_warned = True
+
+
+def _warn_gluon_fallback(msg: str) -> None:
+    global _gluon_fallback_warned
+    if _gluon_fallback_warned:
+        return
+    logger.warning(
+        "MiniMax Gluon sparse prefill is unavailable (%s); falling back to Triton "
+        "sparse attention.",
+        msg,
+    )
+    _gluon_fallback_warned = True

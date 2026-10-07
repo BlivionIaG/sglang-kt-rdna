@@ -564,3 +564,60 @@ __all__ = [
     "cudaStream_t",
     "buffer_type",
 ]
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class ncclConfig_t(ctypes.Structure):
+    """Mirror of ``ncclConfig_t`` (``ncclConfig_v22800``) from nccl.h.in.
+
+    Fields are append-only across NCCL versions, and NCCL only copies
+    ``min(config.size, sizeof(its own struct))`` bytes, so declaring the full
+    (newest) layout stays compatible with both older and newer libnccl.so.
+    """
+
+    _fields_ = [
+        # attributes that users should never touch.
+        ("size", ctypes.c_size_t),
+        ("magic", ctypes.c_uint),
+        ("version", ctypes.c_uint),
+        # attributes that users are able to customize.
+        ("blocking", ctypes.c_int),
+        ("cgaClusterSize", ctypes.c_int),
+        ("minCTAs", ctypes.c_int),
+        ("maxCTAs", ctypes.c_int),
+        ("netName", ctypes.c_char_p),
+        ("splitShare", ctypes.c_int),
+        ("trafficClass", ctypes.c_int),
+        ("commName", ctypes.c_char_p),
+        ("collnetEnable", ctypes.c_int),
+        ("CTAPolicy", ctypes.c_int),
+        ("shrinkShare", ctypes.c_int),
+        ("nvlsCTAs", ctypes.c_int),
+        ("nChannelsPerNetPeer", ctypes.c_int),
+        ("nvlinkCentricSched", ctypes.c_int),
+        ("graphUsageMode", ctypes.c_int),
+        ("numRmaCtx", ctypes.c_int),
+        ("maxP2pPeers", ctypes.c_int),
+    ]
+
+    @classmethod
+    def create(cls) -> "ncclConfig_t":
+        """Build a config equivalent to ``NCCL_CONFIG_INITIALIZER``.
+
+        All customizable fields are set to the UNDEF sentinels; callers may
+        override individual fields afterwards.
+        """
+        config = cls()
+        config.size = ctypes.sizeof(cls)
+        config.magic = NCCL_API_MAGIC
+        config.version = NCCL_CONFIG_VERSION
+        # Must explicitly set sentinels: ctypes zero-initializes, and 0 is a
+        # valid value for many fields (e.g. blocking=0 means non-blocking).
+        for name, ctype in cls._fields_[3:]:
+            if ctype is ctypes.c_char_p:
+                setattr(config, name, NCCL_CONFIG_UNDEF_PTR)
+            else:
+                setattr(config, name, NCCL_CONFIG_UNDEF_INT)
+        return config

@@ -6348,3 +6348,25 @@ from sglang.srt.layers.moe.quant_method_registry import register_moe_quant_wrapp
 register_moe_quant_wrapper(
     "kt_ep", _kt_ep_predicate, _kt_ep_factory, priority=20
 )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+    """Mask CPU expert IDs by setting them to -1.
+
+    This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
+    so they won't be computed on GPU. The masked IDs are set to -1, which causes the
+    GPU MoE kernel to skip those experts.
+
+    Args:
+        topk_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
+        num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
+
+    Returns:
+        Modified topk_ids tensor with CPU expert IDs masked as -1
+    """
+    topk_ids[topk_ids >= num_gpu_experts] = -1
+    return topk_ids

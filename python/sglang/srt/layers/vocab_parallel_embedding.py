@@ -606,3 +606,28 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, input_):
         del input_
         raise RuntimeError("LMHead's weights should be used in the sampler.")
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def get_embedding_tp_kwargs() -> dict:
+    """Vocab-parallel layout kwargs for the *input embedding* of models that
+    support embedding replication (the DeepSeek-V2 target family: DeepSeek
+    V3.1 / Kimi K2.5, plus their EAGLE3 / NextN drafts).
+
+    EAGLE / NextN share the target's ``embed_tokens.weight`` tensor with the
+    draft (``set_embed`` / ``set_embed_and_head``), so the target and every
+    draft that shares it MUST use the same vocab-parallel layout -- otherwise
+    the draft's masking/index math runs against a tensor with a different
+    layout and accept_len silently drops. Route all of them through this one
+    helper so they can never drift.
+    """
+    if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+        # Replicate the full table on every rank: skips the embed all-reduce
+        # at the cost of duplicated embedding weights.
+        return {"enable_tp": False}
+    # Shard along the vocab dim. Under DP attention each rank owns only its
+    # local tokens, so reduce within the attention-TP group, not the full TP
+    # group.
+    return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}

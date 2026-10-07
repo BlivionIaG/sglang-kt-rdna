@@ -186,3 +186,124 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
 
     x_scale_ceil = ceil_to_ue8m0(x_scale)
     assert torch.all(x_scale == x_scale_ceil), f"{x_scale=} {x_scale_ceil=}"
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def grouped_gemm_nt_bf16_masked(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    num_groups, _, k = a.shape
+    _, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            a,
+            b,
+            d,
+            masked_m,
+            expected_m,
+        )
+
+
+def grouped_gemm_nt_bf16_contig(
+    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+):
+    m, k = a.shape
+    num_groups, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+
+
+def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
+    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    if isinstance(alignment, tuple):
+        alignment = alignment[0]
+
+    theoretical_alignment = getattr(
+        deep_gemm, "get_theoretical_mk_alignment_for_contiguous_layout", None
+    )
+    if theoretical_alignment is None:
+        return alignment
+
+    per_group_m = (expected_m + num_groups - 1) // num_groups
+    try:
+        try:
+            candidate = theoretical_alignment(per_group_m)
+        except TypeError:
+            candidate = theoretical_alignment(
+                expected_m=expected_m, num_groups=num_groups
+            )
+    except Exception:
+        return alignment
+    return candidate if 0 < candidate <= alignment else alignment
+
+
+@contextmanager
+def contiguous_layout_alignment_scope(alignment: Optional[int]):
+    if alignment is None:
+        yield
+        return
+
+    getter = getattr(deep_gemm, "get_mk_alignment_for_contiguous_layout", None)
+    setter = getattr(deep_gemm, "set_mk_alignment_for_contiguous_layout", None)
+    if getter is None or setter is None:
+        yield
+        return
+
+    previous = getter()
+    if isinstance(previous, tuple):
+        previous = previous[0]
+    setter(alignment)
+    try:
+        yield
+    finally:
+        setter(previous)
+
+
+def gemm_nt_mxfp8_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.fp8_fp4_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
+            disable_ue8m0_cast=disable_cast,
+        )
+
+
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    if x.shape[0] == 0:
+        return
+    deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)

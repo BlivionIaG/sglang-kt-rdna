@@ -1160,3 +1160,33 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
             )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _multi_ctas_kv_counter_bytes(
+    device: torch.device, num_q_heads: int, batch_size: int
+) -> int:
+    sm_count = flashinfer.utils.get_device_sm_count(device)
+    return flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_q_heads, sm_count
+    )
+
+
+def make_persistent_multi_ctas_kv_counter_buffer(
+    device: torch.device, num_q_heads: int, max_batch_size: int
+) -> torch.Tensor:
+    num_bytes = _multi_ctas_kv_counter_bytes(
+        device, num_q_heads, max(TRTLLM_MLA_MAX_BATCH_SIZE, max_batch_size)
+    )
+    return torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+
+
+def grow_multi_ctas_kv_counter_buffer_if_needed(
+    buffer: torch.Tensor, device: torch.device, num_q_heads: int, batch_size: int
+) -> torch.Tensor:
+    required_bytes = _multi_ctas_kv_counter_bytes(device, num_q_heads, batch_size)
+    if buffer.numel() >= required_bytes:
+        return buffer
+    return torch.zeros(required_bytes, dtype=torch.uint8, device=device)

@@ -366,3 +366,21 @@ def marlin_quant_fp8_torch(weight, group_size):
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
 
     return weight_ref.T, marlin_qweight, marlin_scales
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def fake_apply_fp8_marlin_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor],
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+    out_shape = input.shape[:-1] + (size_n,)
+    fake_output = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    return fake_output

@@ -6,6 +6,9 @@ from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
 from sglang.srt.utils import BumpAllocator
+from typing import Optional, Tuple
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.runtime_context import get_exec
 
 __all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
 
@@ -44,3 +47,27 @@ def get_dsv3_gemm_output_zero_allocator_size(
     per_layer_size = 256 * (allocate_size + n_routed_experts)
 
     return num_moe_layers * per_layer_size
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def rocm_dsv3_router_split_k(
+    gate, hidden_states: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The ROCm decode router for gate (a MoEGate): an fp32 logits buffer plus
+    the split-K partials whose fixed-order sum fills it, or None when gate.forward
+    applies. Only TopK.forward_cuda(..., router_logits_partials=partials) may read
+    the buffer: it sums the partials into it inside the fused gate launch."""
+    num_tokens = hidden_states.shape[0]
+    if not 0 < num_tokens <= gate.rocm_router_max_tokens:
+        return None
+    if get_exec().deterministic.enable_deterministic_inference:
+        return None
+    partials = rocm_router_gemv_split_k(hidden_states, gate.weight)
+    logits = torch.empty(
+        (num_tokens, gate.weight.shape[0]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    return logits, partials

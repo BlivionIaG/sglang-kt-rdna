@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from typing import Callable, Optional, Tuple
+from sglang.srt.environ import envs
 
 
 # Inverse dim formula to find dim based on number of rotations
@@ -133,3 +134,31 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _extend_yarn_cache(
+    cache: torch.Tensor,
+    compute_inv_freq: Callable[[], torch.Tensor],
+    mscale: float,
+    needed_max_pos: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return the extended cache and uncast rows for auxiliary tables.
+
+    A no-op returns the original cache and None without computing frequencies.
+    The caller supplies YaRN frequencies using its scaling factor and unchanged
+    correction-range bound, rather than the base extension's theta argument.
+    """
+    if needed_max_pos < cache.shape[0]:
+        return cache, None
+    align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+    new_len = ((needed_max_pos + align) // align) * align
+    inv_freq = compute_inv_freq().to(cache.device)
+    positions = torch.arange(
+        cache.shape[0], new_len, dtype=inv_freq.dtype, device=cache.device
+    )
+    freqs = torch.einsum("i,j->ij", positions, inv_freq)
+    rows = torch.cat((freqs.cos() * mscale, freqs.sin() * mscale), dim=-1)
+    return torch.cat((cache, rows.to(cache.dtype)), dim=0), rows

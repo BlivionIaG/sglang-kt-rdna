@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
+from sglang.kernels.fused_op import BaseFusedOp
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -382,3 +383,42 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
     else:
         # adapt bge-reranker
         return nn.Identity()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class SituAndMul(BaseFusedOp):
+    """SituGLU activation used by Kimi K3.
+
+    Computes beta * tanh(gate / beta) * sigmoid(gate) * up.
+    When linear_beta is set, up is softly clipped:
+        up = linear_beta * tanh(up / linear_beta).
+    """
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.activation import situ_and_mul
+
+        return situ_and_mul(x, None, self.beta, self.linear_beta)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        from sgl_kernel_npu.activation.situ import situ_and_mul
+
+        return situ_and_mul(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)

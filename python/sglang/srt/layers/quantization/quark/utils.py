@@ -19,6 +19,7 @@ except ImportError as err:
 
     dynamic_mxfp4_quant = raise_aiter_import_error
 from torch import nn
+from dataclasses import dataclass
 
 
 def deep_compare(dict1: Any, dict2: Any) -> bool:
@@ -213,3 +214,14 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
 
         return w_kc, w_s_kc, w_vc, w_s_vc
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@dataclass
+class Nvfp4SourceConfig:
+    """Dispatch marker for online NVFP4 -> MXFP4 re-quantization, carried on
+    `QuarkConfig.dequantization_config` to represent an NVFP4 source
+    Only ModelOpt / AMD Quark NVFP4 (per-tensor `weight_scale_2`
+    that multiplies the per-block scale) is supported."""

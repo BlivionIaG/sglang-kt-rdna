@@ -137,3 +137,70 @@ class IntelAMXAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class IntelAMXMultiStepDraftBackend:
+    """
+    Wrap multiple intel amx attention backends as one for multiple consecutive
+    draft decoding steps.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        from sgl_kernel import build_draft_decode_metadata_cpu
+
+        self.build_draft_decode_metadata = build_draft_decode_metadata_cpu
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends: list[IntelAMXAttnBackend] = []
+        for _ in range(self.speculative_num_steps - 1):
+            self.attn_backends.append(IntelAMXAttnBackend(model_runner))
+        self.device = model_runner.device
+        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        num_seqs = forward_batch.batch_size
+        topk = self.topk
+        bs = num_seqs * topk
+        num_steps = self.speculative_num_steps
+        req_to_token = self.attn_backends[0].req_to_token_pool.req_to_token
+        seq_lens = forward_batch.seq_lens
+        pool_len = self.pool_len
+        num_head = self.attn_backends[0].num_head
+        v_head_dim = self.attn_backends[0].v_head_dim
+        device = self.device
+
+        # Build expanded req_to_token via C++ kernel
+        req_to_token_draft = self.build_draft_decode_metadata(
+            req_to_token,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            topk,
+            num_steps,
+            pool_len,
+        )
+
+        req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)
+
+        num_kv_splits = self.attn_backends[0].num_kv_splits
+        for step in range(num_steps - 1):
+            # Each candidate sees prefix + (step + 1) draft tokens.
+            seq_lens_expanded = seq_lens.repeat_interleave(topk) + step + 1
+            attn_logits = torch.zeros(
+                (bs, num_head, num_kv_splits, v_head_dim + 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.attn_backends[step].forward_metadata = (attn_logits, None)
+            self.attn_backends[step].draft_decode_metadata = (
+                req_to_token_draft,
+                seq_lens_expanded,
+                req_pool_indices_expanded,
+            )

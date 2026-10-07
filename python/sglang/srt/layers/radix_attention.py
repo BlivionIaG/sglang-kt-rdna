@@ -24,6 +24,8 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
+from contextlib import contextmanager
+from sglang.srt.model_executor.forward_context import get_attn_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -171,3 +173,353 @@ def unified_attention_with_output(
 
     output.view(ret.shape).copy_(ret)
     return
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@contextmanager
+def force_eager_attention():
+    token = _force_eager_attn.set(True)
+    try:
+        yield
+    finally:
+        _force_eager_attn.reset(token)
+
+
+def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
+    """Zero the padded tail ``buf`` leaves as torch.empty garbage under PCG
+    replay, so NaN/Inf cannot reach residual / MoE routing / allreduce."""
+    pcg_static_tokens = context.num_tokens
+    actual_tokens = context.raw_num_tokens
+    if (
+        pcg_static_tokens is not None
+        and actual_tokens is not None
+        and pcg_static_tokens > actual_tokens
+    ):
+        first_dim = buf.shape[0]
+        elems_per_token = buf.numel() // first_dim
+        buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+
+
+def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
+    """Zero outputs when an idle DP rank skips attention work."""
+    for buf in bufs:
+        if buf is not None:
+            buf.zero_()
+
+
+def _unified_attention_with_output_impl(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    use_mha_companion: bool,
+    return_lse: bool,
+    *,
+    key_value_num_tokens: Optional[int] = None,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
+    # they must appear in the schema when --cuda-graph-backend-prefill=tc_piecewise is on.
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
+    # instead supplies a fixed-capacity K/V chunk whose extent is independent
+    # of the suffix queries, so its caller must preserve that separate extent.
+    if key_value_num_tokens is None:
+        key_value_num_tokens = real_query_num_tokens
+
+    if real_query_num_tokens == 0:
+        _zero_skipped_attn_outputs(output)
+        if return_lse:
+            # unified_attention_with_output_and_lse asserts a tensor comes back.
+            # Match _unified_attention_with_output_and_lse_fake's meta shape and
+            # the padded LSE the normal path returns below (padded row count,
+            # i.e. query before narrowing).
+            return query.new_zeros(
+                (query.shape[0], query.shape[1]), dtype=torch.float32
+            )
+        return None
+
+    query = query[:real_query_num_tokens]
+    if key is not None:
+        key = key[:key_value_num_tokens]
+    if value is not None:
+        value = value[:key_value_num_tokens]
+
+    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
+    # attn_mha) that share the same layer_id. Preserve the calling instance's
+    # identity through the custom-op boundary; save_kv_cache is not an identity
+    # signal because absorbed MLA can also disable a redundant cache store.
+    if use_mha_companion:
+        assert context.mha_companion_layers is not None
+        attention_layer = context.mha_companion_layers[layer_id]
+        assert attention_layer is not None
+
+    kwargs = {}
+    if q_rope is not None:
+        kwargs["q_rope"] = q_rope[:real_query_num_tokens]
+    if k_rope is not None:
+        kwargs["k_rope"] = k_rope[:key_value_num_tokens]
+    if sinks is not None:
+        kwargs["sinks"] = sinks
+    if attn_sink is not None:
+        kwargs["attn_sink"] = attn_sink
+    if cos_sin_cache is not None:
+        kwargs["cos_sin_cache"] = cos_sin_cache
+    if is_neox is not None:
+        kwargs["is_neox"] = is_neox
+    if llama_4_scaling is not None:
+        kwargs["llama_4_scaling"] = llama_4_scaling
+    if topk_indices is not None:
+        kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_positions = forward_batch.positions
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_query_num_tokens]
+    if original_positions is not None:
+        forward_batch.positions = original_positions[:real_query_num_tokens]
+
+    # Store pre-allocated output for FA backend to write directly into.
+    # Must slice to real_query_num_tokens to match the narrowed query shape —
+    # the FA kernel validates out.size(0) == q.size(0).
+    forward_batch._attn_output = output[:real_query_num_tokens]
+
+    ret = get_attn_backend().forward(
+        query,
+        key,
+        value,
+        attention_layer,
+        forward_batch,
+        save_kv_cache,
+        **kwargs,
+    )
+    forward_batch.out_cache_loc = original_out_cache_loc
+    forward_batch.positions = original_positions
+
+    lse = None
+    if return_lse:
+        assert isinstance(ret, tuple)
+        ret, lse, *_ = ret
+    else:
+        assert isinstance(ret, torch.Tensor)
+
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_query_num_tokens].view(ret.shape).copy_(ret)
+
+    # During PCG replay the attention backend writes only the narrowed
+    # real-token slice (output[:real_query_num_tokens]) and leaves padded positions
+    # as uninitialized torch.empty garbage. Zero them so garbage (NaN/Inf) does
+    # not propagate through residual connections, MoE routing, and allreduce.
+    # This affects every backend that varlen-writes under PCG, not just ROCm.
+    # Use context.raw_num_tokens (pre-padding count from PCG runner) instead of
+    # forward_batch.extend_num_tokens, which is None for TARGET_VERIFY batches.
+    _zero_padded_pcg_tail(output, context)
+    if lse is not None and lse.shape[0] != output.shape[0]:
+        padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
+        padded_lse[:real_query_num_tokens].copy_(lse)
+        lse = padded_lse
+    return lse
+
+
+def _unified_attention_with_output_and_lse_fake(
+    query: torch.Tensor, *args, **kwargs
+) -> torch.Tensor:
+    return query.new_empty((query.shape[0], query.shape[1]), dtype=torch.float32)
+
+
+@register_split_op()
+def unified_attention_with_output_and_lse(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    use_mha_companion: bool = False,
+    key_value_num_tokens: Optional[int] = None,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    lse = _unified_attention_with_output_impl(
+        query,
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        use_mha_companion,
+        True,
+        key_value_num_tokens=key_value_num_tokens,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        sinks=sinks,
+        attn_sink=attn_sink,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+    assert lse is not None
+    return lse
+
+
+@register_custom_op(mutates_args=["attn_out", "idx_out"])
+@register_split_op()
+def unified_sparse_attention_with_output(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    attn_out: torch.Tensor,
+    idx_out: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    idx_v: Optional[torch.Tensor] = None,
+) -> None:
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        _zero_skipped_attn_outputs(attn_out, idx_out)
+        return
+
+    query = query[:real_num_tokens]
+    if key is not None:
+        key = key[:real_num_tokens]
+    if value is not None:
+        value = value[:real_num_tokens]
+    idx_q = idx_q[:real_num_tokens]
+    idx_k = idx_k[:real_num_tokens]
+    if idx_v is not None:
+        idx_v = idx_v[:real_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+
+    ret_idx, ret_out = get_attn_backend().forward(
+        query,
+        key,
+        value,
+        attention_layer,
+        forward_batch,
+        save_kv_cache,
+        idx_q=idx_q,
+        idx_k=idx_k,
+        idx_v=idx_v,
+    )
+    forward_batch.out_cache_loc = original_out_cache_loc
+
+    attn_out[:real_num_tokens].view(ret_out.shape).copy_(ret_out)
+    # disable_value layers return ret_idx=None; the guard keeps idx_out's
+    # untouched real-token slice safe (model returns before index_o_proj).
+    if ret_idx is not None:
+        idx_out[:real_num_tokens].view(ret_idx.shape).copy_(ret_idx)
+
+    for buf in (attn_out, idx_out):
+        _zero_padded_pcg_tail(buf, context)
+    return
+
+
+def attention_with_output_extra_kwargs(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    extra_kwargs: dict,
+) -> Optional[torch.Tensor]:
+    """Breakable/tc_piecewise attention for backends whose forward needs kwargs
+    that cannot cross the ``unified_attention_with_output`` custom-op schema --
+    a ``score_mod`` callable and/or ``aux_tensors`` (e.g. Inkling's relative-bias
+    fa4 attention), or the per-token mxfp8 deferred norm/RoPE operands. Plain
+    (not a custom op) so the callable passes through; still
+    runs eagerly between graph segments under BCG via the wrapper below. Mirrors
+    the real-token narrowing + padded-output write of
+    ``unified_attention_with_output``, and narrows per-token ``aux_tensors`` too.
+    """
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        _zero_skipped_attn_outputs(output)
+        return
+
+    query = query[:real_num_tokens]
+    if key is not None:
+        key = key[:real_num_tokens]
+    if value is not None:
+        value = value[:real_num_tokens]
+
+    kwargs = dict(extra_kwargs)
+    aux_tensors = kwargs.get("aux_tensors")
+    if aux_tensors is not None:
+        kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
+    for per_token_key in (
+        "rel_bias",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+        "mxfp8_norm_rope_positions",
+        "mxfp8_norm_rope_temp_scale",
+    ):
+        t = kwargs.get(per_token_key)
+        if t is not None:
+            kwargs[per_token_key] = t[:real_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    forward_batch._attn_output = output[:real_num_tokens]
+
+    ret = get_attn_backend().forward(
+        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
+    )
+    forward_batch.out_cache_loc = original_out_cache_loc
+
+    return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
+    if return_lse:
+        assert isinstance(ret, tuple)
+        ret, lse, *_ = ret
+    else:
+        assert isinstance(ret, torch.Tensor)
+        lse = None
+
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+    if _is_hip:
+        _zero_padded_pcg_tail(output, context)
+    if lse is not None and lse.shape[0] != output.shape[0]:
+        padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
+        padded_lse[:real_num_tokens].copy_(lse)
+        lse = padded_lse
+    return lse

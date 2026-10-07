@@ -627,3 +627,308 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
     forward_native = forward_cpu
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the Triton BF16 path supports this decode shape."""
+    if x.dim() != 2 or weight.dim() != 2:
+        return False
+    k = weight.shape[1]
+    max_m = (
+        _A16W16_TRITON_NARROW_K_MAX_M
+        if k <= _A16W16_TRITON_NARROW_K
+        else _A16W16_TRITON_MAX_M
+    )
+    return (
+        x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.shape[1] == k
+        and 0 < k <= _A16W16_TRITON_MAX_K
+        and 0 < x.shape[0] <= max_m
+        and weight.shape[0] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+class Bf16GemmBackend(Enum):
+    AUTO = "auto"
+    CUTEDSL = "cutedsl"
+    GEMV = "gemv"
+    TORCH = "torch"
+
+    def is_auto(self) -> bool:
+        return self == Bf16GemmBackend.AUTO
+
+    def is_cutedsl(self) -> bool:
+        return self == Bf16GemmBackend.CUTEDSL
+
+    def is_gemv(self) -> bool:
+        return self == Bf16GemmBackend.GEMV
+
+
+def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
+    return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
+
+
+def precompile_splitk_tactics() -> bool:
+    """JIT-compile every tuned tactic through the real dispatch,
+    so CUDA graph capture never hits a cold kernel."""
+    if not _enable_bf16_splitk_gemm:
+        return False
+    device = torch.cuda.current_device()
+    for m, n, k in _BF16_SPLITK_TUNED_TACTICS:
+        x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+        _bf16_splitk_gemm_out(x, weight, None, out)
+    torch.cuda.synchronize()
+    return True
+
+
+def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
+    """Return whether the optional Split-K path should be initialized."""
+    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+
+
+def initialize_bf16_gemm_config() -> None:
+    global _BF16_GEMM_BACKEND
+    global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _splitk_tactic
+    global _run_splitk_dense
+    global _direct_default_tactic
+    global _prefer_direct
+    global _run_direct_dense
+    global _enable_bf16_splitk_gemm
+
+    backend_str = get_exec().kernel.bf16_gemm_backend
+    if backend_str == "auto" and get_platform().is_sm100:
+        backend_str = (
+            "torch"
+            if get_exec().deterministic.enable_deterministic_inference
+            else "cutedsl"
+        )
+
+    backend = Bf16GemmBackend(backend_str)
+
+    if backend.is_gemv():
+        if torch.cuda.get_device_capability()[0] != 9:
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+
+        global _hopper_bf16_gemv, _use_hopper_bf16_gemv
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
+            hopper_bf16_gemv,
+            use_hopper_bf16_gemv,
+        )
+
+        _hopper_bf16_gemv = hopper_bf16_gemv
+        _use_hopper_bf16_gemv = use_hopper_bf16_gemv
+    elif backend.is_cutedsl():
+        if get_exec().deterministic.enable_deterministic_inference:
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
+                "be combined with --enable-deterministic-inference"
+            )
+        if not get_platform().is_sm100:
+            raise ValueError(
+                f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
+            )
+
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+            cutedsl_bf16_gemm,
+            use_cutedsl_bf16_gemm,
+        )
+
+        _cutedsl_bf16_gemm = cutedsl_bf16_gemm
+        _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+
+    _enable_bf16_splitk_gemm = False
+    if should_enable_bf16_splitk_gemm(backend):
+        from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
+            default_tactic,
+            prefer_direct_bf16_gemm_sm100,
+            run_direct_dense,
+        )
+        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+            SplitKTactic,
+            run_splitk_dense,
+        )
+
+        _splitk_tactic = SplitKTactic
+        _run_splitk_dense = run_splitk_dense
+        _direct_default_tactic = default_tactic
+        _prefer_direct = prefer_direct_bf16_gemm_sm100
+        _run_direct_dense = run_direct_dense
+        _enable_bf16_splitk_gemm = True
+
+    _BF16_GEMM_BACKEND = backend
+
+
+def _bf16_gemm_dispatch_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+def _bf16_splitk_gemm_out(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> torch.Tensor:
+    m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
+    if bias is None and _prefer_direct(m, n, k):
+        tactic = _direct_default_tactic(m, n, k)
+        _run_direct_dense(x_2d, weight.T, out, True, tactic)
+    else:
+        tactic = _splitk_tactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
+        _run_splitk_dense(
+            x_2d,
+            weight.T,
+            bias,
+            out,
+            True,
+            tactic,
+        )
+    return out
+
+
+def _bf16_splitk_gemm(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    _bf16_splitk_gemm_out(x_2d, weight, bias, out)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def _bf16_gemm_dispatch_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    m = x.numel() // x.shape[-1]
+    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
+        m, weight.shape[0], weight.shape[1]
+    ):
+        output = _bf16_splitk_gemm(x, weight, bias)
+    elif (
+        _use_hopper_bf16_gemv is not None
+        and bias is None
+        and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
+    ):
+        output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], -1
+        )
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+        m, weight.shape[0], weight.shape[1]
+    ):
+        output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+            *x.shape[:-1], -1
+        )
+    elif addend is not None:
+        # cuBLAS folds the addend in through the GEMM beta input;
+        # a bias would need a third operand, so callers must exclude it.
+        assert bias is None
+        return torch.addmm(addend, x, weight.t(), out=addend)
+    else:
+        return F.linear(x, weight, bias)
+
+    if addend is not None:
+        output.add_(addend)
+    return output
+
+
+@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def _can_accumulate_into_addend(
+    *,
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    addend: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    if not _is_cuda or torch.compiler.is_compiling():
+        return False
+    # Batch-invariant mode overrides aten::mm and aten::addmm,
+    # but not aten::addmm.out, so deterministic inference keeps a separate add.
+    if is_batch_invariant_mode_enabled():
+        return False
+    # x.is_cuda also keeps the CPU AMX route in apply().
+    if bias is not None or x.ndim != 2 or not x.is_cuda:
+        return False
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return False
+    return (
+        addend.dtype == torch.bfloat16
+        and addend.is_contiguous()
+        and addend.shape == (x.shape[0], weight.shape[0])
+        and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
+    )
+
+
+def get_bf16_gemm_backend() -> Bf16GemmBackend:
+    global _BF16_GEMM_BACKEND
+    if _BF16_GEMM_BACKEND is None:
+        _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
+    return _BF16_GEMM_BACKEND
+
+
+def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
+    """Whether MoE expert weights should get a padded row stride for XPU.
+
+    is_xpu() only tells us an XPU exists on this machine, not that the weights
+    being created land on it -- this can be true while serving on CPU/CUDA.
+    create_weights takes no device argument and allocates under the model
+    loader's ambient device context, so check that context too: padding a
+    non-XPU weight would make it non-contiguous for no benefit, and other
+    backends' MoE kernels expect contiguous expert tensors.
+
+    The Triton path stores B transposed and does not read a row stride, so it
+    is excluded even on XPU (either via --moe-runner-backend triton or the
+    triton_kernels build).
+    """
+    return (
+        is_xpu()
+        and not get_moe_runner_backend().is_triton()
+        and torch.get_default_device().type == "xpu"
+        and not use_triton_kernels
+    )
+
+
+def _empty_xpu_moe_expert_weight(
+    num_experts: int,
+    n_dim: int,
+    k_dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate an [E, N, K] XPU expert weight, over-allocating K when padding
+    its row stride would avoid L3 set aliasing.
+
+    Some K dims (3072, 7168 in bf16) put every weight row in the same handful
+    of L3 sets, which throttles the grouped GEMM's B loads. Over-allocating K
+    and returning a narrowed view keeps the logical [E, N, K] shape (so the
+    weight loader is unchanged) while giving the rows a non-aliasing stride.
+    The Xe20 grouped GEMM reads B's row stride from the tensor, so the padding
+    is transparent to it.
+
+    Callers must have checked _use_xpu_moe_ld_padding() first. K dims that are
+    already well distributed get no padding and allocate normally.
+    """
+    pad = xpu_moe_ld_padding_elems(k_dim, dtype.itemsize)
+    if pad == 0:
+        return torch.empty(num_experts, n_dim, k_dim, dtype=dtype)
+    # The view is non-contiguous; only the K slice is ever read or written.
+    return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]

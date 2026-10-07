@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore, TritonRunnerInput
+from collections.abc import Callable
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -118,3 +119,21 @@ class MoeRunner:
         assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def register_moe_runner_core(
+    backend_name: str,
+    factory: Callable[[MoeRunnerConfig], DispatchMoeRunnerCore],
+) -> None:
+    """Register a runner-core factory for a new or built-in backend name."""
+
+    if backend_name in _CUSTOM_RUNNER_CORE_FACTORIES:
+        raise ValueError(f"Runner core for {backend_name!r} is already registered")
+    try:
+        resolve_moe_runner_backend(backend_name)
+    except ValueError:
+        register_moe_runner_backend_name(backend_name)
+    _CUSTOM_RUNNER_CORE_FACTORIES[backend_name] = factory

@@ -1026,3 +1026,67 @@ class XPUAttentionBackend(AttentionBackend):
             metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
 
         metadata.swa_spec_metadata = metadata_swa
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class XPUMultiStepDraftBackend:
+    """Wrap multiple XPU attention backends for consecutive draft decode steps."""
+
+    needs_cpu_seq_lens: bool = False
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = [
+            XPUAttentionBackend(
+                model_runner,
+                skip_prefill=True,
+                speculative_step_id=i,
+                topk=topk,
+                speculative_num_steps=speculative_num_steps,
+            )
+            for i in range(speculative_num_steps - 1)
+        ]
+        self.max_context_len = self.attn_backends[0].max_context_len
+        self.device = model_runner.device
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)

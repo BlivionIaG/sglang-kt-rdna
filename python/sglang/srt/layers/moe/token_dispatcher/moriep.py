@@ -36,6 +36,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 import functools
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.runtime_context import get_parallel
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -811,6 +812,880 @@ class MoriEPDispatcher(BaseDispatcher):
         self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
+
+    def combine_a(
+        self,
+        combine_input: CombineInput,
+    ):
+        hidden_states, topk_ids, topk_weights = combine_input
+        self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
+        inner_state = self._get_impl().combine_a(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        self._combine_intermediate_state = inner_state
+
+    def combine_b(self):
+        self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
+        inner_state = self._combine_intermediate_state
+        del self._combine_intermediate_state
+        return self._get_impl().combine_b(*inner_state)
+
+    def _get_impl(self) -> _MoriEPDispatcherImplBase:
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
+            return self._normal_dispatcher
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
+            return self._low_latency_dispatcher
+        else:
+            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def _update_stage(self, old_stage, new_stage):
+        assert self._stage == old_stage
+        self._stage = new_stage
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_quant_config(quant_config)
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_quant_config(quant_config)
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+
+    def clear_overlap_args(self):
+        super().clear_overlap_args()
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.clear_overlap_args()
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.clear_overlap_args()
+
+    def register_deepep_dispatch_hook(self, hook):
+        return self._deepep_dispatch_hooks.register_hook(hook)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _should_record_expert_distribution() -> bool:
+    recorder = get_global_expert_distribution_recorder()
+    if recorder.recording:
+        return True
+    # While capturing, only bake in the count kernel if a recorder is actually
+    # configured (non-Noop); otherwise it would replay as dead work every decode
+    # step. Configured recorders still bake it in, so start_record() works after
+    # capture.
+    if torch.get_device_module().is_current_stream_capturing():
+        return not isinstance(recorder, _ExpertDistributionRecorderNoop)
+    return False
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_supports_mxfp8_dispatch() -> bool:
+    """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
+
+    Probed rather than assumed, because the failure is silent in the worst way:
+    an older per_1x32 quant still returns fp8, but with continuous fp32 scales,
+    which the MoE then reads as e8m0 bytes and produces garbage rather than an
+    exception. Checking the signature keeps this a startup-time fallback instead
+    of a runtime corruption.
+    """
+    try:
+        import inspect
+
+        from aiter import get_hip_quant
+
+        return "scale_type" in inspect.signature(get_hip_quant).parameters or any(
+            "scale_type" in inspect.signature(f).parameters
+            for f in (get_hip_quant(QuantType.per_1x32),)
+        )
+    except Exception:
+        return False
+
+
+class DispatchDtype(Enum):
+    bf16 = "bfloat16"
+    fp8 = "float8_blockwise"
+    fp4 = "mxfp4_blockwise"
+    mxfp8 = "mxfp8_blockwise"
+
+
+class CombineDtype(Enum):
+    bf16 = "bfloat16"
+    fp8 = "float8_blockwise"
+    fp8_direct_cast = "float8_direct_cast"
+    fp4 = "fp4_blockwise"  # packed E2M1, blockwise-scaled; ~half the combine transport of fp8
+
+
+class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.quant_config = {}
+        self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+        # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
+        self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        import mori
+
+        assert (
+            self.mori_op.config.kernel_type
+            is mori.ops.EpDispatchCombineKernelType.AsyncLL
+        ), "mori asyncll mismatch"
+
+        num_tokens = hidden_states.shape[0]
+        output_dtype = hidden_states.dtype
+        scale = None
+
+        if self.dispatch_dtype == DispatchDtype.mxfp8:
+            # MXFP8 quant on live tokens, before the wire.
+            if num_tokens > 0:
+                # scale_type must be set explicitly: per_1x32_mx_quant_hip still
+                # defaults fp8 output to continuous fp32 scales for backward
+                # compatibility, but the MoE kernels (and the 1-byte scale_dim
+                # configured above) need the e8m0 byte layout.
+                hidden_states, scale = self.mxfp8_quant_func(
+                    hidden_states,
+                    quant_dtype=fp8_dtype,
+                    scale_type=torch.float8_e8m0fnu,
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        elif self.dispatch_dtype == DispatchDtype.fp8:
+            # FP8 quant
+            if num_tokens > 0:
+                # NOTE: aiter is able to handle token=0 case in UT. But for some
+                # reason it failed at e2e case. Root cause TBD.
+                hidden_states, scale = self.fp8_quant_func(
+                    hidden_states, quant_dtype=fp8_dtype
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // FP8_BLOCK_SIZE),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+
+        elif self.dispatch_dtype == DispatchDtype.fp4:
+            # FP4 quant
+            if num_tokens > 0:
+                hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
+            else:
+                hidden_states = torch.empty(
+                    (0, self.hidden_size // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=hidden_states.device,
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+        (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count,
+        ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, scale=scale)
+
+        return (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_topk_ids,
+            recv_scales,
+            packed_recv_count,
+            topk_weights,
+            topk_ids,
+            output_dtype,
+        )
+
+    def dispatch_b(
+        self,
+        hidden_states,
+        recv_topk_weights,
+        recv_topk_ids,
+        recv_scales,
+        packed_recv_count,
+        topk_weights,
+        topk_ids,
+        output_dtype,
+    ):
+
+        ##TODO(billishyahao): add assertion here to check async
+        import mori
+
+        assert (
+            self.mori_op.config.kernel_type
+            is mori.ops.EpDispatchCombineKernelType.AsyncLL
+        ), "mori asyncll mismatch"
+
+        record = _should_record_expert_distribution()
+        self.mori_op.dispatch_recv(call_local_expert_count=record)
+
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
+
+        return MoriEPLLDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=recv_scales,
+            topk_ids=recv_topk_ids,
+            topk_weights=recv_topk_weights,
+            num_recv_tokens_per_expert=packed_recv_count,
+            origin_topk_ids=topk_ids,
+            origin_topk_weights=topk_weights,
+            out_dtype=output_dtype,
+        )
+
+    def _dispatch_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+    ):
+        ##TODO(billishyahao): add assertion here to check async
+
+        (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count,
+        ) = self.mori_op.dispatch_send(hidden_states, topk_weights, scale, topk_ids)
+
+        return (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count,
+        )
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
+    ):
+        hidden_states = self._combine_core(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            overlap_args=overlap_args,
+        )
+        return hidden_states, topk_ids, topk_weights, overlap_args
+
+    def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
+
+        self.mori_op.combine_recv()
+
+        return hidden_states[0]
+
+    def _combine_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
+    ):
+        combined_hidden_states = self.mori_op.combine_send(
+            hidden_states, None, topk_ids
+        )
+
+        return combined_hidden_states
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+
+
+@dataclass
+class _Stage(Enum):
+    INITIAL = auto()
+    AFTER_DISPATCH_A = auto()
+    AFTER_DISPATCH_B = auto()
+    AFTER_COMBINE_A = auto()
+
+
+class MoriEPDispatcher(BaseDispatcher):
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        num_experts: int = None,
+        num_local_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        instance_id: int = 0,
+    ):
+        super().__init__()
+
+        self.deepep_mode = deepep_mode
+
+        async_mode = self.deepep_mode.enable_low_latency()
+        if get_bool_env_var("SGLANG_ROCM_USE_MULTI_STREAM") and not async_mode:
+            logger.warning_once(
+                "SGLANG_ROCM_USE_MULTI_STREAM=1 is set but Mori AsyncLL is "
+                "not enabled (--deepep-mode=%s). The alt-stream overlap only "
+                "frees up CUs when dispatch/combine runs on the AsyncLL "
+                "copy-engine kernel; otherwise it stays on CUs and competes "
+                "with the alt-stream work. Pass --deepep-mode low_latency "
+                "(or auto) to enable the AsyncLL kernel.",
+                self.deepep_mode.value,
+            )
+
+        common_kwargs = dict(
+            group=group,
+            router_topk=router_topk,
+            permute_fusion=permute_fusion,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            deepep_mode=deepep_mode,
+            instance_id=instance_id,
+        )
+
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher = _MoriEPDispatcherImplLowLatency(
+                **common_kwargs,
+            )
+
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher = _MoriEPDispatcherImplNormal(
+                async_finish=async_finish,
+                **common_kwargs,
+            )
+
+        self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = MoriEPPDispatchHooks()
+
+        # Mori dispatch produces global topk_ids in [0, num_experts); mask out
+        # experts that are not local to this rank.
+        self.expert_mask_gpu = None
+        if _use_aiter and num_experts is not None and num_local_experts is not None:
+            ep_rank = get_parallel().moe_ep_rank
+            expert_mask = torch.zeros(
+                num_experts,
+                device=torch.cuda.current_device(),
+                dtype=torch.int32,
+            )
+            start = ep_rank * num_local_experts
+            expert_mask[start : start + num_local_experts] = 1
+            self.expert_mask_gpu = expert_mask
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self._num_tokens = hidden_states.shape[0]
+        self.dispatch_a(hidden_states, topk_output)
+        if self._deepep_dispatch_hooks is not None:
+            self._deepep_dispatch_hooks(self)
+        ret = self.dispatch_b()
+        return ret
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        inner_state = self._get_impl().dispatch_a(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        self._dispatch_intermediate_state = inner_state
+
+    def dispatch_b(self):
+        self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
+        inner_state = self._dispatch_intermediate_state
+        del self._dispatch_intermediate_state
+        return self._get_impl().dispatch_b(*inner_state)
+
+    def combine(
+        self,
+        combine_input: CombineInput,
+    ) -> Tuple:
+        self.combine_a(combine_input)
+        hidden_states = self.combine_b()
+        return hidden_states[: self._num_tokens]
+
+    def combine_a(
+        self,
+        combine_input: CombineInput,
+    ):
+        hidden_states, topk_ids, topk_weights = combine_input
+        self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
+        inner_state = self._get_impl().combine_a(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        self._combine_intermediate_state = inner_state
+
+    def combine_b(self):
+        self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
+        inner_state = self._combine_intermediate_state
+        del self._combine_intermediate_state
+        return self._get_impl().combine_b(*inner_state)
+
+    def _get_impl(self) -> _MoriEPDispatcherImplBase:
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
+            return self._normal_dispatcher
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
+            return self._low_latency_dispatcher
+        else:
+            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def _update_stage(self, old_stage, new_stage):
+        assert self._stage == old_stage
+        self._stage = new_stage
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_quant_config(quant_config)
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_quant_config(quant_config)
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+
+    def clear_overlap_args(self):
+        super().clear_overlap_args()
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.clear_overlap_args()
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.clear_overlap_args()
+
+    def register_deepep_dispatch_hook(self, hook):
+        return self._deepep_dispatch_hooks.register_hook(hook)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _should_record_expert_distribution() -> bool:
+    recorder = get_global_expert_distribution_recorder()
+    if recorder.recording:
+        return True
+    # While capturing, only bake in the count kernel if a recorder is actually
+    # configured (non-Noop); otherwise it would replay as dead work every decode
+    # step. Configured recorders still bake it in, so start_record() works after
+    # capture.
+    if torch.get_device_module().is_current_stream_capturing():
+        return not isinstance(recorder, _ExpertDistributionRecorderNoop)
+    return False
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_supports_mxfp8_dispatch() -> bool:
+    """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
+
+    Probed rather than assumed, because the failure is silent in the worst way:
+    an older per_1x32 quant still returns fp8, but with continuous fp32 scales,
+    which the MoE then reads as e8m0 bytes and produces garbage rather than an
+    exception. Checking the signature keeps this a startup-time fallback instead
+    of a runtime corruption.
+    """
+    try:
+        import inspect
+
+        from aiter import get_hip_quant
+
+        return "scale_type" in inspect.signature(get_hip_quant).parameters or any(
+            "scale_type" in inspect.signature(f).parameters
+            for f in (get_hip_quant(QuantType.per_1x32),)
+        )
+    except Exception:
+        return False
+
+
+class DispatchDtype(Enum):
+    bf16 = "bfloat16"
+    fp8 = "float8_blockwise"
+    fp4 = "mxfp4_blockwise"
+    mxfp8 = "mxfp8_blockwise"
+
+
+class CombineDtype(Enum):
+    bf16 = "bfloat16"
+    fp8 = "float8_blockwise"
+    fp8_direct_cast = "float8_direct_cast"
+    fp4 = "fp4_blockwise"  # packed E2M1, blockwise-scaled; ~half the combine transport of fp8
+
+
+class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.quant_config = {}
+        self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+        # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
+        self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        import mori
+
+        assert (
+            self.mori_op.config.kernel_type
+            is mori.ops.EpDispatchCombineKernelType.AsyncLL
+        ), "mori asyncll mismatch"
+
+        num_tokens = hidden_states.shape[0]
+        output_dtype = hidden_states.dtype
+        scale = None
+
+        if self.dispatch_dtype == DispatchDtype.mxfp8:
+            # MXFP8 quant on live tokens, before the wire.
+            if num_tokens > 0:
+                # scale_type must be set explicitly: per_1x32_mx_quant_hip still
+                # defaults fp8 output to continuous fp32 scales for backward
+                # compatibility, but the MoE kernels (and the 1-byte scale_dim
+                # configured above) need the e8m0 byte layout.
+                hidden_states, scale = self.mxfp8_quant_func(
+                    hidden_states,
+                    quant_dtype=fp8_dtype,
+                    scale_type=torch.float8_e8m0fnu,
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        elif self.dispatch_dtype == DispatchDtype.fp8:
+            # FP8 quant
+            if num_tokens > 0:
+                # NOTE: aiter is able to handle token=0 case in UT. But for some
+                # reason it failed at e2e case. Root cause TBD.
+                hidden_states, scale = self.fp8_quant_func(
+                    hidden_states, quant_dtype=fp8_dtype
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // FP8_BLOCK_SIZE),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+
+        elif self.dispatch_dtype == DispatchDtype.fp4:
+            # FP4 quant
+            if num_tokens > 0:
+                hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
+            else:
+                hidden_states = torch.empty(
+                    (0, self.hidden_size // 2),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=hidden_states.device,
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+        (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count,
+        ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, scale=scale)
+
+        return (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_topk_ids,
+            recv_scales,
+            packed_recv_count,
+            topk_weights,
+            topk_ids,
+            output_dtype,
+        )
+
+    def dispatch_b(
+        self,
+        hidden_states,
+        recv_topk_weights,
+        recv_topk_ids,
+        recv_scales,
+        packed_recv_count,
+        topk_weights,
+        topk_ids,
+        output_dtype,
+    ):
+
+        ##TODO(billishyahao): add assertion here to check async
+        import mori
+
+        assert (
+            self.mori_op.config.kernel_type
+            is mori.ops.EpDispatchCombineKernelType.AsyncLL
+        ), "mori asyncll mismatch"
+
+        record = _should_record_expert_distribution()
+        self.mori_op.dispatch_recv(call_local_expert_count=record)
+
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
+
+        return MoriEPLLDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=recv_scales,
+            topk_ids=recv_topk_ids,
+            topk_weights=recv_topk_weights,
+            num_recv_tokens_per_expert=packed_recv_count,
+            origin_topk_ids=topk_ids,
+            origin_topk_weights=topk_weights,
+            out_dtype=output_dtype,
+        )
+
+    def _dispatch_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+    ):
+        ##TODO(billishyahao): add assertion here to check async
+
+        (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count,
+        ) = self.mori_op.dispatch_send(hidden_states, topk_weights, scale, topk_ids)
+
+        return (
+            packed_recv_hidden,
+            recv_topk_weights,
+            recv_scales,
+            recv_topk_ids,
+            packed_recv_count,
+        )
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
+    ):
+        hidden_states = self._combine_core(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            overlap_args=overlap_args,
+        )
+        return hidden_states, topk_ids, topk_weights, overlap_args
+
+    def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
+
+        self.mori_op.combine_recv()
+
+        return hidden_states[0]
+
+    def _combine_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
+    ):
+        combined_hidden_states = self.mori_op.combine_send(
+            hidden_states, None, topk_ids
+        )
+
+        return combined_hidden_states
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+
+
+@dataclass
+class _Stage(Enum):
+    INITIAL = auto()
+    AFTER_DISPATCH_A = auto()
+    AFTER_DISPATCH_B = auto()
+    AFTER_COMBINE_A = auto()
+
+
+class MoriEPDispatcher(BaseDispatcher):
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        num_experts: int = None,
+        num_local_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        instance_id: int = 0,
+    ):
+        super().__init__()
+
+        self.deepep_mode = deepep_mode
+
+        async_mode = self.deepep_mode.enable_low_latency()
+        if get_bool_env_var("SGLANG_ROCM_USE_MULTI_STREAM") and not async_mode:
+            logger.warning_once(
+                "SGLANG_ROCM_USE_MULTI_STREAM=1 is set but Mori AsyncLL is "
+                "not enabled (--deepep-mode=%s). The alt-stream overlap only "
+                "frees up CUs when dispatch/combine runs on the AsyncLL "
+                "copy-engine kernel; otherwise it stays on CUs and competes "
+                "with the alt-stream work. Pass --deepep-mode low_latency "
+                "(or auto) to enable the AsyncLL kernel.",
+                self.deepep_mode.value,
+            )
+
+        common_kwargs = dict(
+            group=group,
+            router_topk=router_topk,
+            permute_fusion=permute_fusion,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            deepep_mode=deepep_mode,
+            instance_id=instance_id,
+        )
+
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher = _MoriEPDispatcherImplLowLatency(
+                **common_kwargs,
+            )
+
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher = _MoriEPDispatcherImplNormal(
+                async_finish=async_finish,
+                **common_kwargs,
+            )
+
+        self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = MoriEPPDispatchHooks()
+
+        # Mori dispatch produces global topk_ids in [0, num_experts); mask out
+        # experts that are not local to this rank.
+        self.expert_mask_gpu = None
+        if _use_aiter and num_experts is not None and num_local_experts is not None:
+            ep_rank = get_parallel().moe_ep_rank
+            expert_mask = torch.zeros(
+                num_experts,
+                device=torch.cuda.current_device(),
+                dtype=torch.int32,
+            )
+            start = ep_rank * num_local_experts
+            expert_mask[start : start + num_local_experts] = 1
+            self.expert_mask_gpu = expert_mask
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self._num_tokens = hidden_states.shape[0]
+        self.dispatch_a(hidden_states, topk_output)
+        if self._deepep_dispatch_hooks is not None:
+            self._deepep_dispatch_hooks(self)
+        ret = self.dispatch_b()
+        return ret
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        inner_state = self._get_impl().dispatch_a(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        self._dispatch_intermediate_state = inner_state
+
+    def dispatch_b(self):
+        self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
+        inner_state = self._dispatch_intermediate_state
+        del self._dispatch_intermediate_state
+        return self._get_impl().dispatch_b(*inner_state)
+
+    def combine(
+        self,
+        combine_input: CombineInput,
+    ) -> Tuple:
+        self.combine_a(combine_input)
+        hidden_states = self.combine_b()
+        return hidden_states[: self._num_tokens]
 
     def combine_a(
         self,

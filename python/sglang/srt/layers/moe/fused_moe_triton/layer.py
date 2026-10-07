@@ -72,6 +72,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 import time
 from typing import Dict, List, Optional, Tuple
+from sglang.srt.environ import envs
 
 if importlib.util.find_spec("sglang._vendor.compressed_tensors") is not None:
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (
@@ -1346,5 +1347,151 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
         ),
     )
     forward_context = get_forward_context()
+    moe_layer = forward_context.moe_layers[layer_id]
+    return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
+    return (
+        getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
+        or (
+            isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
+            and not getattr(
+                quant_method, "_moe_runner_backend", get_moe_runner_backend()
+            ).is_marlin()
+        )
+        or (
+            isinstance(quant_method, Fp8MoEMethod)
+            and (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
+        )
+        or (
+            isinstance(quant_method, UnquantizedFusedMoEMethod)
+            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
+    )
+
+
+def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Copy a CPU tensor view into independent contiguous storage."""
+    if loaded_weight.device.type != "cpu":
+        return loaded_weight
+    tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
+    needs_copy = not (
+        loaded_weight.is_contiguous()
+        and loaded_weight.storage_offset() == 0
+        and loaded_weight.untyped_storage().nbytes() == tensor_bytes
+    )
+    if not needs_copy:
+        return loaded_weight
+    return loaded_weight.clone(memory_format=torch.contiguous_format)
+
+
+def _maybe_copy_weight_view_before_h2d(
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
+        return loaded_weight
+    return _copy_weight_view_before_h2d(loaded_weight)
+
+
+def _get_deepep_comm_group(a2a_backend):
+    group = get_parallel().tp_group.device_group
+
+    if a2a_backend.is_mori():
+        group = get_parallel().tp_group
+
+    elif _is_npu:
+        group = get_parallel().moe_ep_group.device_group
+
+    return group
+
+
+def _validate_hpc_ops_quant_method(quant_method) -> None:
+    """--moe-runner-backend hpc_ops makes the standard dispatcher keep global
+    expert ids for every MoE layer, so the resolved quant method must be the
+    FP8 one the hpc_ops runner supports. Quant methods that never construct a
+    MoeRunner (e.g. W4AFp8 calls its kernel directly from apply()) bypass the
+    MoeRunner-level guard, so validate here at layer init.
+    """
+    if get_moe_runner_backend().is_hpc_ops() and not isinstance(
+        quant_method, Fp8MoEMethod
+    ):
+        raise ValueError(
+            "--moe-runner-backend hpc_ops only supports Fp8MoEMethod "
+            "(FP8 blockwise or per-tensor MoE), but this layer selected "
+            f"{type(quant_method).__name__}. Remove --moe-runner-backend "
+            "hpc_ops for this model."
+        )
+
+
+def _deepep_v2_experts_are_fp8(quant_method) -> bool:
+    # All other supported quantization methods are blockwise FP8.
+    return not isinstance(quant_method, UnquantizedFusedMoEMethod)
+
+
+def _validate_deepep_v2_quant_method(quant_method) -> None:
+    """Validate the expert formats the DeepEP v2 adapter can feed."""
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    if isinstance(quant_method, UnquantizedFusedMoEMethod):
+        return
+
+    config = (
+        quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
+    )
+    reason = None
+    if not isinstance(quant_method, Fp8MoEMethod):
+        reason = f"selected {type(quant_method).__name__}"
+    elif quant_method.is_fp4_expert:
+        reason = "selected FP4 experts"
+    elif list(quant_method.weight_block_size or []) != (
+        [1, 32] if quant_method.use_mxfp8 else [128, 128]
+    ):
+        quant_format = "MXFP8 " if quant_method.use_mxfp8 else ""
+        reason = f"has {quant_format}weight_block_size={quant_method.weight_block_size}"
+    elif config.activation_scheme != "dynamic":
+        reason = f"has activation_scheme={config.activation_scheme!r}"
+
+    if reason is not None:
+        raise ValueError(
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 or 1x32 MXFP8 "
+            "experts with dynamic activation scaling or unquantized BF16 "
+            f"experts, but this layer {reason}. Use a compatible checkpoint or "
+            "--moe-a2a-backend deepep."
+        )
+
+
+@register_custom_op(out_shape="hidden_states")
+def fused_moe_bypassed_piecewise_cuda_graph_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    topk_group: Optional[int],
+    num_expert_group: Optional[int],
+    correction_bias: Optional[torch.Tensor],
+    renormalize: bool,
+    layer_id: int,
+    allow_routed_experts_capture: bool,
+) -> torch.Tensor:
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=TopKConfig(
+            top_k=top_k,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            correction_bias=correction_bias,
+            renormalize=renormalize,
+            allow_routed_experts_capture=allow_routed_experts_capture,
+        ),
+    )
+    forward_context = get_tc_piecewise_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
     return moe_layer.forward_impl(hidden_states, topk_output)

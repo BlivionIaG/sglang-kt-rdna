@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
 from sglang.srt.utils import ceil_align
 from typing import Dict, Optional
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+import os
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -588,3 +589,67 @@ class SparsePrefillChunkCache:
             out_indices=self.c4_combined_indices,
             out_lens=self.c4_combined_lens,
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
+    """Return whether DeepSeek-V4 sparse prefill should use Q8KV8.
+
+    ``dsv4_prefill_backend`` is the production configuration. The environment
+    variable remains as a debug override while the runtime path is being
+    hardened: truthy values force Q8 on, falsy values force it off.
+    """
+    env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
+    if env_value is not None:
+        return env_value.lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    return dsv4_prefill_backend == "flashmla_sparse_q8"
+
+
+class SparsePrefillWorkspace:
+    """Backend-owned scratch storage for sparse prefill KV dequantization.
+
+    The workspace contents are fully overwritten before every attention call,
+    so token buckets and compression ratios can safely share one buffer. Sparse
+    prefill executes eagerly and serially on the supported paths, which makes it
+    safe to replace the scratch allocation when a larger extent is needed.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._buffer: Optional[torch.Tensor] = None
+
+    def get(
+        self,
+        num_tokens: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        assert num_tokens > 0
+        current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
+        current_dtype = self._buffer.dtype if self._buffer is not None else None
+        if num_tokens > current_capacity or dtype != current_dtype:
+            self._buffer = torch.empty(
+                (num_tokens, 1, WORKSPACE_DIM),
+                dtype=dtype,
+                device=self.device,
+            )
+        return self._buffer[:num_tokens]
+
+
+@dataclass
+class CompressedGather:
+    """Positional layout of one compressed cache inside the workspace."""
+
+    flat_token_ids: torch.Tensor  # (num_reqs * c_max,) int32
+    compressed_base: torch.Tensor  # (num_reqs,) int32
+    swa_base: torch.Tensor  # (num_reqs,) int32
+    # Tail stays at the -1 sentinel because the valid prefix length is
+    # chunk-invariant per request; subsequent layers only overwrite that prefix.
+    combined_indices: Optional[torch.Tensor] = None
+    combined_lens: Optional[torch.Tensor] = None

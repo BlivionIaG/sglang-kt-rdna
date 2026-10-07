@@ -36,3 +36,35 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _sm120_deep_gemm_apis_available() -> bool:
+    try:
+        import deep_gemm
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "fp8_einsum",
+            "m_grouped_fp8_fp4_gemm_nt_contiguous",
+            "transform_sf_into_required_layout",
+        )
+    )
+
+
+def _supports_paged_sparse_mqa_logits() -> bool:
+    if not DEEPGEMM_BLACKWELL:
+        return False
+    import deep_gemm
+
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "get_paged_sparse_mqa_logits_metadata",
+            "fp8_fp4_paged_sparse_mqa_logits",
+        )
+    )

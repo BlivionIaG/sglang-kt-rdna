@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
 from typing import List, NamedTuple, Optional, Tuple
+from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
 logger = logging.getLogger(__name__)
 
@@ -172,3 +173,58 @@ def _init_config():
 
 
 THRESHOLD_2_SHOT_MAP: Dict[int, ModeConfig] = {}
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _ceil_align(nbytes: int, align: int) -> int:
+    return (nbytes + align - 1) // align * align
+
+
+def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    if torch.__version__ < "2.11.0":
+        import torch.distributed._symmetric_memory as torch_symm_mem
+
+        torch_symm_mem.enable_symm_mem_for_group(group.group_name)
+    tensor = _SymmetricMemory.empty_strided_p2p(
+        (nbytes,),
+        [1],
+        torch.uint8,
+        device,
+        group.group_name,
+    )
+    symm_mem = _SymmetricMemory.rendezvous(tensor)
+    return tensor, symm_mem
+
+
+class AllReduceConfig(NamedTuple):
+    algo: AllReduceAlgo
+    use_graph: bool = False
+    use_multicast: bool = False
+
+
+def _is_vmm_backed_allocator(device: torch.device) -> bool:
+    """Check whether expandable-segments VMM backs the caching allocator."""
+    probe = torch.empty(1, dtype=torch.uint8, device=device)
+    return is_vmm_pointer(probe.data_ptr())
+
+
+def can_use_custom_all_reduce_v2(
+    group: ProcessGroup,
+    device: torch.device,
+) -> bool:
+    supported = get_supported_world_sizes()
+    if dist.get_world_size(group=group) not in supported:
+        return False
+    if not all(in_the_same_node_as(group, source_rank=0)):
+        return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
+    full_nvlink = can_use_custom_all_reduce_with_nvlink(
+        group=group,
+        device=device,
+        supported_world_size=list(supported),
+        cls_name="CustomAllReduceV2",
+    )
+    return full_nvlink is True

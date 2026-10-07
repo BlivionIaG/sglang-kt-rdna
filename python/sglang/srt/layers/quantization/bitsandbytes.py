@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import direct_register_custom_op, set_weight_attrs
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -619,3 +620,45 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def require_bitsandbytes() -> None:
+    try:
+        import bitsandbytes
+
+        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
+            raise ImportError(
+                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
+            )
+    except ImportError as err:
+        raise ImportError(
+            "Please install bitsandbytes>=0.46.1 via "
+            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
+        ) from err
+
+
+@register_custom_op(mutates_args=["out"])
+def apply_bnb_4bit(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    # only load the bitsandbytes module when needed
+    from bitsandbytes import matmul_4bit
+
+    quant_states = weight.bnb_quant_state
+    current_index = 0
+    for i in range(len(quant_states)):
+        output_size = quant_states[i].shape[0]
+        # It is more efficient to use out kwarg like
+        # matmul_4bit(..., out = ...).  Infeasible now due to the bug
+        # https://github.com/TimDettmers/bitsandbytes/issues/1235.
+        # Need to change  after the bug is fixed.
+        out[:, current_index : current_index + output_size] = matmul_4bit(
+            x, weight[offsets[i] : offsets[i + 1]].t(), quant_states[i]
+        )
+        current_index += output_size

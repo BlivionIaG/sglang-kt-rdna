@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -1040,4 +1041,28 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
             group_list_type,
             group_list,
             output_dtype,
+        )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
+    """Load calibrated k_scale / v_scale from a compressed-tensors checkpoint
+    that declares a ``kv_cache_scheme`` (static per-tensor FP8)."""
+
+    def __init__(self, quant_config: CompressedTensorsConfig):
+        assert self.is_supported_scheme(quant_config.kv_cache_scheme)
+        super().__init__(quant_config)
+
+    @staticmethod
+    def is_supported_scheme(kv_cache_scheme: Dict[str, Any]) -> bool:
+        """Static symmetric per-tensor FP8 — all BaseKVCacheMethod can
+        represent. Dynamic schemes serialize no k_scale/v_scale tensors."""
+        return (
+            kv_cache_scheme.get("type") == "float"
+            and kv_cache_scheme.get("num_bits") == 8
+            and kv_cache_scheme.get("strategy") == "tensor"
+            and kv_cache_scheme.get("symmetric", True)
+            and not kv_cache_scheme.get("dynamic", False)
         )

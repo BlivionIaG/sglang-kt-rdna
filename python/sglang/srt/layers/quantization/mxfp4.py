@@ -52,6 +52,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from dataclasses import fields, replace
+from functools import lru_cache
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
@@ -1038,3 +1040,84 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             expert_mask=layer.expert_mask_gpu,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@lru_cache(maxsize=1)
+def _is_sm107_supported() -> bool:
+    return get_device_capability() == (10, 7)
+
+
+def _prepare_flashinfer_mxfp8_activations(
+    x: torch.Tensor, hidden_size: int
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    prepared = None
+    if x.shape[-1] == hidden_size:
+        if x.dim() > 2:
+            x = x.view(-1, x.shape[-1])
+        # K3's routing dispatch may already have quantized these rows and
+        # packed the topk ids. Other models use FlashInfer's own activation
+        # preparation so the producer matches the fused-MoE input contract.
+        from sglang.srt.layers.moe import route_quant_handoff
+
+        prepared = route_quant_handoff.take(x)
+
+    if prepared is not None:
+        prepared_packed_topk, x_quant, x_scale = prepared
+        x_scale = x_scale.view(torch.float8_e4m3fn)
+    # FlashInfer handles SM107 inputs unless K3 reaches this fallback with an
+    # exact-width FP32 tensor, which its quantizer rejects. Use SGLang's compatible
+    # MXFP8/UE8M0 quantizer for that case; padded inputs still need alignment.
+    elif x.shape[-1] != hidden_size or (
+        _is_sm107_supported() and x.dtype != torch.float32
+    ):
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_mxfp8_quantize,
+        )
+
+        prepared_packed_topk = None
+        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
+        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+    else:
+        from sglang.kernels.ops.quantization.per_token_group_quant import (
+            per_token_group_quant,
+        )
+
+        prepared_packed_topk = None
+        x_quant, x_scale = per_token_group_quant(x, group_size=32, scale_ue8m0=True)
+        x_scale = x_scale.view(torch.float8_e4m3fn)
+
+    return x, prepared_packed_topk, x_quant, x_scale
+
+
+def _aiter_situ_uses_gu_interleaved_weights() -> bool:
+    """Match AITER's SiTU activation-mode precedence when choosing weight layout."""
+    a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
+    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
+    return a8w4 or not a4w4
+
+
+def _pad_hopper_mxfp4_scale(scale, k_size):
+    # triton_kernels' HOPPER_SCALE branch (matmul_details/_matmul.py) loads the w
+    # scales unmasked over cdiv(k_size, 128) tiles; drop when that load is masked.
+    mxfp4_block = 32
+    want = round_up(k_size, 128) // mxfp4_block
+    if scale.shape[-1] >= want:
+        return scale
+    return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
+
+
+@lru_cache(maxsize=1)
+def _mx_block_kwargs():
+    # triton_kernels 3.8 rejects an mx scale without its block size; the field is
+    # absent in 3.7, which ROCm still ships, so probe before importing the value.
+    from triton_kernels.matmul import PrecisionConfig
+
+    if "b_microblock_size" not in {f.name for f in fields(PrecisionConfig)}:
+        return {}
+
+    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+    return {"b_microblock_size": int(MXFP_BLOCK_SIZE)}

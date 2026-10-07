@@ -20,6 +20,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -749,3 +751,36 @@ def apply_custom_logit_processor(
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _trace_e2e_sampler(stage: str, **fields) -> None:
+    if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_SAMPLER_E2E {rank} stage={stage} {details}", flush=True)
+
+
+class _SamplingMaskCapture(NamedTuple):
+    """Compact post-filter weights and their original batch-row mapping."""
+
+    weights: torch.Tensor
+    token_ids: Optional[torch.Tensor]
+    selected_weight: Optional[torch.Tensor]
+    batch_rows: torch.Tensor
+
+
+def _select_sampling_mask_rows(
+    tensor: torch.Tensor, batch_indices: torch.Tensor
+) -> torch.Tensor:
+    """Select opted-in rows, returning the input when every row opts in."""
+    if batch_indices.numel() == tensor.shape[0]:
+        return tensor
+    return tensor.index_select(0, batch_indices)

@@ -25,6 +25,8 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 from sglang.srt.utils import get_bool_env_var, is_hip
+import functools
+from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -386,3 +388,85 @@ def get_rope_wrapper(
         partial_rotary_factor,
         device,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _get_rope_param(rope_scaling, key, default, scaling_type):
+    """Get a parameter from rope_scaling dict, warn if missing.
+
+    In transformers v5, config.rope_scaling is an alias for rope_parameters
+    which may be non-None even for models with no actual scaling (rope_type=default).
+    When a required key is missing, this logs a warning instead of silently
+    defaulting, to make config mismatches easier to debug.
+    """
+    if key in rope_scaling:
+        return rope_scaling[key]
+    logger.warning(
+        "rope_scaling (type=%s) missing key '%s', defaulting to %s. "
+        "This may indicate a v5 config issue — check model accuracy.",
+        scaling_type,
+        key,
+        default,
+    )
+    return default
+
+
+def _bailing_yarn_kwargs(rope_scaling: Dict[str, Any], max_position: int) -> Dict:
+    """YaRN overrides for BailingMRotaryEmbedding; factor=1.0 is a no-op."""
+    return {
+        "scaling_factor": rope_scaling.get("factor", 1.0),
+        "original_max_position_embeddings": rope_scaling.get(
+            "original_max_position_embeddings", max_position
+        ),
+        "extrapolation_factor": rope_scaling.get("extrapolation_factor", 1),
+        "attn_factor": rope_scaling.get("attn_factor", 1),
+        "beta_fast": rope_scaling.get("beta_fast", 32),
+        "beta_slow": rope_scaling.get("beta_slow", 1),
+        "truncate": rope_scaling.get("truncate", True),
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_rope_unsupported_arch() -> bool:
+    """aiter's rope kernels (csrc/kernels/rope/rope_common.h) depend on ck_tile
+    types that do not build on gfx1250; fall back to sglang's native rope there."""
+    if not _is_hip:
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+def _get_live_rope_cache_entry(key: Tuple) -> Optional[RotaryEmbedding]:
+    """Return the cached module for ``key``, dropping it if its buffers are dead.
+
+    A cached module is shared process-wide and attached as a submodule of every
+    model that requests it, so a model teardown that frees CUDA storages and
+    re-points its own module tree at the meta device kills this entry for all
+    later models too. Nothing downstream can catch that: the in-place RoPE ops
+    take the cos/sin cache as an argument, so a meta tensor routes them to the
+    Meta backend, where they silently no-op and leave queries un-rotated.
+
+    A dead entry is indistinguishable from one a meta-device construction pass
+    built on purpose -- both are meta with no storage -- so the current device
+    is what separates them.
+    """
+    cached = _ROPE_DICT.get(key)
+    if cached is None:
+        return None
+    if torch.get_default_device().type == "meta":
+        return cached
+    for buf in cached.buffers():
+        if buf.device.type == "meta" or buf.untyped_storage().nbytes() == 0:
+            logger.warning(
+                "Discarding dead RoPE cache entry (key=%s): buffer on %s. "
+                "A shared RotaryEmbedding was freed by its owner.",
+                key,
+                buf.device,
+            )
+            del _ROPE_DICT[key]
+            return None
+    return cached

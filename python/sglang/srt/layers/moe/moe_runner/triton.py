@@ -580,3 +580,11 @@ def post_permute_triton_to_standard(
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
+    # only expert parallelism can route a token to an expert this rank does not hold
+    return config.num_experts is None or config.num_experts != config.num_local_experts

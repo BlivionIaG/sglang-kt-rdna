@@ -1088,3 +1088,53 @@ def fast_mla_decode_plan(
         )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA plan: {e}")
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def fast_mla_prefill_plan(
+    self,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_len_arr_cpu: torch.Tensor,
+    num_heads: int,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    page_size: int,
+    causal: bool,
+    sm_scale: float,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+) -> None:
+    """Sync-free BatchMLAPagedAttentionWrapper.plan for the target-verify CUDA
+    graph replay. Like fast_mla_decode_plan it hands host-known qo/kv indptr +
+    lengths straight to _cached_module.plan (no per-replay device-to-host copy).
+    Decode's indices updater writes the cuda-graph buffers in place so its fast
+    plan can skip them; verify metadata is freshly built each step, so refresh
+    the bound buffers here exactly as stock plan()'s use_cuda_graph branch does
+    (host->device / device->device, non-blocking).
+    """
+    self._causal = causal
+    self._page_size = page_size
+    self._sm_scale = sm_scale
+    self._qo_indptr_buf.copy_(qo_indptr_cpu, non_blocking=True)
+    self._kv_indptr_buf.copy_(kv_indptr_cpu, non_blocking=True)
+    self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices, non_blocking=True)
+    self._kv_len_arr_buf.copy_(kv_len_arr_cpu, non_blocking=True)
+
+    try:
+        self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA prefill plan: {e}")

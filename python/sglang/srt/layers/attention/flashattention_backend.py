@@ -2647,3 +2647,10 @@ def draft_decode_set_expand_metadata(
     positions = mask.cumsum(dim=1) - 1
     num_seqs = cache_loc.shape[0]
     page_table[:num_seqs, :].scatter_(1, positions, cache_loc)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _should_disable_scheduler_metadata_precompute() -> bool:
+    return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)

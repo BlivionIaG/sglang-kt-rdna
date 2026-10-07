@@ -563,3 +563,376 @@ class Gemma3RMSNorm(MultiPlatformOp):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@lru_cache(maxsize=1)
+def _get_aiter_per_group_quant():
+    """Resolve aiter's per-1x128 HIP quant functor + FP8 dtype on first use.
+
+    Memoized locally (rather than cached as module-level globals) so this
+    aiter-specific state stays out of layernorm.py's shared namespace and is
+    handed to callers as explicit values instead of being read implicitly.
+    """
+    return _aiter.get_hip_quant(_aiter.QuantType.per_1x128), _aiter.dtypes.fp8
+
+
+def _forward_with_allreduce_fusion(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    post_residual_addition: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    use_attn_tp_group: bool = True,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Shared allreduce-fused RMSNorm logic usable by any norm."""
+    if residual is not None:
+        from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
+            tensor_model_parallel_all_reduce,
+            tensor_model_parallel_fused_allreduce_rmsnorm,
+        )
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce_residual_rmsnorm,
+        )
+        from sglang.srt.layers.moe.utils import deferred_post_experts_all_reduce
+
+        if use_attn_tp_group:
+            world_size = get_parallel().attn_tp_size
+        else:
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
+            else:
+                world_size = get_parallel().moe_tp_size
+
+        if world_size > 1:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+
+            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
+            if _use_aiter:
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, residual, weight, norm_module.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
+            else:
+                fused_result = flashinfer_allreduce_residual_rmsnorm(
+                    input_tensor=x,
+                    residual=residual,
+                    weight=weight,
+                    eps=norm_module.variance_epsilon,
+                    max_token_num=max(x.shape[0], 2048),
+                    use_attn_tp_group=use_attn_tp_group,
+                )
+                if fused_result[0] is not None:
+                    return fused_result
+                # The kernel declined: all-reduce over the group its workspace
+                # is built on, then add and norm into a new residual tensor, as
+                # the kernel does.
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                else:
+                    x = deferred_post_experts_all_reduce(x)
+                if post_residual_addition is None:
+                    residual = residual.clone()
+                return norm_module.forward(x, residual, None)
+
+            # For AITER route, preserve correctness when fused path is unavailable.
+            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
+                x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
+
+    return norm_module.forward(x, residual, post_residual_addition)
+
+
+def _forward_with_allreduce_fusion_quant_per_group(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    group_size: int = 128,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+):
+    """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
+
+    The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
+    Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
+    the existing tuple handoff behavior.
+
+    The helper returns one of:
+
+    * ``((fp8, scale), residual)``                       when keep_bf16=False
+    * ``((bf16, fp8, scale), residual)``                 when keep_bf16=True
+    * ``None``                                           when no fusion is possible
+
+    Fallback chain (best → worst):
+
+    1. Fully-fused AR+RMSNorm+per-group-quant  (aiter single kernel).
+    2. Fused AR+RMSNorm followed by a separate per-1x128 quant
+       (two kernels, still saves the 3-kernel unfused baseline path).
+    3. ``None`` so the caller can run the generic unfused path.
+
+    ``keep_bf16`` is required for GDN-style layers that have one FP8 projection
+    (``in_proj_qkvz``) **and** one bf16 projection (``in_proj_ba``) on the
+    same normed output; without the bf16 we would have to dequantize which is
+    lossy. Standard attention layers (single FP8 ``qkv_proj``) use
+    ``keep_bf16=False``.
+    """
+    if residual is None or not _use_aiter:
+        return None
+
+    from sglang.srt.distributed import (
+        tensor_model_parallel_fused_allreduce_rmsnorm,
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
+    )
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_bpreshuffle_gfx95 as use_bpreshuffle,
+    )
+    from sglang.srt.layers.quantization.fp8_utils import (
+        materialize_bpreshuffle_fp8_scale,
+    )
+
+    if use_attn_tp_group:
+        world_size = get_parallel().attn_tp_size
+    else:
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+        else:
+            world_size = get_parallel().moe_tp_size
+    if world_size <= 1:
+        return None
+
+    # ``transpose_scale=use_bpreshuffle`` asks the fused kernel to emit the
+    # per-group scale directly in the column-major layout the gfx95 bpreshuffle
+    # GEMM consumes (identical to ``materialize_bpreshuffle_fp8_scale``), so the
+    # fused-success paths below need no post-kernel transpose. The separate
+    # per-group-quant fallbacks still materialize: ``per_1x128_quant``'s own
+    # ``transpose_scale`` byte-shuffles the scale into a *different* arrangement,
+    # not the column-major layout this GEMM expects.
+    if not keep_bf16:
+        result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+            x,
+            residual,
+            weight,
+            norm_module.variance_epsilon,
+            group_size,
+            transpose_scale=use_bpreshuffle,
+        )
+        if result is not None:
+            fp8_out, residual_out, scale_out = result
+            return (fp8_out, scale_out), residual_out
+
+        # Fallback: fused AR+RMSNorm then separate per-group quant.
+        fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual, weight, norm_module.variance_epsilon
+        )
+        if fused_result is None:
+            return None
+        bf16_out, residual_out = fused_result
+        per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
+        fp8_out, scale_out = per_1x128_quant(
+            bf16_out,
+            quant_dtype=fp8_dtype,
+            transpose_scale=False,
+        )
+        if use_bpreshuffle:
+            scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
+        return (fp8_out, scale_out), residual_out
+
+    # keep_bf16=True: GDN path — need both an unquantized bf16 normed output
+    # (for in_proj_ba) AND (fp8, scale) (for in_proj_qkvz). Preferred path:
+    # use the fully-fused AR+RMSNorm+per-group-quant kernel with the optional
+    # bf16 side-output, so we avoid the separate per-group quant launch
+    # entirely. Fallback: fused AR+RMSNorm + separate per-group quant.
+    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+        x,
+        residual,
+        weight,
+        norm_module.variance_epsilon,
+        group_size,
+        emit_bf16=True,
+        transpose_scale=use_bpreshuffle,
+    )
+    if result is not None and len(result) == 4:
+        fp8_out, residual_out, scale_out, bf16_out = result
+        return (bf16_out, fp8_out, scale_out), residual_out
+
+    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x, residual, weight, norm_module.variance_epsilon
+    )
+    if fused_result is None:
+        return None
+    bf16_out, residual_out = fused_result
+    per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
+    fp8_out, scale_out = per_1x128_quant(
+        bf16_out,
+        quant_dtype=fp8_dtype,
+        transpose_scale=False,
+    )
+    if use_bpreshuffle:
+        scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
+    return (bf16_out, fp8_out, scale_out), residual_out
+
+
+def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
+    """Return the per-tensor static FP8 activation scale of ``linear`` if it is
+    an FP8 linear using static per-tensor activation scaling that can consume a
+    pre-quantized ``(fp8, scale)`` input; otherwise ``None``.
+
+    Recognizes both the native ``Fp8LinearMethod`` (non block/mxfp8/marlin) and
+    the compressed-tensors W8A8-FP8 scheme with a static per-tensor input scale
+    (e.g. RedHatAI ``*-FP8`` checkpoints). The flashinfer fused kernel only
+    supports per-tensor quant, hence the ``numel() == 1`` requirement.
+    """
+    if linear is None:
+        return None
+    quant_method = getattr(linear, "quant_method", None)
+    if quant_method is None:
+        return None
+    if not _is_static_per_tensor_fp8_linear(quant_method, linear):
+        return None
+    input_scale = getattr(linear, "input_scale", None)
+    if input_scale is None or input_scale.numel() != 1:
+        return None
+    return input_scale
+
+
+def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
+    try:
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    except ImportError:
+        Fp8LinearMethod = ()
+    if isinstance(quant_method, Fp8LinearMethod):
+        return not (
+            getattr(quant_method, "block_quant", False)
+            or getattr(quant_method, "use_mxfp8", False)
+            or getattr(quant_method, "use_marlin", False)
+        )
+    try:
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsLinearMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A8Fp8,
+        )
+    except ImportError:
+        return False
+    if isinstance(quant_method, CompressedTensorsLinearMethod):
+        scheme = getattr(linear, "scheme", None)
+        return isinstance(scheme, CompressedTensorsW8A8Fp8) and getattr(
+            scheme, "is_static_input_scheme", False
+        )
+    return False
+
+
+class Gemma4RMSNorm(BaseFusedOp):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        scale_shift: float = 0.0,
+        with_scale: bool = True,
+    ):
+        super().__init__()
+        self.with_scale = with_scale
+
+        if self.with_scale:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_buffer("weight", torch.ones(dim), persistent=False)
+
+        self.eps = eps
+        self.scale_shift = scale_shift
+
+    def __repr__(self):
+        dim = self.weight.shape[0]
+        return (
+            f"{self.__class__.__name__}(dim={dim}, eps={self.eps}, "
+            f"with_scale={self.with_scale}, scale_shift={self.scale_shift})"
+        )
+
+    def _norm(self, x):
+        mean_squared = x.pow(2).mean(-1, keepdim=True) + self.eps
+        return x * torch.pow(mean_squared, -0.5)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        normed_output = self._norm(x.float())
+        if self.with_scale:
+            normed_output = normed_output * (self.weight.float() + self.scale_shift)
+        return normed_output.type_as(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx_available:
+            # the kernel needs a last-dim-contiguous input; the audio conformer
+            # normalizes its depthwise conv output, which arrives permuted
+            if x.stride(-1) != 1:
+                x = x.contiguous()
+            return torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
+                x, self.weight.data, self.eps, self.scale_shift, self.with_scale
+            )
+        return self.forward_native(x)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        if self.with_scale and self.scale_shift == 1.0:
+            # gemma_rmsnorm: norm(x) * (1 + weight)
+            out = gemma_rmsnorm(x, self.weight.data, self.eps)
+        else:
+            # rmsnorm: norm(x) * weight
+            # with_scale=False → weight is ones → norm(x) * 1 = norm(x)
+            # scale_shift=0.0 → standard RMSNorm without +1 shift
+            out = rmsnorm(x, self.weight.data, self.eps)
+
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if self.with_scale and self.scale_shift == 1.0:
+            out = gemma_rmsnorm(x, self.weight.data, self.eps)
+        else:
+            out = rmsnorm(x, self.weight.data, self.eps)
+        return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel's gemma_rmsnorm is not available on ROCm;
+        # delegate to the pure-PyTorch implementation.
+        return self.forward_native(x)
+
+
+class RMSNormWithoutScale(BaseFusedOp):
+    def __init__(self, hidden_size: int, eps=1e-6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward_native(self, x):
+        orig_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return x.to(orig_dtype)
+
+    def forward_cuda(self, x):
+        return self.forward_native(x)
+
+    def extra_repr(self):
+        return f"{self.hidden_size}, eps={self.eps}"

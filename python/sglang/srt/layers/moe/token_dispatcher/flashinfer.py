@@ -261,3 +261,19 @@ class FlashinferDispatcher(BaseDispatcher):
         del self.runtime_max_tokens_per_rank
         del self.has_dummy_token
         return hidden_states
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _max_tokens_per_scattered_source(
+    dp_global_num_tokens: list[int], attn_tp_size: int
+) -> int:
+    assert attn_tp_size > 0
+    max_dp_tokens = max(dp_global_num_tokens)
+    return (max_dp_tokens + attn_tp_size - 1) // attn_tp_size
+
+
+def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> int:
+    slot = int(speculative)
+    return workspace_size + slot * _WORKSPACE_NAMESPACE_ALIGNMENT

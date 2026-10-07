@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+import re
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
@@ -522,3 +523,210 @@ class QuarkKVCacheMethod(BaseKVCacheMethod):
                 "for quark KV cache. "
                 f"Expected qscheme: per_tensor, found qscheme: {qscheme}"
             )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
+    """Extract NVFP4 producer-declared excludes as `re:` patterns.
+
+    Reads the producer-specific key:
+      - `ignore`          - ModelOpt (config.json)
+      - `exclude_modules` - ModelOpt hf_quant_config.json
+      - `exclude`         - AMD Quark export
+
+    Entries are usually fnmatch-style (literal strings work too), but ModelOpt
+    `ignore` lists may already carry `re:`-prefixed regexes (e.g.
+    `re:.*linear_attn\\.in_proj_a$`); those are passed through untouched.
+    Wrapping an already-`re:` entry with another `re:` + `fnmatch.translate`
+    yields a pattern that never matches, silently un-excluding the layer.
+    Returns [] if no key present.
+    """
+    pats = (
+        hf_quant_config.get("ignore")
+        or hf_quant_config.get("exclude_modules")
+        or hf_quant_config.get("exclude")
+        or []
+    )
+    return [p if p.startswith("re:") else "re:" + fnmatch.translate(p) for p in pats]
+
+
+def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"]:
+    """Return an Nvfp4SourceConfig if `config` (the checkpoint's
+    quantization_config dict) describes a supported NVFP4 source, else None.
+
+    Handles two producers:
+      - ModelOpt:  quant_method in {modelopt, modelopt_fp4, nvfp4}
+                   with quant_algo NVFP4/FP4 (or unspecified).
+      - AMD Quark: quant_method == "quark". global_quant_config.weight is a
+                   2-element list [fp4_per_group_gs16, fp8_e4m3_per_tensor].
+
+    compressed-tensors NVFP4 is not supported at this time.
+    """
+    from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+
+    quant_method = config.get("quant_method", "")
+    quant_algo = (config.get("quant_algo") or "").upper()
+
+    if quant_method in ("modelopt", "modelopt_fp4", "nvfp4") and quant_algo in (
+        "",
+        "NVFP4",
+        "FP4",
+    ):
+        return Nvfp4SourceConfig()
+    if quant_method == "quark":
+        gqc = config.get("global_quant_config", {})
+        weight = gqc.get("weight")
+        if not (isinstance(weight, list) and len(weight) == 2):
+            return None
+        w0, w1 = weight
+        is_nvfp4_weight = (
+            isinstance(w0, dict)
+            and w0.get("dtype") == "fp4"
+            and w0.get("qscheme") == "per_group"
+            and w0.get("group_size") == 16
+            and not w0.get("is_dynamic")
+        )
+        is_nvfp4_scale_2 = (
+            isinstance(w1, dict)
+            and w1.get("dtype") == "fp8_e4m3"
+            and w1.get("qscheme") == "per_tensor"
+            and not w1.get("is_dynamic")
+        )
+        if is_nvfp4_weight and is_nvfp4_scale_2:
+            return Nvfp4SourceConfig()
+        return None
+    if quant_method in ("compressed-tensors", "compressed_tensors"):
+        raise NotImplementedError(
+            "Online MXFP4 requantization from compressed-tensors NVFP4 "
+            "checkpoints is not supported at this time."
+        )
+    return None
+
+
+def _fp8_per_tensor_spec(is_dynamic_input: bool) -> Dict[str, Any]:
+    return {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_tensor",
+            "is_dynamic": False,
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_tensor",
+            "is_dynamic": is_dynamic_input,
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+
+def _fp8_is_dynamic_from_config_groups(
+    config_groups: Any,
+) -> bool:
+    """Return whether FP8 activation quantization is dynamic, from config_groups.
+
+    Reads the `input_activations.dynamic` field of the first config_group whose
+    `num_bits` is 8, and falls back to True (dynamic) when none exists or the
+    format is not a recognised dict-of-dicts.
+    """
+    if not isinstance(config_groups, dict):
+        return True
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        input_act = group.get("input_activations") or {}
+        if input_act.get("num_bits") == 8:
+            return bool(input_act.get("dynamic", True))
+    return True
+
+
+def _mixed_precision_layer_map(config: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return {layer_name: quant_algo} for a MIXED_PRECISION source, else None.
+
+    Reads ModelOpt's per-layer `quantized_layers` map (from
+    hf_quant_config.json or config.json's quantization_config). Only the
+    quant_algo string per layer is needed;
+    """
+    if (config.get("quant_algo") or "").upper() != "MIXED_PRECISION":
+        return None
+    quantized_layers = config.get("quantized_layers")
+    if not isinstance(quantized_layers, dict) or not quantized_layers:
+        return None
+    layer_map: Dict[str, str] = {}
+    for name, info in quantized_layers.items():
+        if isinstance(info, dict):
+            layer_map[name] = str(info.get("quant_algo", "")).upper()
+    return layer_map
+
+
+def _build_mixed_precision_layer_quant_config(
+    layer_map: Dict[str, str],
+    config_groups: Optional[Dict[str, Any]] = None,
+) -> tuple[Dict[str, Any], bool]:
+    """Collapse a per-layer {name: quant_algo} map into a compact
+    `layer_quant_config` keyed by fnmatch glob patterns.
+    """
+    # suffix tail -> set of algos seen (to detect inconsistency)
+    tail_algos: Dict[str, set] = {}
+    for name, algo in layer_map.items():
+        # Suffix after the last `.layers.<idx>.` (or the whole name if
+        # unindexed); this is the part shared across all layer indices.
+        tail = re.split(r"\.layers\.\d+\.", name, maxsplit=1)[-1]
+        tail_algos.setdefault(tail, set()).add(algo)
+
+    fp8_is_dynamic = _fp8_is_dynamic_from_config_groups(config_groups or {})
+    fp8_spec = _fp8_per_tensor_spec(is_dynamic_input=fp8_is_dynamic)
+
+    layer_quant_config: Dict[str, Any] = {}
+    has_nvfp4 = False
+    for tail, algos in tail_algos.items():
+        if len(algos) != 1:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} has inconsistent "
+                f"quant algos across layers: {sorted(algos)}. SGLang requires "
+                "all layers in a group to share one algo."
+            )
+        algo = next(iter(algos))
+        pattern = "*" + tail
+        if algo in ("NVFP4", "W4A16_NVFP4"):
+            layer_quant_config[pattern] = _MXFP4_TARGET_SPEC
+            has_nvfp4 = True
+        elif algo == "FP8":
+            layer_quant_config[pattern] = fp8_spec
+        else:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} uses unsupported "
+                f"quant algo {algo!r}; online requantization supports NVFP4 "
+                "(-> MXFP4) and FP8 (kept as-is) only."
+            )
+    return layer_quant_config, has_nvfp4
+
+
+def _build_excluded_fp8_config(config: Dict[str, Any]) -> Optional["Fp8Config"]:
+    """Build a load-as-is `Fp8Config` for the excluded layers of a
+    mixed-precision NVFP4 source, or None if excluded layers are bf16.
+
+    Two producer conventions are handled:
+
+    - FP8-serialized base (``quant_method == "fp8"``, e.g.
+      DeepSeek-V4-Pro-NVFP4): the routed experts are NVFP4 (requantized to
+      MXFP4) while attn / shared_experts stay FP8 and are listed in the
+      excludes. Those FP8 layers load through `Fp8LinearMethod`;
+      ``weight_block_size`` selects block (e.g. ``[128, 128]``) vs per-tensor
+      (``None``), so a single config covers either granularity - and a
+      checkpoint carrying only per-tensor or only block layers is handled
+      without any per-layer probing.
+
+    - ModelOpt mixed base (``quant_method`` in {modelopt, modelopt_mixed},
+      e.g. Qwen3.5-397B-A17B-NVFP4-V2): FP8 layers are enumerated in the
+      per-layer ``quantized_layers`` map (loaded via `QuarkW8A8Fp8`), not in
+      the excludes, so the excludes are genuinely bf16 -> None.
+    """
+    if config.get("quant_method") != "fp8":
+        return None
+    # Fp8Config.from_config reads quant_method/activation_scheme/
+    # weight_block_size/packed_modules_mapping straight off the checkpoint's
+    # quantization_config dict, which is exactly what `config` carries here.
+    return Fp8Config.from_config(config)

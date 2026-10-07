@@ -1330,3 +1330,33 @@ def update_sliding_window_buffer_cuda_graph(
             )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _mla_decode_kv_splits_cap(
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
+) -> int:
+    if sm_count <= 0:
+        return base_max_kv_splits
+    sm_cap = next_power_of_2(sm_count)
+    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap))
+
+
+def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+    if not is_gfx95_supported() or topk != 1:
+        return False
+    if use_mla:
+        return is_kimi_k3(model_config.hf_config)
+    if is_dspark_draft(model_config.hf_config):
+        return use_verify_splitkv
+    return (
+        use_verify_splitkv
+        and is_qwen3_5(model_config.hf_config)
+        and model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        == 1
+    )

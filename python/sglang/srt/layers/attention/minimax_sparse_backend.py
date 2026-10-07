@@ -723,3 +723,70 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
             return self.dense.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _native_indexer_enabled() -> bool:
+    # Native AscendC packed indexer switch (default off).
+    return envs.SGLANG_MINIMAX_NPU_NATIVE_INDEXER.get()
+
+
+def _native_attn_enabled() -> bool:
+    # Native AscendC sparse MAIN-attention switch (default off).
+    return envs.SGLANG_MINIMAX_NPU_NATIVE_ATTN.get()
+
+
+def _kv_cache_to_bnsd(
+    k_cache: torch.Tensor, v_cache: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, int, int, int]:
+    """Reshape NHD slot-major KV caches to BNSD [pages, page_size, heads, dim].
+
+    Already-paged 4D inputs pass through unchanged.
+    """
+    if k_cache.dim() == 4:
+        num_pages, _, num_kv_heads, head_dim = k_cache.shape
+        return k_cache, v_cache, num_pages, num_kv_heads, head_dim
+    num_pages = k_cache.shape[0] // page_size
+    num_kv_heads = k_cache.shape[1]
+    head_dim = k_cache.shape[2]
+    return (
+        k_cache.view(num_pages, page_size, num_kv_heads, head_dim),
+        v_cache.view(num_pages, page_size, num_kv_heads, head_dim),
+        num_pages,
+        num_kv_heads,
+        head_dim,
+    )
+
+
+def _idx_cache_to_bnsd(
+    idx_k_cache: torch.Tensor,
+    idx_v_cache: Optional[torch.Tensor],
+    page_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
+    """Reshape NHD slot-major index caches to BNSD; already-paged 4D passes through."""
+    if idx_k_cache.dim() == 4:
+        return idx_k_cache, idx_v_cache, idx_k_cache.shape[2], idx_k_cache.shape[3]
+    num_pages = idx_k_cache.shape[0] // page_size
+    idx_kv_heads = idx_k_cache.shape[1]
+    idx_dim = idx_k_cache.shape[2]
+    idx_v_bnsd = (
+        None
+        if idx_v_cache is None
+        else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+    )
+    return (
+        idx_k_cache.view(num_pages, page_size, idx_kv_heads, idx_dim),
+        idx_v_bnsd,
+        idx_kv_heads,
+        idx_dim,
+    )
+
+
+def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
+    # Same convention as the KV pools: the fp8 tensor stores value/scale and
+    # the attention kernels multiply the logits back by the scale (None = unit).
+    if q_scale is not None:
+        q = q / q_scale
+    return q.to(torch.float8_e4m3fn)

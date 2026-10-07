@@ -2,6 +2,7 @@ import logging
 import re
 
 import torch
+from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
 
@@ -71,3 +72,57 @@ class PPMissingLayer(torch.nn.Identity):
         """
         input = args[0] if args else next(iter(kwargs.values()))
         return (input,) if self.return_tuple else input
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def copy_or_rebind_param(
+    module: torch.nn.Module, name: str, new_value: torch.Tensor
+) -> None:
+    """Keep parameter identities stable for CUDA graph reuse and hot reload."""
+    new_value = new_value.detach()
+    param = getattr(module, name, None)
+    if isinstance(param, Parameter):
+        if param.data.shape == new_value.shape and param.data.dtype == new_value.dtype:
+            param.data.copy_(new_value)
+        else:
+            param.data = new_value
+        param.requires_grad_(False)
+    else:
+        setattr(module, name, Parameter(new_value, requires_grad=False))
+
+
+def alias_or_bind_derived_param(
+    module: torch.nn.Module,
+    source_name: str,
+    derived_name: str,
+    derived_value: torch.Tensor,
+) -> None:
+    """Bind a post-processed (derived) tensor to a derived attribute name.
+
+    When `derived_value` is broadcastable to the source Parameter's shape (and
+    dtype matches), write it broadcast-filled into the source's storage in
+    place and register `derived_name` as an alias of the source Parameter. The
+    two attribute names then share one underlying buffer, so:
+      - apply() can read via `derived_name`
+      - update_weights_from_disk can keep refilling `source_name` (the loader
+        re-runs process_weights_after_loading which re-derives in place)
+      - peak GPU memory is the source size, not source + derived.
+
+    When the shapes are not broadcast-compatible, fall back to allocating a
+    separate Parameter under `derived_name` via copy_or_rebind_param.
+    """
+    derived_value = derived_value.detach()
+    source = getattr(module, source_name, None)
+    if isinstance(source, Parameter) and source.data.dtype == derived_value.dtype:
+        try:
+            broadcast = torch.broadcast_to(derived_value, source.data.shape)
+        except RuntimeError:
+            broadcast = None
+        if broadcast is not None:
+            source.data.copy_(broadcast)
+            source.requires_grad_(False)
+            setattr(module, derived_name, source)
+            return
+    copy_or_rebind_param(module, derived_name, derived_value)

@@ -45,3 +45,14 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
     def target_verify(self, *args, **kwargs):
         raise NotImplementedError("CuteDSLGDNKernel only supports decode")
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _is_blackwell() -> bool:
+    """True iff running on SM100+ (Blackwell) where the ported kernel is valid."""
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 10

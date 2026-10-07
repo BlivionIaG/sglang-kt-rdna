@@ -351,3 +351,50 @@ def msa_sparse_decode_main(
         kv_block_indexes=kv_block_indexes,
     )
     return o
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class MSAUnavailableError(RuntimeError):
+    """Raised when fmha_sm100 cannot serve the MiniMax MSA path."""
+
+
+def _check_msa_dtypes(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor):
+    # Uniform dtype required in BOTH modes: fmha_sm100 keys its kernel variant
+    # on q.dtype alone and casts the k/v pointers to the same element type, so
+    # a mismatched cache would be silently reinterpreted.
+    if q.dtype == torch.bfloat16:
+        assert k_cache.dtype == torch.bfloat16, (
+            f"MSA bf16 requires a bf16 K cache, got {k_cache.dtype}"
+        )
+    elif q.dtype == torch.float8_e4m3fn:
+        # e5m2 is rejected here too: fmha_sm100's variant lookup falls back to
+        # the e4m3 kernel for unknown dtype codes.
+        assert k_cache.dtype == torch.float8_e4m3fn, (
+            f"MSA fp8 requires an fp8_e4m3fn K cache, got {k_cache.dtype}"
+        )
+    else:
+        raise AssertionError(f"MSA supports bf16 or fp8_e4m3fn Q, got {q.dtype}")
+    assert v_cache.dtype == k_cache.dtype
+
+
+@functools.lru_cache(maxsize=1)
+def _load_fmha_sm100():
+    try:
+        from fmha_sm100 import fmha_sm100, fmha_sm100_plan
+    except Exception as err:
+        raise MSAUnavailableError(
+            "fmha_sm100 or fmha_sm100_plan is not importable"
+        ) from err
+    if not callable(fmha_sm100) or not callable(fmha_sm100_plan):
+        raise MSAUnavailableError("fmha_sm100 exports must be callable")
+    return fmha_sm100, fmha_sm100_plan
+
+
+def _run_fmha_sm100_plan(*args, **kwargs):
+    _, fmha_sm100_plan = _load_fmha_sm100()
+    try:
+        return fmha_sm100_plan(*args, **kwargs)
+    except (AttributeError, RuntimeError, TypeError) as err:
+        raise MSAUnavailableError("fmha_sm100_plan failed") from err

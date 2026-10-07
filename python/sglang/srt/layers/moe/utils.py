@@ -1057,3 +1057,101 @@ def is_deepep_class_backend() -> bool:
         or b.is_mori()
         or b.is_pplx()
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def is_shared_experts_fusion_disabled() -> bool:
+    """The ACTIVE shared-experts-fusion decision for the model being built.
+
+    Written (both ways) by each MoE model's gate before its layers construct;
+    falls back to the config intent when no gate has run (models without an
+    auto-disable gate read the intent directly off the bag instead).
+
+    Construction-time only: a forward reads what its build baked in
+    (``num_fused_shared_experts`` on the layer). During a draft's build this
+    flag holds the DRAFT's decision, so a forward-time read would race the
+    build window — refuse it loudly."""
+    from sglang.srt.model_executor.forward_context import has_forward_context
+
+    if has_forward_context():
+        raise AssertionError(
+            "is_shared_experts_fusion_disabled() called inside a forward: the "
+            "fusion decision is construction-time state (it can hold the draft's "
+            "value while a draft builds). Read the value your build baked in, "
+            "e.g. the layer's num_fused_shared_experts."
+        )
+    moe = get_flags().moe
+    if moe.disable_shared_experts_fusion is None:
+        return get_exec().moe.disable_shared_experts_fusion
+    return moe.disable_shared_experts_fusion
+
+
+@contextmanager
+def draft_model_build_scope():
+    """Brackets a draft model's CONSTRUCTION with the draft's construction-time
+    settings; every value below returns to the target's on exit, including on
+    error.
+
+    - Shared-experts fusion: the gates the draft runs also record their
+      decision on the speculative leaf; the target's ACTIVE
+      ``disable_shared_experts_fusion`` is restored.
+    - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
+      Boundaries built here keep the resolved value after exit.
+    - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
+      when set, else inherited. ``FusedMoE`` layers built here keep the
+      draft's MegaMoE MMA type after exit.
+
+    Deliberately does not touch ``runner_backend`` — swapping that is
+    ``speculative_moe_backend_context``'s job and has to bracket the draft's
+    whole lifecycle (build + capture + forward), which not every worker does.
+    """
+    moe = get_flags().moe
+    original_fusion = moe.disable_shared_experts_fusion
+    original_scope = moe.in_speculative_scope
+    try:
+        moe.in_speculative_scope = True
+        # Boundaries capture this resolved preference while the draft builds.
+        # Restoring it cannot change an already constructed target plan.
+        with (
+            get_exec().comm.override(
+                boundary_reduction=get_spec().speculative_boundary_reduction
+            ),
+            _draft_w4a4_mxfp4_megamoe_override(),
+        ):
+            yield
+    finally:
+        moe.in_speculative_scope = original_scope
+        moe.disable_shared_experts_fusion = original_fusion
+
+
+def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
+    # FusedMoE pins its MegaMoE MMA type at construction, so the draft's layers
+    # keep this value after the scope exits.
+    draft_w4a4 = get_spec().speculative_enable_w4a4_mxfp4_megamoe
+    if draft_w4a4 is None:
+        return nullcontext()
+    return get_exec().moe.override(enable_w4a4_mxfp4_megamoe=draft_w4a4)
+
+
+def is_flashinfer_cutedsl_v1_path() -> bool:
+    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
+    return (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        and get_moe_a2a_backend().is_deepep()
+    )
+
+
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)

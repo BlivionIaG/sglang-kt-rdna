@@ -15,6 +15,19 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import TCPStore
+from sglang.srt.runtime_context import get_resources
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+# torch renamed these collectives; bind whichever this build has.
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+    from torch.distributed import reduce_scatter_single as _reduce_scatter_single
+except ImportError:  # older torch builds only have the *_tensor names
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+    from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
+
+all_gather_single = _all_gather_single
+reduce_scatter_single = _reduce_scatter_single
 
 logger = logging.getLogger(__name__)
 
@@ -229,3 +242,34 @@ class StatelessProcessGroup:
             store=store,
             data_expiration_seconds=data_expiration_seconds,
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def set_global_tcp_store(store: TCPStore) -> None:
+    """Install the shared TCPStore created during distributed initialization;
+    the handle lives on ``ctx.resources``."""
+
+    get_resources().tcp_store = store
+    logger.info("Global TCPStore has been set")
+
+
+def get_global_tcp_store() -> Optional[TCPStore]:
+    """Get the existing global TCPStore.
+
+    This function provides access to the shared TCPStore instance that was
+    created during distributed initialization. All components (like NIXL buffers)
+    should use this same store for coordination.
+
+    Returns:
+        The global TCPStore instance, or None if not initialized yet.
+    """
+
+    store = get_resources().tcp_store
+    if store is None:
+        logger.warning(
+            "Global TCPStore not found. Make sure init_distributed_environment "
+            "was called with a tcp:// init method."
+        )
+    return store

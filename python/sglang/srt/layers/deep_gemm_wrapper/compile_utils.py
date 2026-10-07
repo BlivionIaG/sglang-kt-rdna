@@ -19,6 +19,10 @@ from sglang.srt.utils import ceil_div, get_available_gpu_memory
 import time
 from contextlib import contextmanager, nullcontext
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
+import fcntl
+import math
+from pathlib import Path
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
 
@@ -343,3 +347,167 @@ def deep_gemm_execution_hook(
     if m > 0:
         _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@contextmanager
+def _local_rank_compile_lock(
+    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
+):
+    """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
+
+    Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
+    the same order, so without a lock N local ranks nvcc-compile N identical
+    copies of every kernel. The lock holder compiles into the shared cache;
+    waiters then find the cubins already present and their pass over the M
+    list is execution warmup only.
+    """
+    lock_dir = Path(os.environ["DG_JIT_CACHE_DIR"]) / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{kernel_type.name}_n{n}_k{k}_g{num_groups}.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            self.a[:m],
+            self.b,
+            self.out[:m],
+            self.m_indices[:m],
+        )
+
+
+class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty(
+            (num_groups, max_m, k), device="cuda", dtype=torch.bfloat16
+        )
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            self.a,
+            self.b,
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+@contextmanager
+def _deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    if m > 0:
+        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    yield
+
+
+def pp_parallel_deep_gemm_warmup(runner) -> None:
+    """Run per-PP-rank dummy DECODE+EXTEND forwards so each rank's
+    DeepGEMM JIT compiles in parallel instead of serially via the warmup
+    /generate flowing through the pipeline. Opt-in via
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
+
+    Driven from BaseRunner.warmup(), which passes the runner; the dummy
+    forwards go through runner._dummy_run (the autotune/dummy-run machinery now
+    lives on BaseRunner). ModelRunner state is read via runner.model_runner.
+    """
+    model_runner = runner.model_runner
+    # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
+    # cover the brackets real /generate hits (smallest decode shape,
+    # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
+    # bs to the CP padding alignment (cp_size, or 2*cp_size for DSA
+    # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
+    # an unaligned bs makes DSA's padded num_splits longer than the q tokens
+    # and trips FlashMLA's "num_splits must have shape (b+1)" check.
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.utils.common import require_mlp_sync
+
+    n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+    block_m = 64
+    cp = max(get_cp_padding_align_size(), 1)
+
+    attn_tp_size = get_parallel().attn_tp_size
+    mlp_sync = require_mlp_sync()
+
+    def _align(bs: int) -> int:
+        # Align to lcm(cp, attn_tp_size) so the CP multiple isn't undone by a
+        # later attn_tp align (e.g. cp=2, attn_tp=3: 128 -> 128 -> 129).
+        align = cp
+        if mlp_sync and attn_tp_size > 1:
+            align = math.lcm(cp, attn_tp_size)
+        return ceil_align(bs, align)
+
+    batch_sizes = sorted(
+        {
+            _align(bs)
+            for bs in (
+                1,
+                2 * block_m,
+                max(n_sms // 8, 2) * block_m,
+                max(n_sms // 4, 4) * block_m,
+                n_sms * block_m,
+            )
+        }
+    )
+
+    # In PD, prefill-only nodes never decode (indexer would OOM at large
+    # bs) and decode-only nodes never extend.
+    disagg_mode = get_disagg().disaggregation_mode
+    run_decode = model_runner.is_generation and disagg_mode != "prefill"
+    run_extend = disagg_mode != "decode"
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup start "
+        "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
+        get_parallel().pp_rank,
+        get_parallel().tp_rank,
+        batch_sizes,
+        disagg_mode,
+    )
+
+    # One buffer set sized to the largest shape, reused across the sweep
+    # (the decode runner's max_bs is too small for n_sms*block_m).
+    dummy_buffers = runner._alloc_dummy_decode_buffers(max(batch_sizes))
+
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for bs in batch_sizes:
+            if run_decode:
+                runner._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.DECODE,
+                    buffers=dummy_buffers,
+                )
+            if run_extend:
+                runner._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.EXTEND,
+                    buffers=dummy_buffers,
+                )
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
+        time.perf_counter() - t0,
+        get_parallel().pp_rank,
+    )

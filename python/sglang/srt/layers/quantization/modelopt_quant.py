@@ -2641,3 +2641,89 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             return None
 
         return None
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _make_per_tensor_scale_parameter(
+    shape,
+    weight_loader,
+    *,
+    fill_value: Optional[float] = None,
+    needs_scalar_to_array: bool = False,
+) -> PerTensorScaleParameter:
+    data = (
+        torch.empty(shape, dtype=torch.float32)
+        if fill_value is None
+        else torch.full(shape, fill_value, dtype=torch.float32)
+    )
+    scale = PerTensorScaleParameter(data=data, weight_loader=weight_loader)
+    if needs_scalar_to_array:
+        set_weight_attrs(scale, {"needs_scalar_to_array": True})
+    return scale
+
+
+def _use_nvfp4_dispatch() -> bool:
+    if not get_moe_a2a_backend().is_flashinfer():
+        return MOE_NVFP4_DISPATCH
+    return get_flashinfer_a2a_dispatch_type() == FlashinferA2ADispatchType.NVFP4
+
+
+class HybridFp8NvFp4Config(Fp8Config):
+    """FP8 (linear/attention/MTP MoE) + NVFP4 (FusedMoE) hybrid quantization.
+
+    For checkpoints like nvidia/DeepSeek-V4-Pro-NVFP4 where
+    config.json:quantization_config declares quant_method=fp8 and
+    moe_quant_algo=NVFP4. FusedMoE layers route through
+    ModelOptNvFp4FusedMoEMethod; linear / attention layers
+    delegate to the inherited Fp8Config dispatch.
+    """
+
+    def __init__(self, fp8_config: Fp8Config, nvfp4_config: ModelOptFp4Config):
+        # Inherit all of fp8_config's state without re-running its
+        # validation / logging (already happened at fp8_config build time).
+        self.__dict__.update(fp8_config.__dict__)
+        self.nvfp4_config = nvfp4_config
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            if not self.nvfp4_config.is_layer_excluded(prefix):
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            # Fall back to MXFP4 for MTP MoE layers
+            if self.is_fp4_experts:
+                from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+                from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                    Mxfp4FlashinferTrtllmMoEMethod,
+                )
+
+                return Mxfp4FlashinferTrtllmMoEMethod(Fp8MoEMethod(self), prefix=prefix)
+        return super().get_quant_method(layer, prefix)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+
+
+def deinterleave_w13(weight: torch.Tensor, *, up_first: bool = False) -> torch.Tensor:
+    """De-interleave a checkpoint ``[g0,u0,g1,u1,...]`` fused gate/up tensor.
+
+    Default returns the block layout ``[gate...; up...]`` (gate half first), which
+    the CUTLASS NVFP4 prep expects. With ``up_first=True`` it returns
+    ``[up...; gate...]``, the layout the FlashInfer TRT-LLM FP4 prep + kernel
+    expect (the kernel applies the up/gate GEMM1 scales to the first/second halves
+    on that assumption). Operates on the row dim (-2), so it covers both the packed
+    weight and its block scale.
+    """
+    assert weight.shape[-2] % 2 == 0
+    grouped = weight.reshape(
+        *weight.shape[:-2], weight.shape[-2] // 2, 2, weight.shape[-1]
+    )
+    if up_first:
+        # Flip each [gate, up] pair to [up, gate] before the block transpose.
+        grouped = grouped.flip(-2)
+    return grouped.transpose(-3, -2).reshape_as(weight).contiguous()

@@ -512,3 +512,15 @@ def dispatch_custom_allreduce():
             return CustomAllreduce
 
     return CustomAllreduce
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _use_amd_deterministic_impl() -> bool:
+    if not _is_hip:  # CUDA is always deterministic
+        return False
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        return envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()

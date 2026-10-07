@@ -24,6 +24,9 @@ from sglang.srt.utils.common import rank0_log
 from typing import Optional, Tuple, Union
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+import msgspec
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -381,3 +384,177 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         return core_attn_out
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class GDNMISMetadata(msgspec.Struct, frozen=True):
+    query_token_indices: torch.Tensor
+    query_cu_seqlens: torch.Tensor
+    query_seq_lens_cpu: list[int]
+    query_request_indices: torch.Tensor
+    item_token_indices: torch.Tensor
+    item_cu_seqlens: torch.Tensor
+    item_seq_lens_cpu: list[int]
+    item_request_indices: torch.Tensor
+
+
+def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
+    """Build compact query/item segments from request-local MIS delimiters."""
+    if not forward_batch.is_prefill_only:
+        raise ValueError("GDN MIS is only supported for prefill-only requests")
+
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if isinstance(prefix_lens, torch.Tensor):
+        prefix_lens = prefix_lens.tolist()
+    if any(int(prefix_len) != 0 for prefix_len in prefix_lens):
+        raise ValueError("GDN MIS does not support cached prefixes")
+
+    seq_lens = forward_batch.extend_seq_lens_cpu
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    seq_lens = [int(seq_len) for seq_len in seq_lens]
+    delimiter_indices = forward_batch.multi_item_delimiter_indices
+    if delimiter_indices is None or len(delimiter_indices) != len(seq_lens):
+        raise ValueError("GDN MIS requires delimiter indices for every request")
+    if sum(seq_lens) > forward_batch.input_ids.numel():
+        raise ValueError("GDN MIS sequence lengths exceed the input tokens")
+
+    query_token_indices: list[int] = []
+    query_seq_lens_cpu: list[int] = []
+    query_request_indices: list[int] = []
+    item_token_indices: list[int] = []
+    item_seq_lens_cpu: list[int] = []
+    item_request_indices: list[int] = []
+
+    request_start = 0
+    for request_idx, (seq_len, request_delimiters) in enumerate(
+        zip(seq_lens, delimiter_indices)
+    ):
+        delimiters = [int(index) for index in request_delimiters.tolist()]
+        if len(delimiters) < 2:
+            raise ValueError("GDN MIS requires at least two delimiters per request")
+        if any(
+            current >= following
+            for current, following in zip(delimiters, delimiters[1:])
+        ):
+            raise ValueError("GDN MIS delimiter indices must be strictly increasing")
+        if delimiters[0] < 0 or delimiters[-1] >= seq_len:
+            raise ValueError("GDN MIS delimiter index is outside the request")
+        if delimiters[-1] != seq_len - 1:
+            raise ValueError("GDN MIS final delimiter must be the last request token")
+
+        query_len = delimiters[0]
+        if query_len > 0:
+            query_token_indices.extend(range(request_start, request_start + query_len))
+            query_seq_lens_cpu.append(query_len)
+            query_request_indices.append(request_idx)
+
+        branch_ends = delimiters[1:] + [seq_len]
+        for branch_start, branch_end in zip(delimiters, branch_ends):
+            branch_len = branch_end - branch_start
+            item_token_indices.extend(
+                range(request_start + branch_start, request_start + branch_end)
+            )
+            item_seq_lens_cpu.append(branch_len)
+            item_request_indices.append(request_idx)
+
+        request_start += seq_len
+
+    device = forward_batch.input_ids.device
+
+    def _indices(values: list[int], dtype: torch.dtype) -> torch.Tensor:
+        return torch.tensor(values, dtype=dtype, device=device)
+
+    def _cu_seqlens(lengths: list[int]) -> torch.Tensor:
+        result = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+        if lengths:
+            result[1:] = torch.tensor(lengths, dtype=torch.int32, device=device).cumsum(
+                dim=0
+            )
+        return result
+
+    return GDNMISMetadata(
+        query_token_indices=_indices(query_token_indices, torch.int64),
+        query_cu_seqlens=_cu_seqlens(query_seq_lens_cpu),
+        query_seq_lens_cpu=query_seq_lens_cpu,
+        query_request_indices=_indices(query_request_indices, torch.int64),
+        item_token_indices=_indices(item_token_indices, torch.int64),
+        item_cu_seqlens=_cu_seqlens(item_seq_lens_cpu),
+        item_seq_lens_cpu=item_seq_lens_cpu,
+        item_request_indices=_indices(item_request_indices, torch.int64),
+    )
+
+
+def validate_gdn_mis_backend(prefill_backend: LinearAttnKernelBackend) -> None:
+    if not get_exec().features.enable_mis:
+        return
+    if not prefill_backend.is_triton():
+        raise ValueError(
+            "GDN multi-item scoring requires the Triton linear-attention prefill "
+            "backend. Set --linear-attn-prefill-backend triton."
+        )
+    if get_memory().enable_page_major_kv_layout:
+        raise ValueError("GDN multi-item scoring does not support page-major layout")
+
+
+def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
+    """FlashInfer for the narrow SM90/SM100 GDN prefill domains we validated, else None."""
+    sm_major = torch.cuda.get_device_capability()[0] if is_cuda() else 0
+    if (
+        get_exec().mamba.linear_attn_prefill_backend is not None
+        or get_exec().mamba.linear_attn_backend != "triton"
+        or get_exec().deterministic.enable_deterministic_inference
+        or get_memory().enable_page_major_kv_layout
+        or sm_major not in (9, 10)
+    ):
+        return None
+
+    # SM100 runs the CUDA>=13 CuTe-DSL chunk kernel on a bf16 state pool;
+    # SM90 runs the fused Hopper kernel on an fp32 state pool and tolerates
+    # larger chunks. Everything outside these validated domains keeps Triton.
+    cuda_version = torch.version.cuda
+    if sm_major == 10:
+        if cuda_version is None or int(cuda_version.split(".", 1)[0]) < 13:
+            return None
+        max_chunk = 8192
+        expected_state_dtype = torch.bfloat16
+    else:
+        max_chunk = 32768
+        expected_state_dtype = torch.float32
+
+    chunk_size = get_schedule().chunked_prefill_size
+    config = hybrid_gdn_config(model_runner.model_config)
+    if (
+        get_schedule().enable_dynamic_chunking
+        or chunk_size is None
+        or not 1 <= chunk_size <= max_chunk
+        or getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
+        or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+        != expected_state_dtype
+    ):
+        return None
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+        is_flashinfer_gdn_prefill_available,
+    )
+
+    if not is_flashinfer_gdn_prefill_available():
+        return None
+
+    rank0_log(f"Defaulting SM{sm_major}0 GDN prefill backend to FlashInfer.")
+    return "flashinfer"
+
+
+def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
+    if (
+        get_exec().deterministic.enable_deterministic_inference
+        and backends.prefill.is_flashinfer()
+    ):
+        raise ValueError(
+            "FlashInfer GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )

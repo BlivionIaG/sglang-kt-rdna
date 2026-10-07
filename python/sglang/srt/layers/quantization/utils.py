@@ -739,3 +739,20 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         gemm2_weights_fp4_shuffled,
         gemm2_scales_fp4_shuffled,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _module_path_match(ignored: str, prefix: str) -> bool:
+    # Match on dotted module-path boundaries so that `mlp.gate` does NOT
+    # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
+    # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
+    # that collide with fused dense MLP names by plain substring.
+    ignored = ignored.rstrip(".")
+    prefix = prefix.rstrip(".")
+    if ignored == prefix:
+        return True
+    if prefix.startswith(ignored + "."):
+        return True
+    return ("." + ignored + ".") in ("." + prefix + ".")

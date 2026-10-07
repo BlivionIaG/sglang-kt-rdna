@@ -370,3 +370,32 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class RoutewiseLayout(Enum):
+    """Layout of unweighted routes awaiting model finalization; H is hidden size.
+
+    TOKEN_TOPK: outputs [T, K, H], router weights [T, K]. T counts received
+    token rows on this EP rank; K is router top-k. Model finalization reduces
+    K to produce [T, H] before dispatcher combine.
+
+    EXPANDED: outputs [R, H], router weights [R]. Each valid row is one
+    token-expert route; R includes alignment padding and unused capacity.
+    Model finalization preserves row positions; dispatcher combine maps and
+    sums valid routes back to the original sender's tokens.
+    """
+
+    TOKEN_TOPK = "token_topk"
+    EXPANDED = "expanded"
+
+
+@runtime_checkable
+class RoutewiseCombineInput(CombineInput, Protocol):
+    """Combine input whose router weighting is deferred to the model layer."""
+
+    hidden_states: torch.Tensor
+    topk_weights: torch.Tensor
+    routewise_layout: RoutewiseLayout

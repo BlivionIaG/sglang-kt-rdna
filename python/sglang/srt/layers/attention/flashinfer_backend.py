@@ -1661,3 +1661,120 @@ def should_use_tensor_core(
         return gqa_group_size >= 4
     else:
         return False
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def fast_prefill_plan(
+    self,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    page_size: int,
+    head_dim_vo: Optional[int] = None,
+    custom_mask: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    window_left: int = -1,
+    q_data_type: Union[str, torch.dtype] = "float16",
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    o_data_type: Optional[Union[str, torch.dtype]] = None,
+    non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    prefix_len_ptr: Optional[torch.Tensor] = None,
+    token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+    token_pos_in_items_len: int = 0,
+    max_item_len_ptr: Optional[torch.Tensor] = None,
+    # Required host-known metadata: lets us skip the per-replay device-to-host
+    # copies upstream plan() always issues. Keyword-only with no default so a
+    # caller that forgets them fails at the call boundary, not with a cryptic
+    # None crash deeper in.
+    *,
+    qo_indptr_host: torch.Tensor,
+    kv_indptr_host: torch.Tensor,
+    kv_lens_host: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+) -> None:
+    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
+    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+
+    Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
+    its host scheduling metadata, a blocking D2H that drains the GPU queue every
+    replay. The caller passes host-known qo/kv layout in, so we call the underlying
+    ``_cached_module.plan`` directly with no readback; the ``_plan_info`` produced
+    is identical to plan()'s.
+    """
+    assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
+    assert getattr(self, "_backend", None) == "fa2", (
+        "fast_prefill_plan supports the fa2 backend only"
+    )
+    assert getattr(self, "_cached_module", None) is not None, (
+        "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    )
+
+    if head_dim_vo is None:
+        head_dim_vo = head_dim_qk
+    batch_size = len(paged_kv_last_page_len)
+
+    total_num_rows = int(qo_indptr_host[-1])
+    self._qo_indptr_last = total_num_rows
+    self._max_q_len = max_q_len
+    self._max_kv_len = max_kv_len
+
+    if self._max_total_num_rows is None:
+        self._max_total_num_rows = total_num_rows
+
+    self._batch_size = batch_size
+    self._num_qo_heads = num_qo_heads
+    self._num_kv_heads = num_kv_heads
+    self._prefix_len_ptr = prefix_len_ptr
+    self._token_pos_in_items_ptr = token_pos_in_items_ptr
+    self._token_pos_in_items_len = token_pos_in_items_len
+    self._max_item_len_ptr = max_item_len_ptr
+
+    # Refresh the cuda-graph input buffers (device-to-device, non-blocking).
+    self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
+    self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
+    self._paged_kv_last_page_len_buf.copy_(
+        paged_kv_last_page_len, non_blocking=non_blocking
+    )
+    self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+        paged_kv_indices,
+        non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
+    )
+
+    self._cached_q_data_type = q_data_type
+    self._cached_kv_data_type = (
+        kv_data_type if kv_data_type is not None else q_data_type
+    )
+    self._cached_o_data_type = o_data_type
+    self._block_tables = None
+
+    args = [
+        self._float_workspace_buffer,
+        self._int_workspace_buffer,
+        self._pin_memory_int_workspace_buffer,
+        qo_indptr_host,
+        kv_indptr_host,
+        kv_lens_host,
+        self._max_total_num_rows or total_num_rows,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        self.is_cuda_graph_enabled,
+        head_dim_qk,
+        head_dim_vo,
+        causal,
+        window_left,
+        fixed_split_size if fixed_split_size is not None else -1,
+        False,  # disable_split_kv
+        0,  # num_colocated_ctas
+        0,  # uniform_q_len
+    ]
+    self._plan_info = self._cached_module.plan(*args)

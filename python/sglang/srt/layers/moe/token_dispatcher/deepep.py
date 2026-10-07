@@ -54,6 +54,8 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
+import os
+from sglang.srt.runtime_context import get_parallel
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -869,3 +871,34 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
+    min_qp_depth = 2 * (num_max_dispatch_tokens_per_rank + 1)
+    current_qp_depth = int(
+        os.environ.get("NVSHMEM_QP_DEPTH", _NVSHMEM_QP_DEPTH_DEFAULT)
+    )
+    os.environ["NVSHMEM_QP_DEPTH"] = str(
+        max(current_qp_depth, _NVSHMEM_QP_DEPTH_DEFAULT, min_qp_depth)
+    )
+
+
+def _is_mnnvl_fabric_supported() -> bool:
+    if not is_flashinfer_available():
+        return False
+
+    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+    return is_mnnvl_fabric_supported(torch.cuda.current_device())
+
+
+def _deepep_precompile_tp_barrier() -> None:
+    # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
+    # so if different ranks compile at different speeds, it may quickly trigger a timeout.
+    # To avoid this, we use torch.distributed's barrier during the compile stage.
+    # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
+    if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+        get_parallel().tp_group.barrier()

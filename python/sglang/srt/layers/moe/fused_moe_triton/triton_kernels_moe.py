@@ -312,3 +312,26 @@ def triton_kernel_fused_experts_with_bias(
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _assert_unsupported_quant_args(
+    use_fp8_w8a8: bool,
+    per_channel_quant: bool,
+    expert_map: Optional[torch.Tensor],
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    a2_scale: Optional[torch.Tensor],
+    block_shape: Optional[list[int]],
+) -> None:
+    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant is False, "per_channel_quant is not supported"
+    assert expert_map is None, "expert_map is not supported"
+    assert w1_scale is None, "w1_scale is not supported"
+    assert w2_scale is None, "w2_scale is not supported"
+    assert a1_scale is None, "a1_scale is not supported"
+    assert a2_scale is None, "a2_scale is not supported"
+    assert block_shape is None, "block_shape is not supported"

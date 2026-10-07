@@ -67,6 +67,8 @@ import struct
 import re
 from pathlib import Path
 from sglang.srt.runtime_context import get_parallel
+CAPTURE_SAFE_WEIGHT_SENTINEL = 1e-3
+_PREFETCH_STOP_TIMEOUT_SECONDS = 60.0
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup

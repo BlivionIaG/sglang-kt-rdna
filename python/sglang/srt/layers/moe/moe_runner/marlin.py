@@ -13,6 +13,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
@@ -130,3 +132,40 @@ def fused_experts_none_to_marlin(
     return StandardCombineInput(
         hidden_states=output,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@triton.jit
+def _unpack_packed_topk_kernel(packed_ptr, ids_ptr, w_ptr, numel, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    packed = tl.load(
+        packed_ptr + offs, mask=mask
+    )  # int32 (id << 16) | bf16-weight-bits
+    tl.store(ids_ptr + offs, packed >> 16, mask=mask)  # expert id (high 16 bits)
+    wbits = (packed & 0xFFFF).to(tl.int16)  # bf16 weight bits (low 16 bits)
+    tl.store(
+        w_ptr + offs, wbits.to(tl.bfloat16, bitcast=True).to(tl.float32), mask=mask
+    )
+
+
+def _fused_unpack_packed_topk(packed: torch.Tensor):
+    """Single-launch inverse of the fused topk pack ((id << 16) | bf16-weight-bits).
+
+    Returns (topk_ids int32, topk_weights float32). Collapses the ~5 elementwise
+    ops (shift / mask / int16 / bitcast / cast) the torch reference emits per call
+    into one Triton launch. Mirrors _pack_topk_kernel (ops/lora/moe/trtllm_lora_temp/topk_pack).
+    """
+    packed = packed.contiguous()
+    ids = torch.empty_like(packed, dtype=torch.int32)
+    w = torch.empty(packed.shape, dtype=torch.float32, device=packed.device)
+    numel = packed.numel()
+    if numel:
+        BLOCK = 1024
+        _unpack_packed_topk_kernel[(triton.cdiv(numel, BLOCK),)](
+            packed, ids, w, numel, BLOCK=BLOCK
+        )
+    return ids, w

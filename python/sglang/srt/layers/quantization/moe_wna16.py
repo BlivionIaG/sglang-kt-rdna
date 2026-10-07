@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -504,3 +505,23 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 
         return moe_wna16_weight_loader
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _local_expert_ids(layer, expert_id: int) -> List[int]:
+    """This rank's slots for checkpoint expert ``expert_id``, as the layer maps it.
+
+    The qzeros are written here rather than through the layer's weight loader,
+    so they need the same expert placement: EPLB's physical replicas, then the
+    expert-parallel slice this rank stores.
+    """
+    metadata = get_global_expert_location_metadata()
+    physical = (
+        [expert_id]
+        if metadata is None
+        else metadata.logical_to_all_physical(layer.layer_id, expert_id)
+    )
+    local = (layer._map_global_expert_id_to_local_expert_id(p) for p in physical)
+    return [i for i in local if 0 <= i < layer.num_local_experts]

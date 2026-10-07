@@ -19,6 +19,7 @@ from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
 logger = logging.getLogger(__name__)
 import os
+import torch
 
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 
@@ -182,3 +183,31 @@ def decode_attention_fwd(
         sm_scale,
         logit_cap,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@functools.lru_cache(maxsize=None)
+def _is_rocm10_or_newer() -> bool:
+    """Return whether the runtime needs the ROCm 10 Wave decode workaround."""
+    hip_version = torch.version.hip
+    if hip_version is None:
+        return False
+
+    try:
+        hip_major_minor = tuple(int(part) for part in hip_version.split(".")[:2])
+    except ValueError:
+        return False
+
+    # torch 2.11's ROCm 10 build reports HIP 7.15.
+    return hip_major_minor >= (7, 15)
+
+
+def _needs_triton_fallback(q, k_buffer, v_buffer) -> bool:
+    # Wave's paged decode kernel returns NaNs for this shape with ROCm 10 on
+    # gfx942. Keep Wave enabled for every other shape and older ROCm versions.
+    shape = (q.shape[1], k_buffer.shape[1], q.shape[2], v_buffer.shape[2])
+    if shape != (128, 1, 576, 512):
+        return False
+    return _is_rocm10_or_newer()

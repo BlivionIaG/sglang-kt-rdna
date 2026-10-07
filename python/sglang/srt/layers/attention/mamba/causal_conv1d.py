@@ -128,3 +128,12 @@ def causal_conv1d_update(
     if unsqueeze:
         x = x.squeeze(-1)
     return x
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _get_seq_lens_cpu(query_start_loc, x):
+    if query_start_loc is not None:
+        return (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
+    return [x.shape[-1]]

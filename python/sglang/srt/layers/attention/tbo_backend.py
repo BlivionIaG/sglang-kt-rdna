@@ -6,6 +6,7 @@ import torch
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.spec_info import SpecInput
+from types import SimpleNamespace
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -262,3 +263,65 @@ def _init_forward_metadata_cuda_graph_split(
         raise NotImplementedError
 
     return ans
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _build_tbo_child_replay_fb_view(
+    fb_view,
+    *,
+    child_bs: int,
+    seq_slice: slice,
+    tok_slice: slice,
+    token_num_per_seq: int,
+) -> SimpleNamespace:
+    """Slice a parent replay fb_view into a per-child view.
+
+    Mirrors the legacy ``_init_forward_metadata_cuda_graph_split`` (deleted
+    along with the cuda_graph variants) for the new
+    ``init_forward_metadata_out_graph(fb_view)`` contract: padded
+    capture-time buffers are sliced per child, spec_info is split, and
+    seq_lens_sum is recomputed from the sliced ``seq_lens_cpu``.
+    """
+    assert getattr(fb_view, "encoder_lens", None) is None, (
+        "TBO replay split does not support encoder_lens yet"
+    )
+    spec_info = getattr(fb_view, "spec_info", None)
+    if spec_info is not None:
+        start_seq = seq_slice.start or 0
+        end_seq = seq_slice.stop if seq_slice.stop is not None else start_seq + child_bs
+        child_spec_info = two_batch_overlap.split_spec_info(
+            spec_info=spec_info,
+            start_seq_index=start_seq,
+            end_seq_index=end_seq,
+            start_token_index=start_seq * token_num_per_seq,
+            end_token_index=end_seq * token_num_per_seq,
+        )
+    else:
+        child_spec_info = None
+    child_seq_lens_cpu = fb_view.seq_lens_cpu[seq_slice]
+    parent_input_ids = getattr(fb_view, "input_ids", None)
+    parent_out_cache_loc = getattr(fb_view, "out_cache_loc", None)
+    return SimpleNamespace(
+        batch_size=child_bs,
+        forward_mode=fb_view.forward_mode,
+        actual_forward_mode=getattr(
+            fb_view, "actual_forward_mode", fb_view.forward_mode
+        ),
+        input_ids=(
+            parent_input_ids[tok_slice] if parent_input_ids is not None else None
+        ),
+        req_pool_indices=fb_view.req_pool_indices[seq_slice],
+        seq_lens=fb_view.seq_lens[seq_slice],
+        seq_lens_sum=int(child_seq_lens_cpu.sum()),
+        seq_lens_cpu=child_seq_lens_cpu,
+        encoder_lens=None,
+        out_cache_loc=(
+            parent_out_cache_loc[tok_slice]
+            if parent_out_cache_loc is not None
+            else None
+        ),
+        spec_info=child_spec_info,
+        max_seq_len_override=fb_view.max_seq_len_override,
+    )

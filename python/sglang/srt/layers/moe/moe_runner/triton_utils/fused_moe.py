@@ -1037,3 +1037,37 @@ def fused_moe(
         a2_scale=a2_scale,
         block_shape=block_shape,
     )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _validate_fused_swiglu_interleaved(
+    *,
+    activation: str,
+    is_gated: bool,
+    has_gemm1_modifiers: bool,
+    has_bias: bool,
+    is_quantized: bool,
+    apply_router_weight_on_input: bool,
+    has_hooks: bool,
+    dtype: torch.dtype,
+) -> None:
+    if not (
+        activation == "silu"
+        and is_gated
+        and not has_gemm1_modifiers
+        and not has_bias
+        and not is_quantized
+        and not apply_router_weight_on_input
+        and not has_hooks
+        and dtype == torch.bfloat16
+    ):
+        raise ValueError(
+            "fuse_swiglu_interleaved set on an incompatible fused_moe call"
+        )
+
+
+@functools.lru_cache()
+def _moe_support_tma():
+    return support_tensor_descriptor()

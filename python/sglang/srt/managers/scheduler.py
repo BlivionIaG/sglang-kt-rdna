@@ -218,6 +218,13 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from sglang.srt.disaggregation import role_switch
+from sglang.srt.distributed import bootstrap
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 
 logger = logging.getLogger(__name__)
 

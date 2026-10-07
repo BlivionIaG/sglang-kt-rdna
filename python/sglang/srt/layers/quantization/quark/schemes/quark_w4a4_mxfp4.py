@@ -135,3 +135,28 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return y.view(*output_shape)
 
         return y
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _dequant_mxfp4_to_bf16(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize a packed MXFP4 weight ``(N, K//2)`` uint8 + e8m0 group scale
+    ``(N, K//32)`` uint8 into a dense bf16 weight ``(N, K)``."""
+    N, k_packed = weight.shape
+    K = k_packed * 2
+    lut = torch.tensor(_MXFP4_VALUES, device=weight.device, dtype=torch.float32)
+    lo = (weight & 0xF).long()
+    hi = (weight >> 4).long()
+    vals = torch.empty(N, K, device=weight.device, dtype=torch.float32)
+    vals[:, 0::2] = lut[lo]
+    vals[:, 1::2] = lut[hi]
+    # e8m0 byte b decodes to 2^(b-127); 255 is the NaN/Inf sentinel (unused by
+    # real weights) -> map to 0 so it can't poison the matmul.
+    scale = torch.exp2(weight_scale.to(torch.float32) - 127.0)
+    scale = torch.where(weight_scale == 255, torch.zeros_like(scale), scale)
+    scale = scale.view(N, K // 32, 1)
+    w = (vals.view(N, K // 32, 32) * scale).view(N, K)
+    return w.to(torch.bfloat16)

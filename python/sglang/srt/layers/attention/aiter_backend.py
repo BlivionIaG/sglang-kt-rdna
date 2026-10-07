@@ -2238,3 +2238,122 @@ class AiterMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@dataclass
+class MlaPrefillPsMetadata:
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    work_metadata: torch.Tensor
+    work_indptr: torch.Tensor
+    work_info_set: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
+    max_q_len: int
+    is_causal: bool
+    need_lse: bool
+    num_partial_tiles: int
+
+
+def _build_paged_kv_view(
+    kv_indices: torch.Tensor, seq_lens_cpu: torch.Tensor, page_size: int
+):
+    """Token-level flashinfer KV table -> the page-level view aiter's asm
+    paged-varlen prefill expects.
+
+    The paged allocator packs each page contiguously, so a token slot's page id
+    is slot // page_size. The arithmetic runs on seq_lens_cpu so it costs no
+    device sync; only the gather touches the GPU.
+    """
+    device = kv_indices.device
+    seq_lens = seq_lens_cpu.to(torch.int64)
+    pages = (seq_lens + page_size - 1) // page_size
+
+    page_indptr = torch.zeros(pages.numel() + 1, dtype=torch.int32)
+    page_indptr[1:] = torch.cumsum(pages, dim=0)
+    tok_base = torch.zeros(pages.numel() + 1, dtype=torch.int64)
+    tok_base[1:] = torch.cumsum(seq_lens, dim=0)
+
+    within = torch.arange(
+        int(page_indptr[-1]), dtype=torch.int64
+    ) - torch.repeat_interleave(page_indptr[:-1].to(torch.int64), pages)
+    gather = torch.repeat_interleave(tok_base[:-1], pages) + within * page_size
+    page_ids = (kv_indices[gather.to(device)] // page_size).to(torch.int32)
+    last_page_len = ((seq_lens - 1) % page_size + 1).to(torch.int32)
+    return page_indptr.to(device), page_ids, last_page_len.to(device)
+
+
+def _paged_prefill_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
+    """aiter's asm paged-varlen guard takes only a power-of-two GQA ratio."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return False
+    gqa = num_q_heads // num_kv_heads
+    return gqa & (gqa - 1) == 0
+
+
+def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
+    """Whether AITER's FP8 FMHA ASM kernel supports this GQA ratio."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return False
+    return (num_q_heads // num_kv_heads) in _AITER_FP8_ASM_GQA_RATIOS
+
+
+def _asm_context_prefill_gather_indices(
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_slots: int,
+    forward_mode=None,
+):
+    """KV-pool slots to gather for the ASM context-chunk prefill.
+
+    kv_indptr/kv_indices are token-level for every page_size:
+    AiterIndicesUpdaterPrefill sets kv_indptr = cumsum(seq_lens) and writes one
+    kv_indices entry per token, so token t of sequence i lives in pool slot
+    kv_indices[kv_indptr[i] + t]. There is no page arithmetic to apply here.
+
+    Returns (tok_idx, cu_seqlens_k), or None if the metadata disagrees with
+    seq_lens (mixed/spec batches) and the caller must use the paged kernel.
+    """
+    bs = kv_indptr.numel() - 1
+    device = kv_indices.device
+    kv_indptr = kv_indptr.to(torch.long)
+    seq_lens = seq_lens.to(device=device, dtype=torch.long)
+    # kvlen must not exceed the tokens this batch actually has in kv_indices,
+    # otherwise the gather runs off the end of the table.
+    seq_lens = torch.minimum(seq_lens, kv_indptr[1:] - kv_indptr[:bs])
+    total_k = int(seq_lens.sum().item())
+    cu_k = torch.zeros(bs + 1, dtype=torch.long, device=device)
+    torch.cumsum(seq_lens, 0, out=cu_k[1:])
+    seq_ids = torch.repeat_interleave(torch.arange(bs, device=device), seq_lens)
+    pos_in_seq = torch.arange(total_k, device=device) - cu_k[seq_ids]
+    kv_slot = kv_indptr[seq_ids] + pos_in_seq
+    if total_k and int(kv_slot.max().item()) >= kv_indices.numel():
+        logger.warning(
+            "[asm-context-prefill] metadata mismatch, falling back:"
+            " mode=%s bs=%s kv_slot_max=%s kv_indices=%s seq_lens=%s kv_indptr=%s",
+            forward_mode,
+            bs,
+            int(kv_slot.max().item()),
+            kv_indices.numel(),
+            seq_lens.tolist(),
+            kv_indptr.tolist(),
+        )
+        return None
+    tok_idx = kv_indices[kv_slot].to(torch.long)
+    if total_k and int(tok_idx.max().item()) >= num_kv_slots:
+        logger.warning(
+            "[asm-context-prefill] gather index out of pool, falling back:"
+            " mode=%s bs=%s tok_idx_max=%s num_kv_slots=%s",
+            forward_mode,
+            bs,
+            int(tok_idx.max().item()),
+            num_kv_slots,
+        )
+        return None
+    return tok_idx, cu_k
