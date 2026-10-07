@@ -4381,3 +4381,21 @@ def is_building_neighbour_layer() -> bool:
 
 def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
     return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+def log_debug_on_rank0(logger, msg):
+    """
+    Log a debug message only on tensor model parallel rank 0.
+    Falls back to logging if distributed is not initialized or error occurs.
+    """
+
+    try:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
+            logger.debug(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.debug(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.debug(f"{msg} (rank-check failed: {e})")
