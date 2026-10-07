@@ -125,3 +125,59 @@ Measured while loading: **RAM used 6 GB of 92** (against 70+ for the pinned plac
 47.7 GiB table on disk and its resident set bounded at 8 GiB. That is the whole point of the
 placement, confirmed by observation rather than arithmetic: the memory the pinned backend would
 have held is now on the filesystem.
+
+## MEASURED IN-KERNEL COST (supersedes the disk-based estimate above)
+
+The first placement-B run went further than any previous attempt -- **40 of 48 MoE layers** --
+and died to the cgroup cap, not to the machine. That gave the first real measurement of what
+the KT offload path costs in RAM:
+
+    systemd: run-p4724.scope: Failed with result 'oom-kill'
+             Consumed 11min 34s CPU time, 70G memory peak, 8G memory swap peak
+    kernel : Memory cgroup out of memory: Killed process 4808 (sglang::schedul)
+             anon-rss:72665692kB            <- 69.30 GiB at 40 of 48 layers
+    constraint=CONSTRAINT_MEMCG             <- cgroup-local, so the HOST SURVIVED
+
+**ISOLATE=1 did its job**: the OOM was confined to the scope, `uptime` kept climbing and there
+was no wedge -- the first failure in this whole effort that did not take the box down.
+
+### The number that matters
+
+    measured            69.30 GiB at 40/48 layers
+    per MoE layer       1774 MiB
+    extrapolated to 48  83.16 GiB
+
+    on-disk per layer   1350 MiB   (weight 1200 + weight_scale 150, summed from the index)
+    on-disk x48         63.28 GiB
+
+    IN-KERNEL OVERHEAD FACTOR: 1.314x
+
+So the KT loader does not hold the checkpoint's packed bytes; it materialises per-expert host
+buffers in an AMX-workable layout that costs ~31% more. That is a property of the offload path,
+and it is the number that decides placement -- the earlier budget used the on-disk 63.28 GiB and
+therefore UNDERESTIMATED the requirement by ~20 GiB.
+
+### WHERE THAT LEAVES THE PLACEMENT
+
+    RAM available                90.06 GiB
+    experts, all 48 layers       83.16 GiB  (measured extrapolation)
+    headroom for everything else  6.9 GiB
+
+6.9 GiB must cover the process, KV pools, CUDA context and buffers. It is tight but it is not
+obviously impossible -- the run was killed at the 70G cap with 8G of swap, so the cap itself
+(not the machine) is what stopped it. The next attempt should raise MEMCAP (the scope had
+memory.swap.max=8G and the system has 40G of swap) and see whether the remaining 8 layers
+complete.
+
+### NEXT ATTEMPT
+
+    MEMCAP=88G PLE_BACKEND=file ISOLATE=1 ./scripts/run-qwen38-kt.sh
+
+with the swap allowance raised too. If it still dies, the lever is `--kt-gpu-experts-ratio`
+(put some experts on the 16 GB card) or fewer `--kt-cpuinfer` threads.
+
+### ONE THING TO CLEAN UP FIRST
+
+The PLE file is 48 G of disk and `/home` is now at **7.6 G free (99%)**. The file is reused
+across restarts (deterministic name), so it should NOT be deleted -- but there is no longer room
+for another 48 G if anything repopulates it. Watch this.
