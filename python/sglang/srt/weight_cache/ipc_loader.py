@@ -36,6 +36,7 @@ from .protocol import (
     send_msg,
 )
 from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
+import socket
 
 logger = logging.getLogger(__name__)
 

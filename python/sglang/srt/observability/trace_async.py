@@ -64,6 +64,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from sglang.srt.environ import envs
+import socket
 
 if TYPE_CHECKING:
     import zmq as _zmq_type

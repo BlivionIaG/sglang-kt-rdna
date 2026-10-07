@@ -485,7 +485,12 @@ class ContentBlockStartEvent(BaseModel):
 class ContentBlockDeltaEvent(BaseModel):
     type: Literal["content_block_delta"] = "content_block_delta"
     index: int
-    delta: AnthropicContentDelta
+    # `AnthropicContentDelta` is referenced here but defined nowhere -- not in this
+    # file, not in upstream's copy either (upstream's own ContentBlockDeltaEvent
+    # names a class its module never defines). The delta model this file DOES
+    # define, and the one whose fields match a content-block delta, is
+    # `AnthropicDelta`. Bound to that so the event model can be created.
+    delta: AnthropicDelta
 
 
 class ContentBlockStopEvent(BaseModel):

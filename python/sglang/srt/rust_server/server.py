@@ -38,6 +38,7 @@ from sglang.srt.utils.flatten import (
     RaggedPairColumns,
 )
 from sglang.srt.utils.network import NetworkAddress
+import signal
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput

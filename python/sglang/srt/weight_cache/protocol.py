@@ -17,6 +17,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import safe_pickle_loads
+import socket
 
 logger = logging.getLogger(__name__)
 

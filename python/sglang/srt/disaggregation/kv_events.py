@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from enum import auto
 from copy import copy
 from struct import pack
+import socket
 
 logger = logging.getLogger(__name__)
 

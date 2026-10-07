@@ -47,6 +47,7 @@ from sglang.utils import convert_json_schema_to_str
 from typing import Protocol
 from pydantic import ConfigDict
 from typing import Annotated
+from typing import runtime_checkable
 
 logger = logging.getLogger(__name__)
 

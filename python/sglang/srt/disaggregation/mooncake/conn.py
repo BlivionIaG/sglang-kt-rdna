@@ -33,6 +33,7 @@ from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+import socket
 
 logger = logging.getLogger(__name__)
 

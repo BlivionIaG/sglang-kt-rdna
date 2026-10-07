@@ -6,6 +6,7 @@ import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any
+import signal
 
 
 @contextmanager

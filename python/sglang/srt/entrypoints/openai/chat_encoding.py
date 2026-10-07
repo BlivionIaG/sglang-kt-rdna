@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from sglang.srt.entrypoints.openai import encoding_dsv4
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 

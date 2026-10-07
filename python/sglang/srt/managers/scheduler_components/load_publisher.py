@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
+import socket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.load_snapshot import LoadSnapshot

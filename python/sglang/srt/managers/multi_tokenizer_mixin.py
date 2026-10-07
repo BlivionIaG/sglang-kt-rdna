@@ -49,6 +49,9 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
+import signal
+import socket
+from typing import List
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager

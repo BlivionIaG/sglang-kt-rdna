@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
+from typing import Sequence
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

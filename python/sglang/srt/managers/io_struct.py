@@ -39,6 +39,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
 import msgspec
+import socket
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:

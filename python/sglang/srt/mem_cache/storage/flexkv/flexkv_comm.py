@@ -37,6 +37,7 @@ import torch.distributed as dist
 
 from sglang.srt.runtime_context import get_parallel
 import copy
+import signal
 
 logger = logging.getLogger(__name__)
 

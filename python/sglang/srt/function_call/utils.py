@@ -11,6 +11,7 @@ import json
 import threading
 import warnings
 import types
+from typing import Iterable
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
