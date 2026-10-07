@@ -62,6 +62,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+import math
+import copy
 
 store_cache = register_custom_op(store_cache, mutates_args=["k_cache", "v_cache"])
 

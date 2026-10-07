@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils.common import async_h2d
+import copy
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher

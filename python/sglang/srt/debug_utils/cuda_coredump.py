@@ -17,6 +17,7 @@ import os
 import warnings
 
 from sglang.srt.environ import envs
+import time
 
 _CUDA_COREDUMP_FLAGS = (
     "skip_nonrelocated_elf_images,skip_global_memory,"

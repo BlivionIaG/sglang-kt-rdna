@@ -14,6 +14,7 @@ from typing import Any, Optional, Union
 import torch
 from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
+import uuid
 
 logger = logging.getLogger(__name__)
 

@@ -69,6 +69,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_pp_layers
+import time
 
 logger = logging.getLogger(__name__)
 

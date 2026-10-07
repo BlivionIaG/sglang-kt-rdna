@@ -22,6 +22,7 @@ import json
 from typing import Any
 
 import regex as re
+import time
 
 
 def _text(text: str, args: dict) -> str:

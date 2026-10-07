@@ -31,6 +31,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
+import time
 
 
 GLM5_NEXT_MIN_PIXELS = 12_544

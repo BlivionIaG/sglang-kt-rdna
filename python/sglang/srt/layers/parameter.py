@@ -9,6 +9,7 @@ from torch.nn import Parameter
 
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
+import copy
 
 __all__ = [
     "BasevLLMParameter",

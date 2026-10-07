@@ -8,6 +8,7 @@ from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.runtime_context import get_parallel
+import time
 
 
 # =============================================================================

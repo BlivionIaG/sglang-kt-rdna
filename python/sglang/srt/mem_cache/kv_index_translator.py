@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_parallel
+import copy
 
 
 class KVReadTables(msgspec.Struct, frozen=True):

@@ -41,6 +41,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+import time
 
 logger = logging.getLogger(__name__)
 

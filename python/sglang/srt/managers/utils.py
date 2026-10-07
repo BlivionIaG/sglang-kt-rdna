@@ -16,6 +16,8 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.server_args import ServerArgs
 import msgspec
+import struct
+import re
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult

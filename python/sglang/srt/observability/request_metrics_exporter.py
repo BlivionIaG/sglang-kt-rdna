@@ -9,6 +9,7 @@ from typing import List, Optional, Union
 
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
+import time
 
 logger = logging.getLogger(__name__)
 

@@ -69,6 +69,7 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+import time
 
 if importlib.util.find_spec("sglang._vendor.compressed_tensors") is not None:
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (

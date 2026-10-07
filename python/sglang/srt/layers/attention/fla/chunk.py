@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.fla.utils import (
     input_guard,
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+import warnings
 
 
 def chunk_gated_delta_rule_fwd(

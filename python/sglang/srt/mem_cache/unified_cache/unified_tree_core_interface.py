@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
+import time
 
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.

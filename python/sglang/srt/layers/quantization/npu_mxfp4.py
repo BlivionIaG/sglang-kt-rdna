@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
+import time
 
 logger = logging.getLogger(__name__)
 

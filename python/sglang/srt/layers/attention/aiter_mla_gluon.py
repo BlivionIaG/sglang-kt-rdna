@@ -20,6 +20,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
+import time
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

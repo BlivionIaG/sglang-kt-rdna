@@ -36,6 +36,7 @@ from sglang.srt.model_executor.input_buffers import (
     share_input_buffer,
 )
 from sglang.srt.runtime_context import get_parallel
+import copy
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

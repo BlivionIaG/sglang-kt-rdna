@@ -70,6 +70,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.environ import envs
+import time
 
 logger = logging.getLogger(__name__)
 

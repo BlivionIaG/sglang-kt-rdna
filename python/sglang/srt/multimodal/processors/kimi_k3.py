@@ -61,6 +61,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.utils import is_cuda
+import time
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:

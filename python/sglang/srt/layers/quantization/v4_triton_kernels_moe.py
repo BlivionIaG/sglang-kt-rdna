@@ -41,6 +41,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+import copy
 
 logger = logging.getLogger(__name__)
 

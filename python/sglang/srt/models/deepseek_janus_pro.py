@@ -113,6 +113,7 @@ def VQ_16(**kwargs):
 VQ_models = {"VQ-16": VQ_16}
 
 import collections.abc
+from dataclasses import dataclass
 
 
 # From PyTorch internals

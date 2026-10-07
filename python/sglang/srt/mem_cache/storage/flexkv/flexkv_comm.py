@@ -36,6 +36,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.runtime_context import get_parallel
+import copy
 
 logger = logging.getLogger(__name__)
 

@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
+import time
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

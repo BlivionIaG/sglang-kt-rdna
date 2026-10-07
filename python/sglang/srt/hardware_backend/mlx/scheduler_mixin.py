@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import DynamicGradMode
+import copy
 
 logger = logging.getLogger(__name__)
 

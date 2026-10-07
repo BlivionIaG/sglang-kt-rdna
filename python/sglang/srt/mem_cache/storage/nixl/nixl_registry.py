@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from typing import List, Optional
 
 from .nixl_utils import NixlFileManager
+import os
 
 logger = logging.getLogger(__name__)
 

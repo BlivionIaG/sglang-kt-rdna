@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
+import time
 
 
 @dataclass

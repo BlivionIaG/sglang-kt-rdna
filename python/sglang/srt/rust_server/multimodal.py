@@ -10,6 +10,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
+import copy
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

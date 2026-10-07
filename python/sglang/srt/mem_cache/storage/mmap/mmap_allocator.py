@@ -11,6 +11,7 @@ import weakref
 import torch
 
 from sglang.srt.environ import envs
+import time
 
 logger = logging.getLogger(__name__)
 

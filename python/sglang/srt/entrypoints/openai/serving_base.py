@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
+import time
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager

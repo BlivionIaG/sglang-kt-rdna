@@ -33,6 +33,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model
+import time
 
 
 class Cosmos3ForConditionalGeneration(Qwen3VLForConditionalGeneration):

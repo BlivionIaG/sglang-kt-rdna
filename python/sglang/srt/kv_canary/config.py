@@ -9,6 +9,7 @@ from sglang.kernels.ops.kv_canary.consts import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_observability
+import time
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs

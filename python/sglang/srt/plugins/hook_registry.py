@@ -31,6 +31,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from enum import Enum
 from typing import NamedTuple
+import time
 
 logger = logging.getLogger(__name__)
 

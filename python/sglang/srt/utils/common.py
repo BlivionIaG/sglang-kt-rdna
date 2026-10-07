@@ -105,6 +105,7 @@ from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.runtime_context import get_platform
+import copy
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below

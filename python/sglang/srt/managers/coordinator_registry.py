@@ -9,6 +9,7 @@ loaded via the DSV4 model entry-point and registers under name "hisparse".
 """
 
 from typing import Any, Callable, Dict
+import time
 
 
 _Factory = Callable[..., Any]

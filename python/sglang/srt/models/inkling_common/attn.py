@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
+import copy
 
 try:
     import cutlass.cute as cute

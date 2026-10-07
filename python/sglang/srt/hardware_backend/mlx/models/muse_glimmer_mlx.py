@@ -114,6 +114,7 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import KVCache
+import copy
 
 # Version of the packaged (fused/folded) weight layout this file understands.
 MUSE_GLIMMER_MLX_FORMAT_VERSION = 1

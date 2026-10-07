@@ -41,6 +41,7 @@ from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward
+import copy
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layer_boundary.construction import StagePlan

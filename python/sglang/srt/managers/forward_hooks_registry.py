@@ -15,6 +15,7 @@ side-effect).
 """
 
 from typing import Any, Dict, List
+import time
 
 
 _HOOKS: Dict[str, Any] = {}

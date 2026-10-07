@@ -61,6 +61,8 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.utils import is_in_ci
+import threading
+import struct
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup

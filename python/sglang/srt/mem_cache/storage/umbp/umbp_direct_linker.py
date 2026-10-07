@@ -29,6 +29,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
+import time
+import copy
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()

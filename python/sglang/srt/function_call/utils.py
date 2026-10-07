@@ -7,6 +7,7 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+import json
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:

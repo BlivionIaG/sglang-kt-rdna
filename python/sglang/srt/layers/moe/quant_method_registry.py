@@ -11,6 +11,7 @@ no base file imports the wrapper directly.
 """
 
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+import time
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase

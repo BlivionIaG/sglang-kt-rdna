@@ -7,6 +7,7 @@ from typing import Any, Optional, Union
 import torch
 
 from sglang.srt.utils import is_device_stream_capturing
+import copy
 
 _PayloadDict = dict[str, Any]
 _TensorOrDict = Union[torch.Tensor, _PayloadDict]

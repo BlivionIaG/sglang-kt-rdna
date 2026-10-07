@@ -15,6 +15,7 @@
 
 import logging
 from typing import Any, Dict, List, Optional, Union
+import re
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:

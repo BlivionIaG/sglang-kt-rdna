@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+import msgspec
 
 logger = logging.getLogger(__name__)
 
