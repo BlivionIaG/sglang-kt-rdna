@@ -24,7 +24,7 @@ import logging
 import sys
 import tempfile
 import uuid
-from typing import Any, NoReturn
+from typing import Any, NoReturn, List, Optional
 
 import msgspec
 
@@ -192,6 +192,8 @@ from sglang.srt.utils.common import (  # noqa: F401
     json_list_type,
     nullable_str,
 )
+import json
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 # Re-exported like the imports above, but resolved on first use: importing them
 # eagerly is what the choices helpers avoid, and most processes never read them.
@@ -418,6 +420,99 @@ class ServerArgs:
             "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
 
+        # --- ktransformers expert offload CLI arguments, restored from the
+        # pre-base-forward fork. The fields above are inert without these.
+        parser.add_argument(
+            "--kt-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-numa-nodes",
+            type=int,
+            nargs="+",
+            default=ServerArgs.kt_numa_nodes,
+            help="[ktransformers parameter] Explicit NUMA node ids for each KT threadpool. "
+                 "Length must equal --kt-threadpool-count.",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] Number of GPU experts per MoE layer. "
+                 "Internally multiplied by the number of MoE layers to get the total GPU experts. "
+                 "Ignored if --kt-gpu-experts-ratio is set.",
+        )
+        parser.add_argument(
+            "--kt-gpu-experts-ratio",
+            type=float,
+            help="[ktransformers parameter] Ratio of total experts to place on GPU (0.0-1.0). "
+                 "If set, overrides --kt-num-gpu-experts. "
+                 "Example: 0.1 means 10%% of all experts across all layers will be on GPU.",
+        )
+        parser.add_argument(
+            "--kt-max-deferred-experts-per-token",
+            type=int,
+            default=ServerArgs.kt_max_deferred_experts_per_token,
+            help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+        parser.add_argument(
+            "--kt-gpu-prefill-token-threshold",
+            type=int,
+            default=ServerArgs.kt_gpu_prefill_token_threshold,
+            help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
+        )
+        parser.add_argument(
+            "--kt-enable-dynamic-expert-update",
+            action="store_true",
+            default=ServerArgs.kt_enable_dynamic_expert_update,
+            help="[ktransformers parameter] Enable dynamic GPU expert updates based on runtime statistics. After full GPU fallback computation, updates original layer's GPU experts to match the most frequently activated experts in the current batch.",
+        )
+        parser.add_argument(
+            "--kt-expert-placement-strategy",
+            type=str,
+            default=ServerArgs.kt_expert_placement_strategy,
+            choices=["frequency", "front-loading", "uniform", "random"],
+            help="[ktransformers parameter] GPU expert placement strategy. "
+                 "frequency: Select top-k by activation frequency (default). "
+                 "front-loading: Fill layers from first MoE layer onwards. "
+                 "uniform: Equal experts per layer. "
+                 "random: Random placement with fixed seed.",
+        )
+        parser.add_argument(
+            "--kt-lora-path",
+            type=str,
+            default=ServerArgs.kt_lora_path,
+            help="[experimental ktransformers parameter] Single PEFT adapter directory "
+                 "for static full KT LoRA. Expert tensors are served by the KT CPU "
+                 "SFT path and Qwen3.5 non-expert tensors are applied statically in "
+                 "the model forward.",
+        )
+        parser.add_argument(
+            "--kt-expert-lora-path",
+            type=str,
+            default=ServerArgs.kt_expert_lora_path,
+            help="[experimental ktransformers parameter] Single PEFT adapter directory "
+                 "for KT CPU expert LoRA. This bypasses SGLang's normal LoRA manager "
+                 "for expert weights and runs the KT CPU expert path through forward_sft.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
@@ -490,6 +585,40 @@ class ServerArgs:
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
+
+    # --- ktransformers expert offload fields, restored from the pre-base-forward
+    # fork. kt_ep_wrapper reads every one of these; the newer upstream ServerArgs
+    # dropped them because upstream has no kt integration.
+    kt_composite_lora_id: Optional[str] = None
+    kt_composite_lora_name: Optional[str] = None
+    kt_cpuinfer: Optional[int] = None
+    kt_dsv4_lora_path: Optional[str] = None
+    kt_enable_dynamic_expert_update: bool = False
+    kt_expert_lora_path: Optional[str] = None
+    kt_expert_placement_strategy: str = "uniform"
+    kt_gpu_experts_ratio: Optional[float] = None
+    kt_gpu_prefill_token_threshold: Optional[int] = None
+    kt_lora_path: Optional[str] = None
+    kt_max_deferred_experts_per_token: Optional[int] = None
+    kt_method: Optional[str] = None
+    kt_num_gpu_experts: Optional[int] = None
+    kt_numa_nodes: Optional[List[int]] = None
+    kt_threadpool_count: Optional[int] = None
+    kt_weight_path: Optional[str] = None
+
+
+    def get_hf_config(self):
+        """Restored from the pre-base-forward fork: kt_ep_wrapper's expert-mask setup and
+        the qwen4_exp model override both call `server_args.get_hf_config()`."""
+        kwargs = {}
+        hf_config = get_config(
+            self.model_path,
+            trust_remote_code=self.trust_remote_code,
+            revision=self.revision,
+            model_override_args=json.loads(self.json_model_override_args),
+            **kwargs,
+        )
+        return hf_config
 
 
 # Collect input fields only; field_order.py preserves positional argument order.

@@ -28,6 +28,7 @@ from sglang.srt.utils import is_cuda, is_npu
 _is_npu = is_npu()
 
 from sglang.srt.utils.common import log_info_on_rank0
+DISABLE_KT_EP_WRAPPER: bool = False
 
 logger = logging.getLogger(__name__)
 
@@ -1076,3 +1077,35 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+# --- restored from the pre-base-forward fork (kt-specific) ---
+
+
+def is_kt_ep_wrapper_disabled() -> bool:
+    """Check if KT EP wrapper is disabled (for draft models in speculative decoding)."""
+    global DISABLE_KT_EP_WRAPPER
+    return DISABLE_KT_EP_WRAPPER
+
+
+@contextmanager
+
+
+@contextmanager
+def speculative_kt_ep_disabled_context():
+    """
+    Context manager to disable KT EP wrapper for draft model operations.
+    Ensures draft models use pure GPU MoE instead of CPU-GPU hybrid computation
+    via kt_ep_wrapper.
+    """
+    global DISABLE_KT_EP_WRAPPER
+    original_value = DISABLE_KT_EP_WRAPPER
+    try:
+        DISABLE_KT_EP_WRAPPER = True
+        yield
+    finally:
+        DISABLE_KT_EP_WRAPPER = original_value
+
+
+# The type of method in top-K routing, for use in torch custom op
+# Please keep this in sync with the counterpart defined in https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/trtllm/fused_moe/runner.h
