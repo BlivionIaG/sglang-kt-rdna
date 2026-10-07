@@ -649,3 +649,22 @@ def get_moe_cp_rank() -> int:
 def is_enable_moe_cp_allgather() -> bool:
     """Whether the MoE CP all-gather path is active (single rank: no)."""
     return get_moe_cp_size() > 1
+
+
+def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    from sglang.srt.distributed.parallel_state import get_moe_dp_group
+
+    return get_moe_dp_group().all_gather_into_tensor(output, input)
+
+
+def can_use_dp_reduce_scatter() -> bool:
+    """Whether the fixed TP group tiles the current attention DP x TP layout."""
+    if not world_dp_gather_enabled():
+        return True
+
+    parallel = get_parallel()
+    return parallel.tp_size == parallel.num_dp_ranks * parallel.attn_tp_size
+
+
+def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
+    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)

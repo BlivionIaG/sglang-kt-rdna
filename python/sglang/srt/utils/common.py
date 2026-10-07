@@ -4297,3 +4297,7 @@ def is_building_neighbour_layer() -> bool:
     the host and device resources a running layer needs: tables, streams,
     engines and communicators."""
     return _building_neighbour_layer
+
+
+def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())

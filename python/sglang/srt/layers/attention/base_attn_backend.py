@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
@@ -172,3 +173,17 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+
+class SharedReadEnds(Enum):
+    """Where an attention backend finishes reading the shared data"""
+
+    PRE_REPLAY = 1  # After the init_forward_metadata_out_graph
+    IN_REPLAY = 2  # After the init_forward_metadata_in_graph
+    POST_REPLAY = 3  # Metadata snapshot not implemented
+    UNKNOWN = 4  # not audited -> coarse whole-forward fence
+
+    @staticmethod
+    def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
+        # Ordered by lateness: the latest end covers every child.
+        return max(items, key=lambda x: x.value)
