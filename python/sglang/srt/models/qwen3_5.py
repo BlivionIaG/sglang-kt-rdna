@@ -1087,10 +1087,31 @@ class Qwen3_5ForCausalLM(nn.Module):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        # `start_layer` / `end_layer` added with the qwen4 subsystem
+        # (sgl-project/sglang). Upstream builds the stack with `make_pp_layers`,
+        # which also returns the pipeline-parallel bounds and exposes them as
+        # properties; this fork still calls `make_layers`, which returns only the
+        # module list, so `Qwen4ExpModel.__init__` raised
+        # "AttributeError: 'Qwen4ExpVLModel' object has no attribute
+        # 'start_layer'" while scanning its layers for PLE blocks. The bounds are
+        # the pipeline ranks' slice of the layer range, which is what upstream's
+        # properties report; on a single pipeline stage (this deployment) they are
+        # simply the whole range.
+        layers_per_rank = len(self.layers)
+        self._start_layer = 0
+        self._end_layer = layers_per_rank
 
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    @property
+    def start_layer(self) -> int:
+        return self._start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self._end_layer
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
