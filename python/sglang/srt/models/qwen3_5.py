@@ -548,6 +548,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -674,6 +676,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
+        build_stages: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
