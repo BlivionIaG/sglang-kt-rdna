@@ -52,11 +52,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+from sglang.srt.distributed.parallel_state import get_tp_group
+
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda

@@ -1340,3 +1340,164 @@ def examples():
 
 if __name__ == "__main__":
     examples()
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+_NON_UTF8_PREFIX = "base64:"
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def exportable_env_vars() -> dict[str, str]:
+    return {
+        field.name: _exportable_value(os.environ[field.name])
+        for field in sorted(
+            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
+            key=lambda field: field.name,
+        )
+        if not field.secret and field.name in os.environ
+    }
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _exportable_value(value: str) -> str:
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return (
+            _NON_UTF8_PREFIX
+            + base64.b64encode(value.encode(errors="surrogateescape")).decode()
+        )
+    return value
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class _DeprecatedEnv:
+    """One deprecated env var: warn if it is set, and optionally forward its
+    (possibly transformed) value to a replacement env var."""
+
+    def __init__(
+        self,
+        replacement: Optional[str] = None,
+        transform: Optional[Callable[[str], str]] = None,
+        note: Optional[str] = None,
+    ):
+        self.replacement = replacement
+        self.transform = transform
+        self.note = note
+
+    def apply(self, old_name: str):
+        if old_name not in os.environ:
+            return
+        message = f"Environment variable {old_name} is deprecated."
+        if self.replacement is not None:
+            message += f" Please use {self.replacement} instead."
+        if self.note is not None:
+            message += f" {self.note}"
+        warnings.warn(message)
+        if self.replacement is not None:
+            value = os.environ[old_name]
+            if self.transform is not None:
+                value = self.transform(value)
+            os.environ[self.replacement] = value
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
+        note=(
+            "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "
+            "Without it an eligible model auto-enables the legacy mnnvl "
+            "backend rather than the CuTe DSL fusion."
+        )
+    ),
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES": _DeprecatedEnv(
+        note="One workspace per process is now an invariant, not a limit."
+    ),
+    # Removed without replacement.
+    "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
+        note="Strategy-based prefill context parallelism is now the only generic implementation."
+    ),
+    "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
+        note="Buffer-mode anchor pinning is always on; set "
+        "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
+    ),
+    # Replaced by CLI flags.
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
+        note="Please use '--enable-prefill-delayer' instead."
+    ),
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": _DeprecatedEnv(
+        note="Please use '--prefill-delayer-max-delay-passes' instead."
+    ),
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
+        note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
+        note="The unified radix tree is the default tree cache now; unset this env."
+    ),
+}
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _handle_deprecated_envs():
+    for old_name, deprecation in _DEPRECATED_ENVS.items():
+        deprecation.apply(old_name)
+
+    # Rewrite the legacy SGL_ prefix to SGLANG_ (names not covered above).
+    for key, value in list(os.environ.items()):
+        if key.startswith("SGL_") and key not in _DEPRECATED_ENVS:
+            new_key = key.replace("SGL_", "SGLANG_", 1)
+            warnings.warn(
+                f"Environment variable {key} is deprecated, please use {new_key}"
+            )
+            os.environ[new_key] = value
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def third_party_cache_defaults() -> Dict[str, str]:
+    base = os.path.expanduser(envs.SGLANG_CACHE_DIR.get())
+    return {
+        "TRITON_CACHE_DIR": os.path.join(base, "triton"),
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(base, "inductor"),
+        "CUDA_CACHE_PATH": os.path.join(base, "nv"),
+        # TileLang compiles the DeepSeek-V4 MHC prenorm kernels; left at its own
+        # default the burst is invisible to anyone warming, mounting or baking
+        # SGLANG_CACHE_DIR, and gets paid again on every cold container.
+        "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
+        # FlashInfer appends ".cache/flashinfer" to this base itself, so this
+        # is the base dir rather than the final cache dir.
+        "FLASHINFER_WORKSPACE_BASE": base,
+    }
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def redirect_third_party_caches():
+    """Point third-party JIT caches at SGLANG_CACHE_DIR, so a run's compiled
+    kernels can be cleaned, warmed or volume-mounted as one directory.
+
+    Must be called early. The redirect silently does nothing if either of
+    these has already happened:
+
+    - FlashInfer was imported. It resolves its workspace at import time.
+    - Inductor made its first ``cache_dir()`` call. That call setdefaults
+      TORCHINDUCTOR_CACHE_DIR itself.
+    """
+    for key, value in third_party_cache_defaults().items():
+        os.environ.setdefault(key, value)

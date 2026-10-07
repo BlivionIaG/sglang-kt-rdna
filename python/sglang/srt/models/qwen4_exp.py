@@ -15,7 +15,8 @@ from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
+
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -65,7 +66,10 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import PPMissingLayer
+from sglang.srt.layers.utils.common import get_layer_id
+
+
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -76,14 +80,13 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
-from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-    is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-)
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import is_in_breakable_cuda_graph
+
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import get_tc_piecewise_forward_context
+
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
@@ -99,7 +102,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.common import is_hip
+from sglang.srt.utils import logger
+
+
 from sglang.srt.utils.common import is_building_neighbour_layer
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
