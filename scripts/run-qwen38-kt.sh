@@ -24,6 +24,30 @@
 # which layer each reaches. Do NOT report a root cause until one of those runs completes.
 set -u
 
+# ---------------------------------------------------------------------------
+# MEMORY ISOLATION -- added 2026-10-07 after the load reproducibly WEDGED the host.
+#
+# Two launches (13:08, 13:35) each drove par1-llm1 into a state where NOTHING could fork:
+# ping and ARP fine, :22 accepting TCP, but the sshd banner never arrived and every service
+# port was closed. The box recovered only when the stuck process exited (~24 min later,
+# uptime unchanged at 41 days). Earlier launches had been SIGKILLed by the kernel OOM killer
+# at ~20 GB anon-rss with 330-345 GB total_vm -- i.e. the machine thrashes on address
+# space/commit, not on resident bytes.
+#
+# That is why this script now offers ISOLATION: a launch that takes the host down gives me
+# one data point per 25 minutes and no ability to observe, which is worse than a launch that
+# fails cleanly. Keeping sshd alive is worth more than any single flag's effect.
+#
+# ISOLATE=1  -- run under systemd-run with a hard memory cap, so the load is killed by the
+#               cgroup BEFORE the host thrashes and sshd survives.
+# LIMIT_V=1  -- set `ulimit -v` so over-large reservations fail at allocation time in Python
+#               (MemoryError, with a traceback) instead of by the kernel later.
+# FEWER_THREADS=1 -- drop cpuinfer threads from 16 to 4; the KT path allocates pinned buffers
+#               per layer, so thread count multiplies the host-side demand.
+#
+# Run with ISOLATE=1 FIRST. If it dies inside the cap, the traceback says exactly which
+# allocation was too large -- which is the measurement I have been missing all along.
+
 VENV="${VENV:-$HOME/Projects/kt071-venv}"
 KT="${KT:-$HOME/Projects/ktransformers-0.7.1}"
 MODEL="${MODEL:-/home/kletorch/models/qwen38-stage}"
@@ -39,15 +63,35 @@ export USE_NUMA=1
 export TORCH_CUDA_ARCH_LIST="12.0"
 export SGLANG_ENABLE_JIT_DEEPGEMM=0
 
-echo "memlock: $(ulimit -l)   (8 = the value under test; unlimited = the fix candidate)"
+if [ "${LIMIT_V:-0}" = "1" ]; then
+  ulimit -v $((60 * 1024 * 1024))   # 60 GB of address space, well under the 90 GB CommitLimit
+  echo "ulimit -v set to 60 GB"
+fi
+CPUINFER="${CPUINFER:-16}"
+[ "${FEWER_THREADS:-0}" = "1" ] && CPUINFER=4
+echo "cpuinfer=$CPUINFER  ISOLATE=${ISOLATE:-0}  LIMIT_V=${LIMIT_V:-0}"
 
-exec python3 -m sglang.launch_server \
-  --model-path "$MODEL" \
-  --kt-weight-path "$MODEL" \
-  --ple-offload-embedding --ple-offload-backend pinned \
-  --quantization modelopt_mixed \
-  --kt-num-gpu-experts 0 --kt-cpuinfer 16 --kt-threadpool-count 1 --kt-method NVFP4 \
-  --attention-backend triton --disable-cuda-graph --mem-fraction-static 0.55 \
-  --max-running-requests 2 \
-  --host 127.0.0.1 --port "$PORT" \
+ARGS=(
+  --model-path "$MODEL"
+  --kt-weight-path "$MODEL"
+  --ple-offload-embedding --ple-offload-backend pinned
+  --quantization modelopt_mixed
+  --kt-num-gpu-experts 0 --kt-cpuinfer "$CPUINFER" --kt-threadpool-count 1 --kt-method NVFP4
+  --attention-backend triton --disable-cuda-graph --mem-fraction-static 0.55
+  --max-running-requests 2
+  --host 127.0.0.1 --port "$PORT"
   --trust-remote-code --disable-radix-cache
+)
+
+if [ "${ISOLATE:-0}" = "1" ]; then
+  # Hard memory cap in a transient scope: the cgroup kills the load BEFORE the host
+  # thrashes, so sshd keeps working and the log survives to be read.
+  MEMCAP="${MEMCAP:-70G}"
+  echo "running under systemd-run --scope -p MemoryMax=$MEMCAP -p MemorySwapMax=8G"
+  exec systemd-run --user --scope --collect \
+    -p MemoryMax="$MEMCAP" -p MemorySwapMax=8G \
+    python3 -m sglang.launch_server "${ARGS[@]}"
+fi
+
+exec python3 -m sglang.launch_server "${ARGS[@]}"
+
