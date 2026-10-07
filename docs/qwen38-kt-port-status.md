@@ -108,3 +108,33 @@ GPU. That is an environment/checkpoint mismatch, not a defect in the port: the c
 complete and pushed. Resolving it needs either a unified-memory device (so `file` works) or a
 host large enough for the weights plus the pinned table. `scripts/run-qwen38-kt.sh` is ready
 for either, and `ISOLATE=1` keeps a future attempt from wedging the machine.
+
+## UPDATE: the `file` backend now has a software route on this GPU
+
+The table above said both backends were closed. That was true of the code AS UPSTREAM SHIPS
+IT, but not of the design: the only thing binding `file` to unified memory is *where the row
+read happens*. The default gather is a Triton kernel that dereferences the host pointer from
+the device (`tl.load(weight_ptr + ...)`), which needs
+`cudaDevAttrPageableMemoryAccessUsesHostPageTables`. The sparse mmap itself
+(`torch.from_file(..., shared=True)` + `MADV_RANDOM` + WILLNEED prefetch + an RSS trimmer)
+is plain Linux and works anywhere.
+
+`SGLANG_QWEN4_PLE_HOST_SIDE_GATHER=1` gathers the same rows on the CPU and copies them over,
+removing that dependency. `scripts/run-qwen38-kt.sh` wires both together:
+
+    PLE_BACKEND=file ./scripts/run-qwen38-kt.sh
+
+which sets `SGLANG_QWEN4_PLE_HOST_SIDE_GATHER=1` and
+`SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` and selects
+`--ple-offload-embedding --ple-offload-backend file`.
+
+Cost, stated plainly: this is a correctness path, not a fast one. It adds a host gather plus
+one H2D copy per call. The volume is small by construction -- 16 rows per token (8 two-gram +
+8 three-gram heads) of `head_dim_per_ngram` values, about 2.5 KB in fp8 -- but it is still a
+per-step cost with a possible sync.
+
+Verified: the masking arithmetic matches `_gather_ple_embedding_from_pinned_kernel` over
+adversarial ids (in-range, below the shard, above it, both bounds) -- 7/7 rows identical.
+NOT verified on hardware: par1-llm1 is wedged, so the torch tensor ops (indexing an fp8 cpu
+table with a long tensor, then `.to(bfloat16)`) have not been exercised against real weights.
+Test that first when the host returns.

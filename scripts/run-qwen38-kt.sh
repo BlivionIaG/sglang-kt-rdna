@@ -71,10 +71,26 @@ CPUINFER="${CPUINFER:-16}"
 [ "${FEWER_THREADS:-0}" = "1" ] && CPUINFER=4
 echo "cpuinfer=$CPUINFER  ISOLATE=${ISOLATE:-0}  LIMIT_V=${LIMIT_V:-0}"
 
+# PLE_BACKEND=pinned|file   -- "file" uses the sparse mmap and REQUIRES the host-side
+# gather on this GPU (see SGLANG_QWEN4_PLE_HOST_SIDE_GATHER below), because the default
+# Triton gather needs unified memory which an RTX PRO 2000 does not have.
+PLE_BACKEND="${PLE_BACKEND:-pinned}"
+if [ "$PLE_BACKEND" = "file" ]; then
+  # The device check exists to stop the kernel reading garbage; the host-side gather makes
+  # that moot, so it is bypassed together with enabling the gather.
+  export SGLANG_QWEN4_PLE_HOST_SIDE_GATHER=1
+  export SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1
+  PLE_OFFLOAD=(--ple-offload-embedding --ple-offload-backend file)
+  echo "PLE: file backend (sparse mmap) + host-side gather"
+else
+  PLE_OFFLOAD=(--ple-offload-embedding --ple-offload-backend pinned)
+  echo "PLE: pinned backend  (upstream docs say this does NOT boot 126 GiB weights on a 92 GB box)"
+fi
+
 ARGS=(
   --model-path "$MODEL"
   --kt-weight-path "$MODEL"
-  --ple-offload-embedding --ple-offload-backend pinned
+  "${PLE_OFFLOAD[@]}"
   --quantization modelopt_mixed
   --kt-num-gpu-experts 0 --kt-cpuinfer "$CPUINFER" --kt-threadpool-count 1 --kt-method NVFP4
   --attention-backend triton --disable-cuda-graph --mem-fraction-static 0.55
