@@ -837,3 +837,159 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.info("Server thread stopped")
 
     def poll(self) -> KVPoll: ...
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
+    sessions = getattr(_bootstrap_sessions, "by_addr", None)
+    if sessions is None:
+        sessions = {}
+        _bootstrap_sessions.by_addr = sessions
+    session = sessions.get(bootstrap_addr)
+    if session is None:
+        # Not evicted: the number of bootstrap_addr is bounded (one per prefill
+        # server). Bootstrap is http-only, so only http:// is mounted.
+        session = requests.Session()
+        session.mount(
+            "http://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1)
+        )
+        sessions[bootstrap_addr] = session
+    return session
+
+
+class KVTransferError(Exception):
+    def __init__(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        is_from_another_rank: bool = False,
+    ):
+        super().__init__(failure_reason)
+        self.bootstrap_room = bootstrap_room
+        self.failure_reason = failure_reason
+        self.is_from_another_rank = is_from_another_rank
+
+    def __str__(self):
+        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+
+
+@dataclasses.dataclass
+class PrefillRankInfo:
+    rank_ip: str
+    rank_port: int
+
+    def __post_init__(self):
+        self.rank_ip = str(self.rank_ip)
+        self.rank_port = int(self.rank_port)
+
+
+class AckTarget(NamedTuple):
+    ip: str
+    port: int
+    generation: int
+
+
+class AbortNotification(msgspec.Struct, frozen=True):
+    room: int
+    decode_ip: Optional[str] = None
+    decode_port: Optional[int] = None
+    generation: Optional[int] = None
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]) -> Optional[AbortNotification]:
+        if len(msg) < 2:
+            logger.warning("Malformed ABORT message: too few frames (%d)", len(msg))
+            return None
+
+        try:
+            room = int(msg[1].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid room field %r", msg[1])
+            return None
+
+        if len(msg) < 4:
+            return cls(room=room)
+
+        try:
+            decode_ip = msg[2].decode("ascii")
+            decode_port = int(msg[3].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid return address")
+            return cls(room=room)
+
+        generation = None
+        if len(msg) >= 5:
+            try:
+                generation = int(msg[4].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                logger.warning("Malformed ABORT message: invalid generation")
+        return cls(
+            room=room,
+            decode_ip=decode_ip,
+            decode_port=decode_port,
+            generation=generation,
+        )
+
+    def to_zmq(self) -> List[bytes]:
+        frames = [ABORT_TAG, str(self.room).encode("ascii")]
+        if self.decode_ip is not None and self.decode_port is not None:
+            frames.extend(
+                [
+                    self.decode_ip.encode("ascii"),
+                    str(self.decode_port).encode("ascii"),
+                ]
+            )
+            if self.generation is not None:
+                frames.append(str(self.generation).encode("ascii"))
+        return frames
+
+    def deferred_ack_target(self) -> Optional[AckTarget]:
+        if self.decode_ip is None or self.decode_port is None:
+            return None
+        if self.generation is None:
+            # Normal for a decode that did not arm (e.g. a prealloc abort before
+            # metadata was published): it does not wait for an ACK. An older
+            # decode that does wait falls back to its release timeout.
+            logger.debug(
+                "Generation-less ABORT for room %s; no deferred ACK", self.room
+            )
+            return None
+        return AckTarget(self.decode_ip, self.decode_port, self.generation)
+
+
+class AbortAck(msgspec.Struct, frozen=True):
+    room: int
+    prefill_rank: int
+    generation: Optional[int] = None
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]) -> Optional[AbortAck]:
+        if len(msg) < 3:
+            logger.warning("Incomplete ABORT_ACK received")
+            return None
+        try:
+            return cls(
+                room=int(msg[1].decode("ascii")),
+                prefill_rank=int(msg[2].decode("ascii")),
+                generation=(int(msg[3].decode("ascii")) if len(msg) >= 4 else None),
+            )
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT_ACK received")
+            return None
+
+    def to_zmq(self) -> List[bytes]:
+        frames = [
+            ABORT_ACK_TAG,
+            str(self.room).encode("ascii"),
+            str(self.prefill_rank).encode("ascii"),
+        ]
+        if self.generation is not None:
+            frames.append(str(self.generation).encode("ascii"))
+        return frames
+
+
+class DeferredAbortAckState(msgspec.Struct):
+    generation: int
+    prefill_ranks: Set[int]

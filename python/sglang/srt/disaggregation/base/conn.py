@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.server_args import ServerArgs
+import enum
+import dataclasses
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -165,3 +167,43 @@ class BaseKVReceiver(ABC):
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
     def __init__(self, host: str, port: int, dp_size: int = 1): ...
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class StateType(str, enum.Enum):
+    MAMBA = "mamba"
+    QSA_PENDING = "qsa_pending"
+    QSA_COMPRESSED = "qsa_compressed"
+    SWA = "swa"
+    DSA = "dsa"
+    # DSA kpool-compress tail: one per-request ring row. The indices encode
+    # only the live subrange of that row for the current open pool.
+    DSA_TAIL = "dsa_tail"
+    MINIMAX_INDEX_K = "minimax_index_k"
+    MINIMAX_DENSE_KV = "minimax_dense_kv"
+    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
+    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
+    SWA_RING = "swa_ring"
+    # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
+    DSV4_REQUEST_STATE = "c128_state"
+    # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
+    # K/V, one component per sub-pool so each carries the index payload of the
+    # KV it describes (whole sequence for full attention, window for SWA).
+    BLOCK_SCALE = "block_scale"
+    BLOCK_SCALE_SWA = "block_scale_swa"
+
+
+@dataclasses.dataclass
+class KVTransferMetric:
+    # Backends that cannot isolate transfer latency can leave this as None.
+    transfer_latency_s: Optional[float] = None
+    # Backends that cannot isolate allocation wait latency can leave this as None.
+    alloc_latency_s: Optional[float] = None
+    transfer_total_bytes: Optional[int] = None
+
+
+class KVTransferDestination(str, enum.Enum):
+    DEVICE = "device"
+    HOST = "host"

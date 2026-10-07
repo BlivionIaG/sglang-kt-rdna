@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Generic
 
 import numpy as np
 import numpy.typing as npt
@@ -1369,3 +1369,54 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
     pass
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _uses_flat_entry_layout(
+    *,
+    mla_backend: bool,
+    force_flat: bool,
+    has_layer_ids: bool,
+    state_type: Optional[StateType],
+    num_src_entries: int,
+    num_dst_entries: int,
+) -> bool:
+    """One region per transfer entry, as opposed to plain MHA's K-then-V split.
+
+    Shared by the transfer and the registration-time stride check so both
+    judge the same entries. Unified SWA publishes one page-envelope region
+    even on an MHA backend.
+    """
+    is_single_region_swa = (
+        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
+    )
+    return mla_backend or force_flat or has_layer_ids or is_single_region_swa
+
+
+class MooncakeFailureExceptionMixin:
+    """Shared `failure_exception` for the Mooncake sender and receiver.
+
+    Both sides conclude a failed room identically: latch Failed, clear local
+    state, then raise with the recorded reason -- or, when no reason was
+    recorded locally, report it as propagated from another rank. Expects the
+    concrete class to provide ``conclude_state``, ``clear()``,
+    ``bootstrap_room`` and ``kv_mgr``.
+    """
+
+    def failure_exception(self):
+        # A room with no locally recorded reason failed on another rank.
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
+        self.clear()
+
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "Failed due to an unknown reason from another rank"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )

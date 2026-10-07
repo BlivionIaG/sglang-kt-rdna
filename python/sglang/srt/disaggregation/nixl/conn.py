@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any, Generic
 
 import numpy as np
 import numpy.typing as npt
@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from functools import reduce
 
 logger = logging.getLogger(__name__)
 
@@ -1078,3 +1079,139 @@ class NixlKVReceiver(CommonKVReceiver):
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):
     pass
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
+    if kinds is None:
+        return ["VRAM"] * expected_len
+    kinds = [str(kind) for kind in kinds]
+    if len(kinds) != expected_len:
+        raise ValueError(
+            f"kv_data_mem_kinds length mismatch: got {len(kinds)}, "
+            f"expected {expected_len}"
+        )
+    invalid = sorted(set(kinds) - KV_MEM_KINDS)
+    if invalid:
+        raise ValueError(f"Unsupported NIXL KV memory kind(s): {invalid}")
+    return kinds
+
+
+def _pack_kv_mem_kinds(kinds: List[str]) -> bytes:
+    return ",".join(kinds).encode("ascii")
+
+
+def _unpack_kv_mem_kinds(buf: bytes, expected_len: int) -> List[str]:
+    if not buf:
+        return ["VRAM"] * expected_len
+    return _normalize_kv_mem_kinds(buf.decode("ascii").split(","), expected_len)
+
+
+def _nixl_device_id(mem_kind: str, gpu_id: int) -> int:
+    return gpu_id if mem_kind == "VRAM" else 0
+
+
+def _homogeneous_kv_mem_kind(kinds: List[str], context: str) -> str:
+    unique = set(kinds)
+    if len(unique) != 1:
+        raise NotImplementedError(
+            f"NIXL {context} mixed KV memory kinds are not implemented safely yet: "
+            f"{sorted(unique)}"
+        )
+    return next(iter(unique))
+
+
+@dataclasses.dataclass(frozen=True)
+class _KVXferMemSegment:
+    start: int
+    end: int
+    src_mem_kind: str
+    dst_mem_kind: str
+
+
+def _kv_xfer_mem_segments(
+    src_kinds: List[str], dst_kinds: List[str]
+) -> List[_KVXferMemSegment]:
+    if len(src_kinds) != len(dst_kinds):
+        raise ValueError(
+            f"KV source/destination memory kind length mismatch: "
+            f"src={len(src_kinds)}, dst={len(dst_kinds)}"
+        )
+    if not src_kinds:
+        return []
+
+    segments = []
+    start = 0
+    cur = (src_kinds[0], dst_kinds[0])
+    for i, pair in enumerate(zip(src_kinds, dst_kinds)):
+        if pair == cur:
+            continue
+        segments.append(_KVXferMemSegment(start, i, cur[0], cur[1]))
+        start = i
+        cur = pair
+    segments.append(_KVXferMemSegment(start, len(src_kinds), cur[0], cur[1]))
+    return segments
+
+
+@dataclasses.dataclass
+class _KVXferPreparedSegment:
+    start: int
+    end: int
+    src_handle: Any
+    dst_handle: Any
+    dst_num_slots: int
+
+
+def expand_page_indices_for_slice(
+    page_indices: npt.NDArray[np.int32],
+    num_ptr_pairs: int,
+    num_slots: int,
+    page_size: int,
+    num_groups: int = 1,
+    head_group_idx: int = 0,
+) -> npt.NDArray[np.int32]:
+    """Map page slot indices to flat dlist indices for the slice prepped path.
+
+    Dlist layout: num_ptr_pairs blocks of (num_slots * page_size * num_groups),
+    with [slot, token, group] interleaving. head_group_idx selects one group (0 for dst).
+    """
+    token_offsets = np.arange(page_size, dtype=np.int32)
+    pair_stride = num_slots * page_size * num_groups
+    within_pair = (
+        page_indices[:, None] * (page_size * num_groups)
+        + token_offsets[None, :] * num_groups
+        + head_group_idx
+    ).ravel()
+    pair_offsets = np.arange(num_ptr_pairs, dtype=np.int64) * pair_stride
+    return (pair_offsets[:, None] + within_pair[None, :]).ravel().astype(np.int32)
+
+
+def num_kv_slots(kv_data_lens: List[int], kv_item_lens: List[int]) -> int:
+    """Slots every registered KV entry can address.
+
+    Prepared dlists index entry i's slot p as i * num_slots + p, so every entry
+    must expose the same count. Entries can have different lengths, so use
+    the shortest.
+    """
+    return min(
+        (
+            data_len // item_len
+            for data_len, item_len in zip(kv_data_lens, kv_item_lens)
+        ),
+        default=0,
+    )
+
+
+def repeat_indices_over_layers(
+    indices: npt.NDArray[np.int32], num_layers: int, layer_length: int
+) -> npt.NDArray[np.int32]:
+    """Map per-slot token indices to flat indices in a pre-built descriptor list.
+
+    Each of ``num_layers`` blocks has ``layer_length`` slots; block i is offset by
+    ``i * layer_length``. Works uniformly for both MLA (one ptr/layer) and MHA
+    (K+V ptrs, 2×N entries).
+    """
+    offsets = np.arange(num_layers, dtype=np.int32) * layer_length
+    return (offsets[:, None] + indices[None, :]).ravel().astype(np.int32)

@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 
@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from functools import partial
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -757,3 +758,52 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def should_force_retry(req: Req) -> bool:
+    """Test hook to force a request into optimistic prefill retry."""
+    retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
+    # Force only before/during the first attempt (count is 1 while it runs).
+    if retry_prob <= 0 or req.prefill_attempt_count > 1 or req.is_retracted:
+        return False
+
+    digest = hashlib.sha256(str(req.rid).encode()).digest()
+    return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def _uses_write_through_cache(cache: object) -> bool:
+    return (
+        isinstance(cache, UnifiedRadixCache)
+        and cache.cache_controller is not None
+        and cache.cache_controller.write_policy == "write_through"
+    )
+
+
+def _transfer_start_layer(*, pool, hf_text_config) -> int:
+    # Hybrid pools count all layers in start_layer, but peer KV lists contain only
+    # full-attention layers, so translate to a full-attention-relative offset.
+    if not isinstance(pool, HybridLinearKVPool):
+        return pool.start_layer
+    return sum(
+        1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
+    )
+
+
+def maybe_release_metadata_buffer(
+    req: Req, allocator: ReqToMetadataIdxAllocator
+) -> None:
+    """
+    Release the metadata buffer index allocated for a request in prefill disaggregation mode.
+
+    This function safely releases the metadata buffer index if it was allocated.
+
+    Args:
+        req: The request object that may have a metadata_buffer_index allocated
+        allocator: The ReqToMetadataIdxAllocator instance to free the index
+    """
+    if req.metadata_buffer_index >= 0:
+        allocator.free(req.metadata_buffer_index)
+        req.metadata_buffer_index = -1

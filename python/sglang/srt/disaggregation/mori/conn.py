@@ -1105,3 +1105,108 @@ class MoriKVReceiver(CommonKVReceiver):
 
 class MoriKVBootstrapServer(CommonKVBootstrapServer):
     pass
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _normalize_state_indices_per_component(
+    state_indices: Optional[List],
+) -> Optional[List[Optional[npt.NDArray[np.int32]]]]:
+    if state_indices is None:
+        return None
+    out: List[Optional[npt.NDArray[np.int32]]] = []
+    for entry in state_indices:
+        if entry is None:
+            out.append(None)
+        else:
+            out.append(np.asarray(entry, dtype=np.int32).ravel())
+    return out
+
+
+def _pack_state_indices(
+    state_indices: Optional[List[Optional[npt.NDArray[np.int32]]]],
+) -> bytes:
+    if not state_indices:
+        return b""
+    lists = [(arr.tolist() if arr is not None else []) for arr in state_indices]
+    return pack_int_lists(lists, "i")
+
+
+def _unpack_state_indices(buf: bytes) -> List[npt.NDArray[np.int32]]:
+    if not buf:
+        return []
+    return [np.asarray(lst, dtype=np.int32) for lst in unpack_int_lists(buf, "i")]
+
+
+def _pack_mem_desc_lists(mems_per_comp: List[List[MemoryDesc]]) -> bytes:
+    if not mems_per_comp:
+        return b""
+    return msgspec.msgpack.encode(
+        [[mem.pack() for mem in comp] for comp in mems_per_comp]
+    )
+
+
+def _unpack_mem_desc_lists(blob: bytes) -> List[List[MemoryDesc]]:
+    if not blob:
+        return []
+    nested = msgspec.msgpack.decode(blob)
+    return [[MemoryDesc.unpack(b) for b in comp] for comp in nested]
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupedIndexPlan:
+    src_starts: List[int]
+    dst_starts: List[int]
+    counts: List[int]
+
+    @classmethod
+    def from_groups(
+        cls, src_groups: List[List[int]], dst_groups: List[List[int]]
+    ) -> GroupedIndexPlan:
+        if len(src_groups) != len(dst_groups):
+            raise ValueError("Source and destination groups must have the same length")
+        return cls(
+            src_starts=[int(group[0]) for group in src_groups],
+            dst_starts=[int(group[0]) for group in dst_groups],
+            counts=[len(group) for group in src_groups],
+        )
+
+    def materialize(self, item_len: int) -> BatchTransferPlan:
+        return BatchTransferPlan(
+            local_offsets=[start * item_len for start in self.src_starts],
+            remote_offsets=[start * item_len for start in self.dst_starts],
+            sizes=[count * item_len for count in self.counts],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchTransferPlan:
+    local_offsets: List[int]
+    remote_offsets: List[int]
+    sizes: List[int]
+
+    def empty(self) -> bool:
+        return not self.sizes
+
+
+@dataclasses.dataclass(frozen=True)
+class TransferTarget:
+    info: TransferInfo
+    peer_info: KVArgsRegisterInfo
+
+
+class _MoriTransferSubmissionError(RuntimeError):
+    def __init__(self, message: str, statuses: List[TransferStatus]):
+        super().__init__(message)
+        self.statuses = statuses
+
+
+class _SubmissionLocal(threading.local):
+    """Per-thread sink for statuses issued by a submission still in progress.
+
+    `statuses` is None outside a tracked submission, so a leaf that records
+    into it is a no-op on threads that are not submitting.
+    """
+
+    statuses: Optional[List[TransferStatus]] = None
