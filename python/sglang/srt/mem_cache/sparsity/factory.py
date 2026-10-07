@@ -124,3 +124,11 @@ def register_sparse_coordinator(coordinator: SparseCoordinator) -> None:
 
 def get_sparse_coordinator() -> Optional[SparseCoordinator]:
     return _global_sparse_coordinator
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def parse_hisparse_config() -> SparseConfig:
+    """The hisparse config as resolved, with defaults where none was given."""
+    return _parse_sparse_config()

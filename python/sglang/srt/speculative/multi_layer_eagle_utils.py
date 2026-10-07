@@ -15,6 +15,7 @@
 import torch
 import triton
 import triton.language as tl
+from copy import copy
 
 
 @triton.jit
@@ -348,3 +349,32 @@ def assign_hidden_states_pool_torch(
         req_to_hidden_states_pool[pool_idx, :pool_size, :].copy_(
             hidden_states[end_loc - pool_size : end_loc, :]
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def boundary_kv_fix_enabled() -> bool:
+    return envs.SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX.get()
+
+
+def compute_widened_draft_extend_locs_positions(
+    seq_lens,
+    req_pool_indices,
+    req_to_token,
+    stash_valid_lens,
+    draft_token_num: int,
+    num_front_tokens: int,
+    num_warmup_tokens: int,
+):
+    """Batched out_cache_loc + positions for the widened draft-extend window,
+    from pre-verify state. Invalid/warm-up front rows write to sacrificial loc 0."""
+    return compute_widened_draft_extend_locs_positions_triton(
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        stash_valid_lens,
+        draft_token_num,
+        num_front_tokens,
+        num_warmup_tokens,
+    )

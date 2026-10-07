@@ -265,3 +265,21 @@ class DraftBackendFactory:
         )
 
         return DeepseekV4BackendRadix(self.draft_model_runner, skip_prefill=False)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
+    """Refuse a multi-step draft decode backend for a draft with conv layers."""
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(
+        draft_model_runner.model_config.hf_config,
+        (InklingModelConfig, InklingMMConfig),
+    ):
+        raise NotImplementedError(
+            "Inkling's draft model runs its own short convs, which need the "
+            "conv-state sidecar the multi-step draft decode backend cannot carry. "
+            "Use --enable-multi-layer-eagle."
+        )

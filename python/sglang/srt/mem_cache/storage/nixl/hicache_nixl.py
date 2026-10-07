@@ -620,3 +620,35 @@ class HiCacheNixl(HiCacheStorage):
         )
 
         return results_set
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
+    """Split NIXL FILE storage directory config into ordered unique paths."""
+    if not raw:
+        return []
+    candidates = [path.strip() for path in raw.split(",")]
+    candidates = [path for path in candidates if path]
+    seen: dict[str, str] = {}
+    ordered: List[str] = []
+    for path in candidates:
+        real_path = os.path.realpath(path)
+        if real_path in seen:
+            raise ValueError(
+                "SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR contains duplicate "
+                f"path {path!r} (same mount as {seen[real_path]!r})."
+            )
+        seen[real_path] = path
+        ordered.append(path)
+    return ordered
+
+
+@dataclass
+class _HybridPoolContext:
+    host_pool: HostKVCache
+    is_zero_copy: bool
+    bounce_set: Optional[torch.Tensor] = None
+    bounce_get: Optional[torch.Tensor] = None
+    bounce_page_bytes: int = 0

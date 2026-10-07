@@ -9,6 +9,8 @@ from typing import Any, List, Optional
 
 import requests
 import torch
+from functools import wraps
+from copy import copy
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
@@ -808,3 +810,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _normalize_tenant_id(value) -> str:
+    if value is None:
+        return DEFAULT_TENANT_ID
+    tenant_id = str(value).strip()
+    return tenant_id if tenant_id else DEFAULT_TENANT_ID

@@ -22,16 +22,22 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2, is_xpu
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+_is_xpu = is_xpu()
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    # Moved under TYPE_CHECKING: `Req` is used only in annotations here, and a
+    # module-scope import created a cycle through schedule_batch ->
+    # disaggregation.decode_schedule_batch_mixin -> managers.overlap_utils ->
+    # speculative.spec_utils. Upstream does not import it at runtime either.
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 

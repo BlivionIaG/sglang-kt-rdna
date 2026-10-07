@@ -1,10 +1,11 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 import torch
 import torch.nn.functional as F
+from functools import partial
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
@@ -40,6 +41,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 if is_cuda():
     from sgl_kernel import (
@@ -819,3 +821,140 @@ class EagleVerifyOutput:
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@dataclass
+class EagleDraftExtendInput(SpecInput):
+    """Inputs to the draft-extend forward (the fill-draft-kvcache pass after
+    target prefill / verify).
+
+    Installed on `batch.spec_info` by the worker's `_draft_extend_for_*`
+    (and synthetically by draft-extend cuda-graph capture), then replaced
+    with a fresh `EagleDraftInput` for the next iter's draft.
+    """
+
+    # Target-model hidden states for the draft-extend forward; None when the
+    # draft doesn't read hidden_states (e.g., STANDALONE). Shape: decode
+    # (bs * num_draft_tokens, hidden), prefill (extend_num_tokens, hidden).
+    hidden_states: Optional[torch.Tensor] = None
+
+    # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
+    # Both kept for cuda-graph buffer indexing.
+    num_correct_drafts: torch.Tensor = None
+    num_accept_tokens: torch.Tensor = None
+    num_front_tokens: int = 0
+    # CPU view, read by attention backends during the extend forward.
+    num_accept_tokens_cpu: List[int] = None
+
+    # Per-req batch-state slices for the draft-extend forward:
+    #   - input_ids:        accept tokens flat over surviving reqs
+    #   - seq_lens / _cpu:  per-req sequence length (post-accept)
+    #   - req_pool_indices: per-req kv-pool slot
+    input_ids: torch.Tensor = None
+    seq_lens: torch.Tensor = None
+    seq_lens_cpu: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+
+    #   - positions: shape `[total_accepted]`.
+    #   - bonus_tokens: shape `[bs]`; read post-extend to populate next iter's
+    #     `EagleDraftInput.bonus_tokens`.
+    positions: Optional[torch.Tensor] = None
+    bonus_tokens: Optional[torch.Tensor] = None
+
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = 1
+
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_select: Optional[torch.Tensor] = None
+
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]). When set, the logits
+    # processor runs lm_head and LAST hidden capture only on these rows; FULL
+    # hidden capture remains unpruned.
+    select_index: Optional[torch.Tensor] = None
+
+    # None for draft-extend's idle batch; attention backends fall back to
+    # rebuilding plain metadata from seq_lens when this is None.
+    kv_indptr: torch.Tensor = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
+
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.num_correct_drafts is not None:
+            self.num_correct_drafts = pad_tensor_to_size(
+                self.num_correct_drafts, batch_size
+            )
+            self.num_accept_tokens = pad_tensor_to_size(
+                self.num_accept_tokens, batch_size
+            )
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST,
+    ) -> "EagleDraftExtendInput":
+        return cls(
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
+            num_correct_drafts=torch.empty((0,), device=device, dtype=torch.int32),
+            num_accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            num_accept_tokens_cpu=[],
+            input_ids=torch.empty((0,), device=device, dtype=torch.long),
+            seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
+        )
+
+    def generate_attn_arg_prefill(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: Optional[int],
+        req_to_token: torch.Tensor,
+    ):
+        device = req_pool_indices.device
+        bs = self.num_correct_drafts.numel()
+        # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
+        qo_indptr = torch.arange(
+            0,
+            (bs + 1) * self.num_tokens_per_req,
+            step=self.num_tokens_per_req,
+            dtype=torch.int32,
+            device=device,
+        )
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = cum_kv_seq_len[-1]
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device=device
+        )
+
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, cum_kv_seq_len, qo_indptr, None

@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
+from itertools import chain
+from copy import copy
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -706,3 +708,152 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
     def can_run(self, forward_batch):
         return self.runners[0].can_run(forward_batch)
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
+    MultiLayerEagleMultiStepDraftExtendCudaGraphRunner
+):
+    """Single-CG variant (SGLANG_ENABLE_SINGLE_CG_DRAFT): captures all draft steps'
+    forwards + the inter-step input_ids rotation in ONE graph per bucket, instead
+    of one graph per step. The worker drops its per-step rotation (rotates_in_graph).
+
+    Each step refreshes metadata in-graph or stages it before replay; no Python
+    may run between captured steps. seq_lens / req_pool_indices / extend_seq_lens
+    are chain-constant (only input_ids rotates).
+
+    Rejection sampling is supported by sampling X ~ q inside the graph
+    (_sample_draft_proposal, selected by the draft_probs buffer's presence):
+    the captured rotation then carries the sampled token, prepare() stages the
+    temperatures sampling_info cannot deliver in-graph, and the worker clones
+    the per-step q off buffers.draft_probs after replay. torch.multinomial
+    draws through the graph-registered Philox generator, so each replay gets
+    fresh coins.
+    """
+
+    rotates_in_graph = True
+
+    def _init_and_capture(self):
+        if self._cuda_graph_disabled():
+            self.runners = [None] * self.speculative_num_steps
+            return
+
+        self._create_runners()
+
+        self._on_runners_created()
+        self.buffers = self._allocate_buffers()
+
+        # No per-step capture: all steps are captured in one graph below.
+        for r in self.runners:
+            if r is not None:
+                r.buffers = self.buffers
+                if r.enable_torch_compile:
+                    set_torch_compile_config()
+                r.backend = resolve_decode_backend(r)
+
+        runners = [r for r in self.runners if r is not None]
+        first = runners[0]
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            "Capture single-CG draft extend begin. This can take several minutes. "
+            f"avail mem={before_mem:.2f} GB"
+        )
+        try:
+            with model_capture_mode():
+                for bs in reversed(first.capture_bs):
+                    self._capture_one_graph(bs, runners)
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture single-CG draft extend failed: {e}\n"
+                f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            "Capture single-CG draft extend end. "
+            f"elapsed={time.perf_counter() - tic:.2f} s, "
+            f"mem usage={(before_mem - after_mem):.2f} GB, avail mem={after_mem:.2f} GB."
+        )
+
+    def _capture_one_graph(self, bs: int, runners):
+        buffers = self.buffers
+        n = len(runners)
+
+        items = []
+        for r in runners:
+            num_tokens = bs * r.captured_req_width
+            forward_batch = r.get_forward_batch(bs)
+            forward_batch = r._postprocess_forward_batch(forward_batch, bs)
+            attn_backend = self.draft_extend_attn_backend_list[r.step]
+            with forward_context(ForwardContext(attn_backend=attn_backend)):
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
+                r.deepep_adapter.capture(is_extend_in_batch=True)
+            items.append((r, forward_batch, num_tokens, attn_backend))
+
+        def multi_step_fn():
+            outs = []
+            for i, (r, forward_batch, num_tokens, attn_backend) in enumerate(items):
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
+                with forward_context(ForwardContext(attn_backend=attn_backend)):
+                    ret = r._run_step_body(forward_batch, num_tokens, bs)
+                outs.append(ret)
+                if i < n - 1:
+                    rotate_input_ids(
+                        buffers.input_ids[: bs * self.captured_req_width],
+                        buffers.extend_start_loc[:bs],
+                        buffers.extend_seq_lens[:bs],
+                        ret.topk_index,
+                        buffers.select_index[:bs],
+                    )
+            return outs
+
+        first = runners[0]
+        # capture_one's warmup runs multi_step_fn, whose in-graph rotation mutates
+        # input_ids/hidden_states/select_index; snapshot and restore OUTSIDE the
+        # graph (an in-graph reset would clobber prepare()'s runtime writes).
+        input_ids_orig = buffers.input_ids.clone()
+        hidden_states_orig = buffers.hidden_states.clone()
+        select_index_orig = buffers.select_index.clone()
+
+        shape_key = first._make_graph_key(bs)
+        first.backend.capture_one(
+            shape_key,
+            multi_step_fn,
+            capture_inputs=None,
+            post_warmup_hook=getattr(
+                first.attn_backend, "on_after_cuda_graph_warmup", None
+            ),
+        )
+
+        buffers.input_ids.copy_(input_ids_orig)
+        buffers.hidden_states.copy_(hidden_states_orig)
+        buffers.select_index.copy_(select_index_orig)
+
+    def replay(self, step: int):
+        """Replays the one graph on step 0 and serves the rest from cache. The
+        first tuple element is the step's RAW (unsliced) LogitsProcessorOutput;
+        the single-CG worker path never consumes it."""
+        if step == 0:
+            first = self.runners[0]
+            for r in self.runners:
+                if r is not None:
+                    r.deepep_adapter.replay()
+            shape_key = first._make_graph_key(self.bs)
+            with device_timer_ctx(
+                first.model_runner.device_timer, "eagle_draft_extend"
+            ):
+                outs = first.backend.replay(shape_key, self._replay_spec_info)
+            raw_bs = self.raw_bs
+            self._cached = {}
+            non_null = [r for r in self.runners if r is not None]
+            for r, out in zip(non_null, outs):
+                self._cached[r.step] = (
+                    out,
+                    out.topk_p[:raw_bs],
+                    out.topk_index[:raw_bs],
+                )
+        return self._cached[step]

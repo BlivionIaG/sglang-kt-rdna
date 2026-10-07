@@ -1,9 +1,10 @@
 import contextlib
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 import torch
+from copy import copy
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -882,3 +883,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             load_format=recv_req.load_format,
         )
         return success, message
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _qsa_index_share_requested(hf_config) -> bool:
+    """--json-model-override-args writes top-level hf_config attributes, while
+    checkpoint configs carry the flag on the nested text_config; read both."""
+    text_config = getattr(hf_config, "text_config", hf_config)
+    return bool(
+        getattr(
+            text_config,
+            "index_share_for_mtp_iteration",
+            getattr(hf_config, "index_share_for_mtp_iteration", False),
+        )
+    )

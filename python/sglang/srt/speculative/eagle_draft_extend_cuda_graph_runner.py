@@ -532,3 +532,18 @@ class EAGLEDraftExtendCudaGraphRunner:
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]
         return out
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def resolve_draft_extend_seq_len_fill_value(
+    attn_backend, captured_req_width: int
+) -> int:
+    """Pad synthetic history past the fixed draft-width subtraction and KPool offset."""
+    fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
+    full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
+    if dsa_index_kpool > 1:
+        fill_value = max(fill_value, captured_req_width + dsa_index_kpool)
+    return fill_value

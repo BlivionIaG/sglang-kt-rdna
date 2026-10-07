@@ -3,6 +3,7 @@ import weakref
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from copy import copy
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -13,6 +14,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -469,3 +471,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+# Upstream moved SWATokenToKVPoolAllocator to mem_cache/allocator/swa.py and
+# kept this module's name; re-export it so existing importers
+# (`mem_cache/common.py`) keep working.
+from sglang.srt.mem_cache.allocator.swa import (  # noqa: F401,E402
+    SWATokenToKVPoolAllocator,
+)

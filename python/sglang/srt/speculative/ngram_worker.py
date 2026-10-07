@@ -284,3 +284,34 @@ class NGRAMWorker:
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def _derive_tree_links(
+    mask: np.ndarray, bs: int, draft_token_num: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-side (retrive_next_token, retrive_next_sibling), matching what
+    reconstruct_indices_from_tree_mask produces on device.
+
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate parent
+    is the largest such j < i, and both links follow from the parents alone.
+    """
+    tree = mask.reshape(bs, draft_token_num, draft_token_num)
+    node_order = np.arange(draft_token_num)
+    ancestors = tree & (node_order < node_order[:, None])
+    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
+
+    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    for b in range(bs):
+        # Descending scan, so every k > i is already recorded when i is reached.
+        earliest_child_of = {}
+        for i in reversed(range(draft_token_num)):
+            next_token[b, i] = earliest_child_of.get(i, -1)
+            parent = int(parents[b, i])
+            if parent >= 0:
+                next_sibling[b, i] = earliest_child_of.get(parent, -1)
+                earliest_child_of[parent] = i
+    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)

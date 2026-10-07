@@ -4,20 +4,25 @@ import dataclasses
 import time
 from abc import ABC, abstractmethod
 from typing import (
-    TYPE_CHECKING,
     Any,
+    Callable,
     NamedTuple,
     Optional,
     Protocol,
+    Sequence,
+    TYPE_CHECKING,
     Tuple,
     runtime_checkable,
 )
 
 import torch
+from enum import Enum, auto
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -227,3 +232,180 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheRequestHandle:
+    rid: str
+    attempt_id: int
+
+
+class CacheRequestOutcome(Enum):
+    SUCCESS = auto()
+    ABORT = auto()
+
+
+@dataclasses.dataclass
+class IncLockRefResult:
+    """Receipt returned by ``inc_lock_ref``.
+
+    ``node_id`` is the anchor the lock was taken on; a release replays the
+    receipt on that node only. A recorded UUID marks a segment boundary;
+    ``None`` means root, while an absent entry means no receipt.
+    ``skipped_lock_components`` records the components the acquire left
+    untaken, so the release leaves them untouched.
+    """
+
+    delta: Optional[int] = None
+    node_id: Optional[int] = None
+    skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def set_lock_uuid(
+        self,
+        component_type: ComponentType,
+        uuid: Optional[int],
+        *,
+        lock_host: bool = False,
+    ) -> None:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        uuids[component_type] = uuid
+
+    def to_dec_params(self) -> DecLockRefParams:
+        """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
+        return DecLockRefParams(
+            node_id=self.node_id,
+            skipped_lock_components=tuple(self.skipped_lock_components),
+            component_lock_uuids=dict(self.component_lock_uuids),
+            component_host_lock_uuids=dict(self.component_host_lock_uuids),
+        )
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    """Receipt required by unified-tree ``dec_lock_ref``.
+
+    A segment release requires its component's boundary entry; a missing
+    entry must not be treated as a lock reaching the root. ``node_id`` is
+    ``None`` only for receipts that never came from a unified-tree acquire
+    (legacy caches, session sentinels).
+    """
+
+    node_id: Optional[int] = None
+    skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def get_lock_uuid(
+        self, component_type: ComponentType, *, lock_host: bool = False
+    ) -> Optional[int]:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        return uuids[component_type]
+
+
+@dataclasses.dataclass
+class TreeLock:
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
+
+    node: Any
+    receipt: DecLockRefParams
+    swa_released: bool = False
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    """Result of an dec_lock_ref operation."""
+
+    delta: Optional[int] = None
+
+
+@dataclasses.dataclass
+class InitLoadBackParams:
+    """Unified parameters for init_load_back across different cache types."""
+
+    best_match_node: Any
+    host_hit_length: int
+    mem_quota: Optional[int] = None
+    req: Optional[Req] = None
+
+
+def zero_match_result(
+    tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
+) -> MatchResult:
+    if not tree_cache.supports_prefix_sharing():
+        # match_prefix already returns a miss; no root_node to walk back to.
+        return match_result
+    root = tree_cache.root_node_handle(extra_key=extra_key)
+    return match_result._replace(
+        # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
+        # without allocating a fresh empty tensor.
+        device_indices=match_result.device_indices[:0],
+        last_device_node=root,
+        last_host_node=root,
+        best_match_node=root,
+        host_hit_length=0,
+        swa_host_hit_length=0,
+        swa_branching_seqlen=None,
+        mamba_host_hit_length=0,
+        full_kv_hit_length=0,
+    )
+
+
+def _dfs_weight_order(
+    root_node: Any,
+    node_handles: Sequence[Any],
+    resolve_node_handle: Callable[[Any], Any],
+) -> list[int]:
+    last_node_to_indices: dict[Any, list[int]] = {}
+    for index, node_handle in enumerate(node_handles):
+        node = resolve_node_handle(node_handle)
+        last_node_to_indices.setdefault(node, []).append(index)
+
+    node_to_weight: dict[Any, int] = {
+        node: len(indices) for node, indices in last_node_to_indices.items()
+    }
+
+    stack: list[tuple[Any, bool]] = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            weight = node_to_weight.get(node, 0)
+            for child in node.children.values():
+                weight += node_to_weight.get(child, 0)
+            node_to_weight[node] = weight
+            continue
+        stack.append((node, True))
+        for child in reversed(list(node.children.values())):
+            stack.append((child, False))
+
+    order: list[int] = []
+
+    stack = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            order.extend(last_node_to_indices.get(node, ()))
+            continue
+        children = list(node.children.values())
+        children.sort(key=lambda child: -node_to_weight.get(child, 0))
+        stack.append((node, True))
+        for child in reversed(children):
+            stack.append((child, False))
+    return order

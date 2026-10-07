@@ -187,3 +187,26 @@ if __name__ == "__main__":
         )
     )
     logger.info(f"✅ All tests passed")
+
+
+# --- imported with the qwen4 subsystem (sgl-project/sglang) ---
+
+
+def make_hicache_storage_config(
+    *,
+    is_mla_model: bool,
+    tp_rank: int,
+    tp_size: int,
+) -> HiCacheStorageConfig:
+    return HiCacheStorageConfig(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=is_mla_model,
+        enable_storage_metrics=False,
+        is_page_first_layout=True,
+        model_name=None,
+    )

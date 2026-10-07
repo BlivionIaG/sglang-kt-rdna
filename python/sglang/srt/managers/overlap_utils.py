@@ -9,6 +9,7 @@ from copy import copy
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import get_compiler_backend, is_npu
+import msgspec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
