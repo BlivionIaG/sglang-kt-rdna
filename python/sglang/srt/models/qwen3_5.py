@@ -80,6 +80,13 @@ from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weigh
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+# Imported with the qwen4 subsystem (sgl-project/sglang): the Qwen4-Exp text
+# config carries model_type "qwen4_exp_text" and reuses the Qwen3.5-MoE text
+# classes. Upstream names the tuple and tests membership against it; this fork
+# compared to the bare string, so every qwen4_exp layer build raised
+# "Invalid model type: qwen4_exp_text".
+_QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -565,7 +572,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -770,7 +777,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        elif config.model_type == "qwen3_5_moe_text":
+        elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1104,7 +1111,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         linear_value_dim = (
             config.linear_num_value_heads * config.linear_value_head_dim
         )
-        if config.model_type == "qwen3_5_moe_text":
+        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             intermediate_size = config.shared_expert_intermediate_size
         else:
             intermediate_size = config.intermediate_size
