@@ -97,6 +97,9 @@ fi
 # in the server log, and --disable-radix-cache throws away prefix reuse on every request.
 # Either can still be turned off for debugging:
 #   DISABLE_RADIX=1 / DISABLE_CUDA_GRAPH=1
+# NOTE: caller-supplied flags are forwarded via "$@" at the exec below. Without that,
+# extra arguments are SILENTLY DROPPED -- which is how --cuda-graph-backend-prefill=disabled
+# appeared to be ignored while prefill graph capture proceeded anyway.
 ARGS=(
   --model-path "$MODEL"
   --kt-weight-path "$MODEL"
@@ -122,8 +125,8 @@ if [ "${ISOLATE:-0}" = "1" ]; then
   echo "running under systemd-run --scope -p MemoryMax=$MEMCAP -p MemorySwapMax=$MEMSWAP"
   exec systemd-run --user --scope --collect \
     -p MemoryMax="$MEMCAP" -p MemorySwapMax="$MEMSWAP" \
-    python3 -m sglang.launch_server "${ARGS[@]}"
+    python3 -m sglang.launch_server "${ARGS[@]}" "$@"
 fi
 
-exec python3 -m sglang.launch_server "${ARGS[@]}"
+exec python3 -m sglang.launch_server "${ARGS[@]}" "$@"
 
