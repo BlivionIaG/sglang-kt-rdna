@@ -240,3 +240,24 @@ Recorded because these are the traps a reader would hit, not war stories:
   threads over 65.6 GiB of host RAM. That is the cost of the offload, and it is the trade that
   makes the model fit at all.
 - **`max_running_requests=1`.** This is a single-stream configuration; concurrency is untested.
+
+---
+
+## Provenance
+
+Every figure was checked back against a log line from the session that produced it:
+
+| figure | source |
+|---|---|
+| 65.63 / 47.75 / 10.16 / 123.53 GiB | summed from `model.safetensors.index.json` with `safe_open` |
+| 1.31x in-kernel overhead | kernel OOM record (`anon-rss:72665692kB` at 40/48 layers) vs the same 40 layers on disk |
+| TTFT / ITL / prefill / decode, both rows | `sglang.bench_serving` output for each run |
+| 42 shapes OOM | `torch.AcceleratorError: CUDA error: out of memory` at `avail_mem=0.01 GB` |
+| 12 shapes in 103 s / 1.20 GB | `Capture target prefill CUDA graph end. elapsed=102.93 s` |
+| `cuda graph: True` | decode batch lines in the server log (`x10` during the benchmark) |
+| 53,440 / 86,528 tokens | `KV Cache is allocated ... #tokens:` and `max_total_num_tokens=` |
+| segfault under both phases | `scheduler_0 (pid=33237) crashed with exit code -11` |
+
+Log files, on the host: `/tmp/bench-c1.log` and `/tmp/bench2.log` (the two benchmark rows),
+`/tmp/plb5.log` (graphs off), `/tmp/plb9.log` (both graph phases, segfault), `/tmp/plbA.log`
+(decode-only, stable), `/tmp/plbB.log` (the 86,528-token ceiling).
