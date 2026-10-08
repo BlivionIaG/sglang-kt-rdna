@@ -262,67 +262,171 @@ Log files, on the host: `/tmp/bench-c1.log` and `/tmp/bench2.log` (the two bench
 `/tmp/plb5.log` (graphs off), `/tmp/plb9.log` (both graph phases, segfault), `/tmp/plbA.log`
 (decode-only, stable), `/tmp/plbB.log` (the 86,528-token ceiling).
 
-## GPU experts: why `--kt-num-gpu-experts` cannot work on this card
+## GPU experts: reachable, 38% faster, and not yet safe to deploy
 
 The Docker Hub page for `blivioniag/sglang-kt` calls expert placement "the single biggest lever on
 this stack" and warns that the `uniform` strategy regresses throughput. We were running
-`--kt-num-gpu-experts 0` with placement `uniform` — the worst of both. Turning offload on does not
-work here, and the reason is worth recording because it is *not* configuration.
+`--kt-num-gpu-experts 0` with `--kt-expert-placement-strategy uniform` — the worst of both. Getting
+offload working took **two real bug fixes and one wrong verdict from me**, and the result is faster
+but unstable. All of it is recorded here because the failure modes matter more than the launch line.
 
-Setting `g=8 --kt-expert-placement-strategy frequency` exposed **three** separate blockers:
-
-**1. A real bug — width mismatch (fixed).** `w13_input_scale` is created as
-`(num_experts, num_shards)` = 512 and marked `_sglang_require_global_experts`, so it survives
-weight loading at global width, while `w13_weight_scale_2` is sized from `num_local_experts` —
-which the KT wrapper overwrites to the GPU subset (48 x 8 = 384). The `else` branch at
-`modelopt_quant.py:2730` multiplied the two unreconciled:
+### Bug 1 — width mismatch in the GEMM1 alphas (fixed)
 
     RuntimeError: The size of tensor a (512) must match the size of tensor b (384)
+      at modelopt_quant.py:2325 in _compute_gemm1_alphas
 
-Fixed by reducing to the local-expert window via the file's own `_input_scale_to_local_experts`
-helper (applied to `w2_input_scale` too, which carried the same latent mismatch).
+`w13_input_scale` is created as `(num_experts, num_shards)` = 512 and marked
+`_sglang_require_global_experts`, so it survives weight loading at **global** width, while
+`w13_weight_scale_2` is sized from `layer.num_local_experts` — which the KT wrapper overwrites to
+the GPU-resident subset at `kt_ep_wrapper.py:5269` (48 MoE layers x 8 = 384). The `else` branch at
+`modelopt_quant.py:2730` kept 512 and multiplied the two. The sibling branches above it (2690,
+2697, 2706) each reduce to a scalar or a slice explicitly; this one did not.
 
-**2. A real bug — `g1_scale_c` never created (fixed).** The same `auto` backend is resolved two
-different ways: `__init__` reads the global (`enable_flashinfer_trtllm_moe` -> False, so weight
-prep skips `align_fp4_moe_weights_for_flashinfer_trtllm`), while `create_moe_runner` resolves it
-to `FLASHINFER_TRTLLM` and caches it, so `apply()` demands the attribute the other skipped:
+Fixed by reducing to the same local-expert window, reusing the file's own
+`_input_scale_to_local_experts` helper — and applied to `w2_input_scale` too, which carried the
+same latent mismatch.
+
+### Bug 2 — `g1_scale_c` never created (fixed)
 
     AttributeError: 'FusedMoE' object has no attribute 'g1_scale_c'
 
-Fixed by resolving `auto` identically in both places.
+The same `auto` backend is resolved two different ways. `__init__` (line 2351) read the GLOBAL
+predicate, so `enable_flashinfer_trtllm_moe` was False and `process_weights_after_loading` skipped
+`align_fp4_moe_weights_for_flashinfer_trtllm` — the only place `g1_scale_c` is ever created.
+`create_moe_runner` (3042-3050) resolves the SAME `auto` to `FLASHINFER_TRTLLM` and caches it, so
+`apply()` took the TRT-LLM branch and demanded the attribute the other had skipped.
 
-**3. A hard limit — no sm120 kernel (not fixable by patching).** With both fixes in, the load
-succeeds and the first forward dies:
+Fixed by resolving `auto` in `__init__` exactly as `create_moe_runner` does.
+
+**Why neither was ever hit:** at `g=0` the KT wrapper short-circuits at `kt_ep_wrapper.py:5989`
+(`if self.num_gpu_experts == 0`) and never calls `gpu_method.apply()` at all. Both defects are
+invisible on the only configuration anyone had run, which is why enabling offload is not the
+one-flag change the vendor page implies.
+
+### Getting it to actually serve: three backends, one that works
+
+With both fixes in, the load succeeds and the first forward dies:
 
     The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm120;
     this backend currently ships cubins for sm100, sm103 and sm107.
 
-`create_moe_runner` routes `auto` by capability alone (`>= (10,0)` -> TRT-LLM), and sm_120 passes
-that test while the TRT-LLM FP4 MoE cubins stop at sm107. Switching to
-`--moe-runner-backend marlin` (FP4 W4A16, no TRT-LLM cubins) **loads completely** — which also
-verifies fixes 1 and 2, since marlin traverses the same code — and then fails on one more
-missing cubin:
+`create_moe_runner` routes `auto` by capability alone (`>= (10,0)` -> TRT-LLM) and sm_120 passes
+that test while the TRT-LLM cubins stop at sm107 — so `auto` selects a backend this device cannot
+execute. Retried with `--moe-runner-backend marlin` (FP4 W4A16): it **loads completely** and then
+dies in `moe_sum_reduce`, a prebuilt cubin in `sgl_kernel`'s 1.07 GB `flash_ops.abi3.so` whose raw
+bytes contain `sm_90` and `sm_80` arch strings and **zero** occurrences of `sm_120`.
 
-    sgl_kernel/moe.py:90 moe_sum_reduce -> moe_sum_reduce CUDA kernel (small-token) launch failed
+The backend that works is the one the source already recommends:
 
-`moe_sum_reduce` is a prebuilt cubin in sgl_kernel's `flash_ops.abi3.so`; a byte scan of that
-1.07 GB library finds `sm_90` and `sm_80` arch strings and **zero** occurrences of `sm_120`.
-Two third-party wheels ship no kernel for this GPU. Fixing either means building that wheel for
-sm120 — a toolchain project, not a flag.
+    --moe-runner-backend flashinfer_cutlass
 
-### The tradeoff, measured
+It uses `fp4_gemm_cutlass_sm120.cu` — which exists — and avoids `moe_sum_reduce` entirely. **I had
+declared this path impossible before trying it**, having generalised from two failed backends; the
+`NotImplementedError` I had already quoted in this session ends with *"Use
+`--moe-runner-backend flashinfer_cutlass` instead."* The evidence for the right answer was on
+screen before the wrong conclusion was written.
 
-| config | KV pool |
-|---|---:|
-| `g=0` @ MEMFRAC 0.95 | **86,528 tokens** |
-| `g=8` @ MEMFRAC 0.95 (marlin) | 62,528 tokens |
+### The throughput win — and its context cost
 
-**8 GPU experts per layer cost 28% of the context pool** (86,528 -> 62,528), because they draw
-from the same VRAM as the KV cache. So expert offload is a throughput-for-context trade on this
-card, never a context win: **86,528 tokens remains the maximum usable context, and it is achieved
-at `g=0`.**
+`flashinfer_cutlass`, `g=8`, c=1, 16k in / 1k out, graphs on. Both runs produced **13,350 input
+tokens**, so the comparison is like-for-like:
 
-Both code bugs are real and fixed on this branch. Both would be absorbed by a future upstream
-`main` bump; neither is reachable at `g=0`, because `kt_ep_wrapper.py:5989` short-circuits
-`if self.num_gpu_experts == 0` before the GPU method is ever called — which is precisely why
-enabling offload is not the one-flag change the vendor page implies.
+| metric | `g=0` (CPU experts) | **`g=8` (GPU experts)** | change |
+|---|---:|---:|---|
+| prefill | 494.40 tok/s | **681.16** | **1.38x** |
+| decode | 8.74 tok/s | **12.04** | **1.38x** |
+| mean TTFT | 1,114 ms | **916 ms** | 1.22x faster |
+| mean ITL | 109.52 ms | **79.09 ms** | 1.38x faster |
+| mean E2E | 26,854 ms | **19,504 ms** | 1.38x faster |
+
+Context cost, measured per point:
+
+| config | KV pool | of the model's 262,144 |
+|---|---:|---:|
+| `g=0` @ MEMFRAC 0.95 | **86,528 tokens** | 33% |
+| `g=8` @ MEMFRAC 0.95 | 67,392 | 26% |
+| `g=8` @ MEMFRAC 0.88 | 44,736 | 17% |
+| `g=4` @ MEMFRAC 0.88 | 52,032 | 20% |
+
+**The non-obvious part: the headroom costs more than the experts.** At equal MEMFRAC, eight GPU
+experts per layer cost 19,136 tokens. Dropping 0.95 -> 0.88 to stop the first real request
+OOM-ing (it died at `avail mem 0.13 GB`) cost **22,656** — more than the experts themselves. With
+GPU experts resident, the safety margin, not the weights, dominates the context bill.
+
+### The stability finding that decides whether to use it
+
+**The `g>0` path segfaults nondeterministically.** Six full server runs:
+
+| run | g | MEMFRAC | tokens | segfault |
+|---|---:|---:|---:|---:|
+| plbA | 0 | 0.85 | 53,440 | 0 |
+| plbB | 0 | 0.95 | 86,528 | 0 |
+| g8cut | 8 | 0.95 | 67,392 | 0 |
+| g8cut2 | 8 | 0.88 | 44,736 | 0 |
+| sw_g4 (x2) | 4 | 0.88 | 52,032 | **2/2** |
+| **sw_g8b** | **8** | **0.88** | 44,736 | **1** |
+
+`sw_g8b` used the **same config that had been clean twice** and died anyway:
+
+    Subprocess scheduler_0 (pid=...) crashed with exit code -11
+
+The crash lands on the first real request, just after `#Input tokens: 13350`. Of six benchmark
+attempts, **exactly one completed**. `g=0` has never segfaulted across any run in this work.
+
+So: **GPU expert offload on this card is 38% faster and not yet trustworthy.** The speed is real;
+the stability is not. Do not deploy `g>0` for anything that must stay up, and treat any single
+successful run as luck until the crash is understood. My working hypothesis is the fused
+cutlass grouped-GEMM path over per-layer GPU-expert buffers, but I have not proven it, and I am
+not recording a guess as a diagnosis.
+
+### The frequency split is not actually frequency-based
+
+`--kt-expert-placement-strategy frequency` is set, but the logs say:
+
+    Using frequency-based strategy WITHOUT activation frequency data (uniform distribution fallback)
+
+`kt_ep_wrapper.py:4629` decides by the file extension:
+
+    init_loc = server_args.init_expert_location
+    has_activation_freq = init_loc and init_loc.endswith(".pt")
+
+`init_expert_location` already exists in this base — it is an EPLB field
+(`arg_groups/fields/exec_.py:819`) defaulting to the string `"trivial"`, which is not a path, so the
+fallback fires. Without a file, `activation_freq` is all ones and every expert ranks identically —
+the split is arbitrary, which is exactly the case the vendor says *regresses* placement.
+
+**So 681 tok/s is a floor, not a tuned result.** A genuine frequency split should do better.
+
+Getting one requires recording the distribution (the `expert_dist.pt` flow), and this rebuild lacks
+the recorder flags (`--record-kt-gpu-expert-distribution`,
+`--expert-distribution-recorder-mode`). The consumer side is present and waiting for a path.
+
+### Reproduce
+
+    PLE_BACKEND=file ISOLATE=1 MEMFRAC=0.88 MEMCAP=200G MEMSWAP=32G \
+      GPUEXPERTS=8 PLACEMENT=frequency \
+      ./scripts/run-qwen38-kt.sh --host 127.0.0.1 --port 8210 \
+      --moe-runner-backend flashinfer_cutlass \
+      --cuda-graph-backend-prefill=disabled
+
+Then bench with the served name and the real tokenizer:
+
+    python3 -m sglang.bench_serving --backend sglang-oai --base-url http://127.0.0.1:8210 \
+      --model /home/kletorch/models/qwen38-stage --served-model-name default \
+      --tokenizer /home/kletorch/models/qwen38-stage \
+      --dataset-name random --random-input-len 16384 --random-output-len 1024 \
+      --num-prompts 1 --max-concurrency 1
+
+Expect the server to segfault during that benchmark most of the time. That is the finding, not a
+setup error.
+
+### Provenance
+
+| figure | source |
+|---|---|
+| 494.40 / 8.74 tok/s, 1,114 ms TTFT, 109.52 ms ITL | `bench2.log`, `g=0`, 13,350 input tokens |
+| 681.16 / 12.04 tok/s, 916 ms TTFT, 79.09 ms ITL | `bench-g8cut.log`, `g=8`, 13,350 input tokens |
+| 86,528 / 67,392 / 52,032 / 44,736 tokens | `max_total_num_tokens=` in plbB / g8cut / sw_g4 / sw_g8b |
+| segfault | `Subprocess scheduler_0 ... exit code -11` in sw_g4, sw_g4b, sw_g8b |
+| missing sm120 cubins | `TrtllmGenBatchedGemmRunner ... contains no kernels runnable on sm120` |
+| uniform fallback | `Using frequency-based strategy WITHOUT activation frequency data` |
