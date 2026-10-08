@@ -261,3 +261,68 @@ Every figure was checked back against a log line from the session that produced 
 Log files, on the host: `/tmp/bench-c1.log` and `/tmp/bench2.log` (the two benchmark rows),
 `/tmp/plb5.log` (graphs off), `/tmp/plb9.log` (both graph phases, segfault), `/tmp/plbA.log`
 (decode-only, stable), `/tmp/plbB.log` (the 86,528-token ceiling).
+
+## GPU experts: why `--kt-num-gpu-experts` cannot work on this card
+
+The Docker Hub page for `blivioniag/sglang-kt` calls expert placement "the single biggest lever on
+this stack" and warns that the `uniform` strategy regresses throughput. We were running
+`--kt-num-gpu-experts 0` with placement `uniform` — the worst of both. Turning offload on does not
+work here, and the reason is worth recording because it is *not* configuration.
+
+Setting `g=8 --kt-expert-placement-strategy frequency` exposed **three** separate blockers:
+
+**1. A real bug — width mismatch (fixed).** `w13_input_scale` is created as
+`(num_experts, num_shards)` = 512 and marked `_sglang_require_global_experts`, so it survives
+weight loading at global width, while `w13_weight_scale_2` is sized from `num_local_experts` —
+which the KT wrapper overwrites to the GPU subset (48 x 8 = 384). The `else` branch at
+`modelopt_quant.py:2730` multiplied the two unreconciled:
+
+    RuntimeError: The size of tensor a (512) must match the size of tensor b (384)
+
+Fixed by reducing to the local-expert window via the file's own `_input_scale_to_local_experts`
+helper (applied to `w2_input_scale` too, which carried the same latent mismatch).
+
+**2. A real bug — `g1_scale_c` never created (fixed).** The same `auto` backend is resolved two
+different ways: `__init__` reads the global (`enable_flashinfer_trtllm_moe` -> False, so weight
+prep skips `align_fp4_moe_weights_for_flashinfer_trtllm`), while `create_moe_runner` resolves it
+to `FLASHINFER_TRTLLM` and caches it, so `apply()` demands the attribute the other skipped:
+
+    AttributeError: 'FusedMoE' object has no attribute 'g1_scale_c'
+
+Fixed by resolving `auto` identically in both places.
+
+**3. A hard limit — no sm120 kernel (not fixable by patching).** With both fixes in, the load
+succeeds and the first forward dies:
+
+    The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm120;
+    this backend currently ships cubins for sm100, sm103 and sm107.
+
+`create_moe_runner` routes `auto` by capability alone (`>= (10,0)` -> TRT-LLM), and sm_120 passes
+that test while the TRT-LLM FP4 MoE cubins stop at sm107. Switching to
+`--moe-runner-backend marlin` (FP4 W4A16, no TRT-LLM cubins) **loads completely** — which also
+verifies fixes 1 and 2, since marlin traverses the same code — and then fails on one more
+missing cubin:
+
+    sgl_kernel/moe.py:90 moe_sum_reduce -> moe_sum_reduce CUDA kernel (small-token) launch failed
+
+`moe_sum_reduce` is a prebuilt cubin in sgl_kernel's `flash_ops.abi3.so`; a byte scan of that
+1.07 GB library finds `sm_90` and `sm_80` arch strings and **zero** occurrences of `sm_120`.
+Two third-party wheels ship no kernel for this GPU. Fixing either means building that wheel for
+sm120 — a toolchain project, not a flag.
+
+### The tradeoff, measured
+
+| config | KV pool |
+|---|---:|
+| `g=0` @ MEMFRAC 0.95 | **86,528 tokens** |
+| `g=8` @ MEMFRAC 0.95 (marlin) | 62,528 tokens |
+
+**8 GPU experts per layer cost 28% of the context pool** (86,528 -> 62,528), because they draw
+from the same VRAM as the KV cache. So expert offload is a throughput-for-context trade on this
+card, never a context win: **86,528 tokens remains the maximum usable context, and it is achieved
+at `g=0`.**
+
+Both code bugs are real and fixed on this branch. Both would be absorbed by a future upstream
+`main` bump; neither is reachable at `g=0`, because `kt_ep_wrapper.py:5989` short-circuits
+`if self.num_gpu_experts == 0` before the GPU method is ever called — which is precisely why
+enabling offload is not the one-flag change the vendor page implies.
