@@ -2348,9 +2348,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
+        # Resolve `auto` the same way create_moe_runner does (3042-3050): on Blackwell
+        # auto becomes FLASHINFER_TRTLLM. Reading the GLOBAL predicate here treated auto as
+        # "not trtllm", so process_weights_after_loading skipped
+        # align_fp4_moe_weights_for_flashinfer_trtllm and never created g1_scale_c -- while
+        # apply() (which uses the resolved cached backend) demanded layer.g1_scale_c and died
+        # with AttributeError. Only reachable with --kt-num-gpu-experts > 0, because at 0 the
+        # kt wrapper short-circuits gpu_method.apply() entirely (kt_ep_wrapper.py:5989).
+        _backend = get_moe_runner_backend()
+        if _backend.is_auto():
+            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+                _backend = MoeRunnerBackend.MARLIN
+            else:
+                _backend = MoeRunnerBackend.FLASHINFER_TRTLLM
         self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            _backend.is_flashinfer_trtllm() or _backend.is_flashinfer_trtllm_routed()
         )
         # MegaMoE consumes canonical W13 directly, regardless of the nominal
         # runner.
@@ -2728,7 +2740,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
-            w2_input_scale = layer.w2_input_scale
+            # w13_input_scale is created as (num_experts, num_shards) and marked
+            # _sglang_require_global_experts, so it survives weight loading at GLOBAL width
+            # while w13_weight_scale_2 is sized from layer.num_local_experts. Under KT GPU-expert
+            # offload num_local_experts is the GPU subset (e.g. 384 of 512), so the multiply in
+            # _compute_gemm1_alphas mixed 512 x 384 and raised
+            # "The size of tensor a (512) must match the size of tensor b (384)".
+            # Reduce to the same local-expert window the weight scale covers.
+            if w13_input_scale.shape[0] != layer.num_local_experts:
+                w13_input_scale = _input_scale_to_local_experts(
+                    w13_input_scale,
+                    layer.num_local_experts,
+                    layer.num_experts,
+                    getattr(layer, "moe_ep_rank", 0),
+                )
+            w2_input_scale = _input_scale_to_local_experts(
+                layer.w2_input_scale,
+                layer.num_local_experts,
+                layer.num_experts,
+                getattr(layer, "moe_ep_rank", 0),
+            )
 
         use_cutedsl_w4a16 = (
             self._is_cutedsl_v2_standard
