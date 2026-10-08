@@ -1089,9 +1089,6 @@ def is_kt_ep_wrapper_disabled() -> bool:
 
 
 @contextmanager
-
-
-@contextmanager
 def speculative_kt_ep_disabled_context():
     """
     Context manager to disable KT EP wrapper for draft model operations.
