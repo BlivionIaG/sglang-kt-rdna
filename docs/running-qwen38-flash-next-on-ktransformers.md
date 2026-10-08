@@ -353,6 +353,34 @@ experts per layer cost 19,136 tokens. Dropping 0.95 -> 0.88 to stop the first re
 OOM-ing (it died at `avail mem 0.13 GB`) cost **22,656** — more than the experts themselves. With
 GPU experts resident, the safety margin, not the weights, dominates the context bill.
 
+### Why `g=16` cannot load at all: the mamba state cache is the real gate
+
+`g=16` never reaches serving. The load completes (all 48 layers, `NativeMoEWrapper` through layer
+32+), then:
+
+    max_running_requests is capped to 0 by the mamba state cache
+      (max_mamba_cache_size=2, 5 state slots per request).
+    RuntimeError: Hybrid (mamba/linear-attention) state cache is too small to serve any requests.
+      max_mamba_cache_size=2, mamba_ratio=5, resulting max_num_reqs=0
+
+`kv_cache_configurator.py:2344` derives the concurrency ceiling from the mamba pool, not the KV
+pool: `mamba_cap = max_mamba_cache_size // ratio`, and `mamba_cap <= 0` is fatal. On this hybrid
+model (36 linear-attention + 12 full-attention layers, `mamba_ratio=5`) the state cache is carved
+out of the same VRAM the GPU experts consume, so raising `g` squeezes it:
+
+| g | MEMFRAC | KV tokens | max_mamba_cache_size | serves? |
+|---:|---:|---:|---:|---|
+| 0 | 0.95 | 86,528 | — | yes |
+| 4 | 0.88 | 52,032 | 9 | yes (then segfault) |
+| 8 | 0.88 | 44,736 | 6 | yes (then segfault) |
+| **16** | **0.88** | **—** | **2** | **no — fatal at load** |
+
+This is the constraint the vendor recipe's "pay for `g` with the mamba cache, not the KV pool"
+rule is about, and it is the **binding one**: `g=16` fails at the mamba gate before any of the
+scheduling or crash questions arise. Raising it needs `--max-mamba-cache-size` or
+`--mamba-full-memory-ratio`, and **neither flag exists in this rebuild** (0 references in
+`server_args.py`), so on this card `g=16` is unreachable at this MEMFRAC by construction.
+
 ### The stability finding that decides whether to use it
 
 **The `g>0` path segfaults nondeterministically.** Six full server runs:
@@ -428,5 +456,7 @@ setup error.
 | 681.16 / 12.04 tok/s, 916 ms TTFT, 79.09 ms ITL | `bench-g8cut.log`, `g=8`, 13,350 input tokens |
 | 86,528 / 67,392 / 52,032 / 44,736 tokens | `max_total_num_tokens=` in plbB / g8cut / sw_g4 / sw_g8b |
 | segfault | `Subprocess scheduler_0 ... exit code -11` in sw_g4, sw_g4b, sw_g8b |
+| mamba gate | `max_running_requests is capped to 0 by the mamba state cache` in sw_g16 |
+| mamba sizes 9 / 6 / 2 | `max_mamba_cache_size=` in sw_g4 / sw_g8b / sw_g16 |
 | missing sm120 cubins | `TrtllmGenBatchedGemmRunner ... contains no kernels runnable on sm120` |
 | uniform fallback | `Using frequency-based strategy WITHOUT activation frequency data` |
