@@ -145,18 +145,47 @@ sglang reports its own numbers; these are quoted, not derived:
     max_total_num_tokens=53440, chunked_prefill_size=2048, max_prefill_tokens=16384,
       max_running_requests=1, context_len=262144, available_gpu_mem=3.63 GB
 
-**KV cost: 22,829 bytes/token** (measured: 1.22 GB of pool for 53,440 tokens). The model's full
-262,144-token context would need **5.57 GiB** of KV, and the GPU has ~3.3 GiB to give after
-weights, activations and graph capture. So the usable context is bounded by VRAM, not by the
-model — see the measured ceiling below.
+**KV cost: 22,829 bytes/token**, measured two ways and stable across both:
+
+    53,440 tokens -> K 0.61 GB + V 0.61 GB   (MEMFRAC=0.85)
+    86,528 tokens -> K 0.99 GB + V 0.99 GB   (MEMFRAC=0.95)
+
+## Max usable context: 86,528 tokens (measured, not modelled)
+
+The model advertises `context_len=262144`. On this card the real ceiling is **33% of that**,
+because VRAM — not the architecture — is the binding constraint. Measured by raising `MEMFRAC`
+and reading what sglang actually allocates:
+
+| MEMFRAC | KV pool allocated | of the model's 262,144 |
+|---:|---:|---:|
+| 0.75 | 20,416 tokens | 7.8% |
+| 0.85 | 53,440 tokens | 20% |
+| **0.95** | **86,528 tokens** | **33%** |
+
+At `MEMFRAC=0.95` the server reaches `health: 200`, answers coherently, and captures decode
+graphs (`elapsed=4.15 s, mem usage=0.26 GB`) with **zero segfaults**. `max_running_requests=2`.
+
+The full 262,144-token context would need **5.57 GiB** of KV. After 10.40 GiB of weights plus
+activations and the graph pool, a 15.93 GiB card cannot supply that. **The split that maximises
+context is `MEMFRAC=0.95` with decode-only graphs.**
+
+**A caution about modelling this.** A straightforward budget model — `pool = MEMFRAC x GPU -
+weights - overhead` — predicted ~146,000 tokens at 0.95, against the 86,528 sglang measured, an
+over-prediction of 69%. The per-token cost was right; the budget was wrong, because sglang
+reserves more for activations and fragmentation than the model allowed. Measure the pool; do
+not compute it.
 
 ---
 
 ## Reproduce
 
-    PLE_BACKEND=file ISOLATE=1 MEMFRAC=0.85 MEMCAP=200G \
+    # max context (86,528 tokens), verified serving:
+    PLE_BACKEND=file ISOLATE=1 MEMFRAC=0.95 MEMCAP=200G \
       ./scripts/run-qwen38-kt.sh --host 0.0.0.0 --port 8210 \
       --cuda-graph-backend-prefill=disabled
+
+    # the split the benchmark numbers above were taken at (53,440 tokens):
+    #   ... MEMFRAC=0.85 ...
 
 Prerequisites that are easy to get wrong:
 
