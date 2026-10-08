@@ -136,3 +136,77 @@ python3 -m sglang.bench_serving \
 
 A run that loaded but crashed during benchmarking is the common outcome for `g>0`. That is the
 finding, not a setup error.
+
+---
+
+## What else can be tuned — ranked, with the evidence
+
+The honest starting point: this rebuild exposes **22 CLI args total**. Most of the levers the
+vendor page and upstream recipes use do not exist here, so the list below separates what we can
+actually change from what would need a base bump.
+
+### Tier 1 — available now, untested, most likely to help
+
+**1. `--kt-cpuinfer` 16 -> 24 or 32.** The host has **32 logical CPUs** (16 cores x 2 threads,
+1 socket) and we give CPU inference **16 threads**. For Recipe A, where all 24,576 experts run on
+CPU, CPU inference is the throughput bottleneck — so this is the single most promising untested
+knob, and `--kt-cpuinfer` is already a script parameter (`CPUINFER`). Try 24 and 32 and compare
+prefill/decode with the bench command above. Watch for diminishing returns once the threads
+contend for the same cores.
+
+**2. `--kt-threadpool-count`.** Currently `1`, which the help says is "one-to-one with the number
+of NUMA nodes". This host reports `NUMA node(s): 1`, so `1` is already correct — **no change
+available here**, recorded so nobody re-derives it.
+
+**3. `--kt-max-deferred-experts-per-token`.** Present and untouched: "Maximum number of experts
+deferred to CPU per token; all MoE layers except the final one use this value." Not yet swept.
+Plausible small win for decode; needs a sweep to say.
+
+**4. `--kt-gpu-experts-ratio`** as an alternative to `--kt-num-gpu-experts` (0.0-1.0 of *all*
+experts). At ratio 0.0156 (= 8/512) it should reproduce `g=8`. Useful only for expressing a target
+fraction rather than a per-layer count; not a perf lever by itself.
+
+### Tier 2 — available, but blocked by something
+
+**5. `--kt-expert-placement-strategy frequency` with a real distribution.** The mechanism exists
+and the consumer is wired (`kt_ep_wrapper.py:4629`, reading `{"logical_count": ...}` from
+`init_expert_location`), but this rebuild cannot produce the `.pt`: `--record-kt-gpu-expert-distribution`
+and `--expert-distribution-recorder-mode` are both absent. **This is the highest-value missing
+piece** — it converts the arbitrary uniform split into a real frequency split, and the vendor
+measured that lever as worth ~2x on a 256-expert model. Anticipate it being worth less here (our
+top-10-of-512 routing is flatter than top-8-of-256), but it should still beat 681 tok/s.
+
+**6. `--kv-cache-dtype fp8_e4m3`** — would ~double the KV pool (the vendor measured 2.00x), i.e.
+86,528 -> ~173,000 tokens for Recipe A. **Absent from this build**; the string appears only in a
+docstring. Needs a base bump.
+
+**7. `--max-mamba-cache-size` / `--mamba-full-memory-ratio`** — the pair that would make `g=16`
+loadable. **Both absent** (0 references). Without them the mamba gate caps `g` at 8 on this card.
+
+### Tier 3 — structural, larger effort
+
+**8. Speculative decoding (MTP/NEXTN).** The vendor's best single-stream number (52.5 tok/s) comes
+from `--speculative-algorithm NEXTN` with a draft head. **`--speculative-algorithm` is absent**,
+and the checkpoint ships an MTP tensor that this build does not consume. Potentially the biggest
+single-stream win available anywhere on this list, and the largest piece of work.
+
+**9. `--cuda-graph-bs` / `--cuda-graph-max-bs`.** Absent. We capture 12 shapes via the config
+object instead, which already worked (both graphs captured, 103 s, 1.20 GB).
+
+**10. The `g>0` segfault.** Not a tuning item — a correctness blocker. Until it is understood,
+every throughput number from Recipe B is a number you cannot rely on. Hypothesis (unproven): the
+fused cutlass grouped-GEMM path over per-layer GPU-expert buffers.
+
+### What I would do first
+
+Run **#1** (`--kt-cpuinfer` 24/32 against Recipe A). It needs no new code, no base bump, and
+Recipe A is the configuration that has never crashed — so it is the one place a clean win is
+still available. Then, if the goal is throughput rather than context, revisit **#5**, which is a
+contained piece of work on this branch.
+
+### The trap to avoid
+
+Do **not** tune `g` upward to gain throughput. `g` costs context (28% of the pool at `g=8`), and
+its headroom costs more than the experts themselves. And `g=16` cannot load at all. If you want
+speed on this card, the tunable space is CPU threads and placement quality — not more experts on
+the GPU.
