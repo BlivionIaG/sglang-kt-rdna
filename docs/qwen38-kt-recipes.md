@@ -168,6 +168,35 @@ Correctness gate passed on the frequency run: `'The capital of France is'` -> `P
 `'17+25='` -> `42`, with `KV Cache is allocated. dtype: torch.bfloat16, #tokens: 72256` and
 `cuda_graph={prefill=0.00, decode=3.70}`, 0 segfaults.
 
+**Caveat on the speedup:** the uniform column above was measured against the 86,528-token pool at
+`MEMFRAC=0.95`, while the frequency run used `MEMFRAC=0.90` (72,256 tokens). The pools differ, so
+that pair is not strictly like-for-like. The like-for-like control at `MEMFRAC=0.90` **crashed
+before producing a number** — see below.
+
+### The like-for-like control crashed
+
+A uniform control at the *identical* settings (only `PLACEMENT` differs) reached serving with the
+same 72,256-token pool, then died during the same 16k/1k benchmark:
+
+```
+torch.AcceleratorError: CUDA error: invalid argument
+Copy is larger than memobj size, for destination operand
+Returning 1 (CUDA_ERROR_INVALID_VALUE) from cuGraphLaunch
+```
+
+…after two `memory allocation failed with OOM on device 0` warnings (67 MB and 100 MB).
+
+| event, same benchmark | uniform control | frequency |
+|---|---:|---:|
+| allocation failures | 2 | **0** |
+| scheduler exception / CUDA coredump | yes | **no** |
+| 16k/1k benchmark | died mid-run | **completed** |
+
+So at equal `MEMFRAC` the uniform placement needed more device memory and failed on CUDA graph
+replay where frequency placement finished. **Treat this as a hypothesis, not a fact** — it is one
+pair of runs, and this stack has already produced false stable/unstable verdicts from single runs
+(see the `sw_g8b` row above).
+
 **Do not combine frequency placement with `g>0` + `flashinfer_cutlass` yet.** That combination
 hangs the FlashInfer autotuner: it prints
 `[AutoTuner]: Tuning trtllm::fused_moe::gemm1: 0%| | 0/1 [00:00<?, ?profile/s]m: 512` and never
