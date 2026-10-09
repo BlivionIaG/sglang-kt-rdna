@@ -103,14 +103,86 @@ real; the reliability is not.
 
 ### Two caveats that bound both recipes
 
-1. **The frequency split is not frequency-based.** The logs report
+1. ~~**The frequency split is not frequency-based.**~~ **FIXED 2026-10-09.** The logs used to report
    `Using frequency-based strategy WITHOUT activation frequency data (uniform distribution
-   fallback)`: `kt_ep_wrapper.py:4629` gates on `init_loc.endswith(".pt")` and the EPLB field
-   `init_expert_location` defaults to the string `"trivial"`, so no file is read and every expert
-   ranks identically. **681 tok/s is a floor, not a tuned result.**
+   fallback)`: `kt_ep_wrapper.py` gated on `init_loc.endswith(".pt")` while the EPLB field
+   `init_expert_location` defaults to the string `"trivial"`, so no file was ever read and every
+   expert ranked identically. **681 tok/s was a floor, not a tuned result.** Three fixes (a
+   dedicated `--kt-expert-frequency-path` arg, a loader that accepts the recorder's real dump
+   format, and a per-layer-balanced mask generator) now make the strategy genuinely
+   frequency-driven — see "Frequency placement" below.
 2. **The headroom costs more than the experts.** At equal MEMFRAC, 8 GPU experts cost 19,136
    tokens; dropping 0.95 -> 0.88 to survive the first real request (it OOM'd at
    `avail mem 0.13 GB`) cost 22,656.
+
+---
+
+## Frequency placement — now real (fixed 2026-10-09)
+
+`--kt-expert-placement-strategy frequency` used to be a no-op that silently degraded to uniform.
+It now consumes a real activation-frequency table. Use `--kt-expert-frequency-path` — **not**
+`--init-expert-location`, which is an EPLB argument (setting it to a `.pt` makes
+`handle_eplb_and_dispatch` declare `ep_dispatch_algorithm="dynamic"`).
+
+```bash
+PLE_BACKEND=file ISOLATE=1 MEMFRAC=0.90 MEMCAP=200G MEMSWAP=32G \
+  GPUEXPERTS=0 PLACEMENT=frequency FREQPATH=/tmp/freq_model.pt \
+  ./run-qwen38-kt.sh --cuda-graph-backend-prefill=disabled
+```
+
+The frequency file may be an `ExpertDistributionRecorder` dump (a dict with `logical_count`, or
+one with `records` entries each carrying `logical_count` — which is what the recorder actually
+writes) or a raw tensor, shaped `[buffer_size, num_layers, num_experts]`. For this model that is
+`[N, 48, 512]`.
+
+Success looks like these two lines and **not** the fallback warning:
+
+```
+Loading activation frequency from /tmp/freq_model.pt
+Using frequency-based strategy with activation frequency data
+KT GPU experts: layer 0 (MoE) has 8 GPU experts      <- per-layer balanced
+```
+
+### What was broken, and the three fixes
+
+| # | blocker | fix |
+|---|---|---|
+| 1 | gate read `init_expert_location`, which defaults to `"trivial"` | new dedicated `--kt-expert-frequency-path` |
+| 2 | setting that EPLB arg flips `ep_dispatch_algorithm` to `dynamic` | the new arg is separate, so EPLB is untouched |
+| 3 | loader only accepted a top-level `logical_count`; a real recorder dump raised | accepts `records` too, and a raw tensor |
+| 4 | global `topk` put **all** GPU experts in the top ~9 layers; the other ~39 got zero | top-k **within each layer**, remainder to the hottest layers |
+
+Blocker 4 was measured on a skewed 48x512 table with a 384-expert budget: per-layer counts went
+from `[0,0,...,10,22,33,44,54,64,74,83]` to `[8]*48`.
+
+### Measured (g=0, c=1, 16,384 in / 1,024 out)
+
+| metric | uniform | frequency |
+|---|---:|---:|
+| input tok/s | 494.40 | **682.53** |
+| output tok/s | 8.74 | **12.07** |
+| mean TTFT | 1,114.03 ms | **649.82 ms** |
+| mean ITL | 109.52 ms | **80.10 ms** |
+
+Correctness gate passed on the frequency run: `'The capital of France is'` -> `Paris`, and
+`'17+25='` -> `42`, with `KV Cache is allocated. dtype: torch.bfloat16, #tokens: 72256` and
+`cuda_graph={prefill=0.00, decode=3.70}`, 0 segfaults.
+
+**Do not combine frequency placement with `g>0` + `flashinfer_cutlass` yet.** That combination
+hangs the FlashInfer autotuner: it prints
+`[AutoTuner]: Tuning trtllm::fused_moe::gemm1: 0%| | 0/1 [00:00<?, ?profile/s]m: 512` and never
+advances (GPU at 100%, identical gdb stack over minutes). The autotune cache is keyed by expert
+count and holds only the 192- and 384-expert shapes; frequency produces a shape it cannot
+profile. Frequency placement on `g=0` (above) is unaffected.
+
+### Two OOM traps when loading
+
+1. **`MEMFRAC=0.95` OOMs at decode capture** (`Tried to allocate 40.00 MiB`, 30 MiB free). Use 0.90.
+2. **Without `--cuda-graph-backend-prefill=disabled`, prefill capture OOMs** at
+   `Capturing prefill shape (num_tokens=2048, avail_mem=1.35 GB)`. Always pass the flag.
+3. A **second server still holding the GPU** fakes a construction-time OOM — the traceback ends
+   in `compute_initial_expert_location_metadata -> F.pad` while the other pid is resident.
+   Check `nvidia-smi` is near-idle before every load.
 
 ---
 
