@@ -2,6 +2,10 @@
 # No GPU is required: hipcc in the public ROCm PyTorch image compiles the
 # module when AMDGPU_TARGET is set. Runtime tests stay in
 # scripts/rdna/smoke_qwen3_moe.sh.
+#
+# That image's hipcc is the pip SDK under _rocm_sdk_core, which does not
+# ship rocThrust or hipSPARSE headers. scripts/rdna/prepare_pip_rocm_devel.sh
+# installs the matching rocm-sdk-devel wheel and exports ROCM_HOME.
 
 name: rdna-sgl-kernel
 
@@ -11,6 +15,7 @@ on:
       - "sgl-kernel/**"
       - "3rdparty/amd/sgl-kernel/**"
       - ".github/workflows/rdna-sgl-kernel.yml"
+      - "scripts/rdna/prepare_pip_rocm_devel.sh"
   workflow_dispatch:
 
 jobs:
@@ -39,6 +44,9 @@ jobs:
             -e AMDGPU_TARGET=${{ matrix.arch }} \
             rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0 \
             bash -c 'set -euo pipefail
+              bash /src/scripts/rdna/prepare_pip_rocm_devel.sh
+              # shellcheck disable=SC1091
+              source /tmp/rdna-rocm-env.sh
               pip install ninja setuptools wheel
               python setup_rocm.py build_ext --inplace
               found=$(find python -name "common_ops*.so" -print)
