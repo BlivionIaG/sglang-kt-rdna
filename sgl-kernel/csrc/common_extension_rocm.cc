@@ -47,8 +47,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
+#ifndef SGL_RDNA_NO_CUSTOM_AR
   /*
    * From csrc/allreduce
+   * gfx94/gfx95 only. RDNA builds leave these symbols out and use RCCL.
    */
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
@@ -109,6 +111,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
+#endif  // SGL_RDNA_NO_CUSTOM_AR
 
   /*
    * From csrc/moe

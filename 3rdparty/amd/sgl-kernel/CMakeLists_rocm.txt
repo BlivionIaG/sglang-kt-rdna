@@ -54,29 +54,48 @@ endif()
 # Set HIP architectures
 set(CMAKE_HIP_ARCHITECTURES ${AMDGPU_TARGETS})
 
-# FP8 macro selection
-# Always define HIP_FP8_TYPE_FNUZ=1 (for gfx942 and host compilation)
-# Additionally define HIP_FP8_TYPE_E4M3=1 when building for gfx950
-# The existing utils.h logic will pick the right one based on architecture
-set(SGL_FP8_MACROS "-DHIP_FP8_TYPE_FNUZ=1")
-
-if(AMDGPU_TARGETS MATCHES "gfx950")
-  list(APPEND SGL_FP8_MACROS "-DHIP_FP8_TYPE_E4M3=1")
-  message(STATUS "Multi-arch build: Enabling both HIP_FP8_TYPE_FNUZ (gfx942) and HIP_FP8_TYPE_E4M3 (gfx950)")
+# Arch policy lives in sgl-kernel/rdna_targets.py. gfx1030 and gfx1100 are
+# separate modules. gfx942 and gfx950 may still be combined.
+set(SGL_IS_RDNA OFF)
+set(SGL_ENABLE_FP8 ON)
+if(AMDGPU_TARGETS MATCHES "gfx1030" AND AMDGPU_TARGETS MATCHES "gfx1100")
+  message(FATAL_ERROR "Refusing to build gfx1030 and gfx1100 into one sgl-kernel module. WMMA code must not be loaded on gfx1030.")
+endif()
+if((AMDGPU_TARGETS MATCHES "gfx1030" OR AMDGPU_TARGETS MATCHES "gfx1100") AND
+   (AMDGPU_TARGETS MATCHES "gfx942" OR AMDGPU_TARGETS MATCHES "gfx950"))
+  message(FATAL_ERROR "Refusing to combine an RDNA arch with gfx942/gfx950 in one sgl-kernel module.")
+endif()
+if(AMDGPU_TARGETS MATCHES "gfx1030" OR AMDGPU_TARGETS MATCHES "gfx1100")
+  if(NOT (AMDGPU_TARGETS STREQUAL "gfx1030" OR AMDGPU_TARGETS STREQUAL "gfx1100"))
+    message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. An RDNA build must be exactly gfx1030 or gfx1100.")
+  endif()
+  set(SGL_IS_RDNA ON)
+  set(SGL_ENABLE_FP8 OFF)
+  message(STATUS "RDNA build ${AMDGPU_TARGETS}: FP8 off, custom all-reduce off, wave32, TopK dynamic smem 48 KiB")
+elseif(AMDGPU_TARGETS MATCHES "gfx950")
+  message(STATUS "CDNA build: HIP_FP8_TYPE_E4M3 for gfx950")
 elseif(AMDGPU_TARGETS MATCHES "gfx942")
-  message(STATUS "Single-arch build: Enabling HIP_FP8_TYPE_FNUZ for gfx942")
+  message(STATUS "CDNA build: HIP_FP8_TYPE_FNUZ for gfx942")
 else()
-  message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. Expected 'gfx942' or 'gfx950' or both.")
+  message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. Expected 'gfx942', 'gfx950', 'gfx1030', or 'gfx1100'.")
 endif()
 
-# TopK dynamic smem bytes
-# Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
-#   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-if(AMDGPU_TARGET_ONE STREQUAL "gfx942")
+set(SGL_FP8_MACROS "")
+if(SGL_ENABLE_FP8)
+  set(SGL_FP8_MACROS "-DHIP_FP8_TYPE_FNUZ=1")
+  if(AMDGPU_TARGETS MATCHES "gfx950")
+    list(APPEND SGL_FP8_MACROS "-DHIP_FP8_TYPE_E4M3=1")
+    message(STATUS "Multi-arch build: Enabling both HIP_FP8_TYPE_FNUZ (gfx942) and HIP_FP8_TYPE_E4M3 (gfx950)")
+  endif()
+endif()
+
+# TopK dynamic smem bytes.
+# gfx942 / gfx1030 / gfx1100: 64 KiB LDS per workgroup -> dynamic smem <= 48 KiB.
+# gfx950: keep the existing 128 KiB budget.
+if(SGL_IS_RDNA OR AMDGPU_TARGETS STREQUAL "gfx942")
   math(EXPR SGL_TOPK_DYNAMIC_SMEM_BYTES "48 * 1024")
 else()
+  # gfx950, and gfx942;gfx950, keep the previous 128 KiB budget.
   math(EXPR SGL_TOPK_DYNAMIC_SMEM_BYTES "32 * 1024 * 4")
 endif()
 
@@ -97,9 +116,6 @@ link_directories(${PLAT_LIB_DIR})
 
 # Sources
 set(SOURCES
-${PROJ_ROOT}/csrc/allreduce/custom_all_reduce.hip
-${PROJ_ROOT}/csrc/allreduce/deterministic_all_reduce.hip
-${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
 ${PROJ_ROOT}/csrc/common_extension_rocm.cc
 ${PROJ_ROOT}/csrc/elementwise/activation.hip
 ${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
@@ -111,6 +127,13 @@ ${PROJ_ROOT}/csrc/moe/moe_topk_softmax_kernels.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_sigmoid_kernels.hip
 ${PROJ_ROOT}/csrc/speculative/eagle_utils.hip
 )
+if(NOT SGL_IS_RDNA)
+  list(PREPEND SOURCES
+    ${PROJ_ROOT}/csrc/allreduce/custom_all_reduce.hip
+    ${PROJ_ROOT}/csrc/allreduce/deterministic_all_reduce.hip
+    ${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
+  )
+endif()
 set_source_files_properties(
   ${SOURCES}
   PROPERTIES
@@ -126,12 +149,22 @@ set(SGL_HIP_FLAGS
   -O3
   -std=c++17
   -DENABLE_BF16
-  -DENABLE_FP8
-  ${SGL_FP8_MACROS}
   -Wno-pass-failed
   -Wundefined-internal
   ${SGL_TOPK_MACROS}
 )
+if(SGL_ENABLE_FP8)
+  list(APPEND SGL_HIP_FLAGS -DENABLE_FP8 ${SGL_FP8_MACROS})
+endif()
+if(SGL_IS_RDNA)
+  list(APPEND SGL_HIP_FLAGS -DSGL_RDNA_WAVE32 -DSGL_RDNA_NO_FP8 -DSGL_RDNA_NO_CUSTOM_AR)
+  if(AMDGPU_TARGETS STREQUAL "gfx1100")
+    list(APPEND SGL_HIP_FLAGS -DSGL_ARCH_GFX1100)
+  endif()
+  if(AMDGPU_TARGETS STREQUAL "gfx1030")
+    list(APPEND SGL_HIP_FLAGS -DSGL_ARCH_GFX1030)
+  endif()
+endif()
 
 # Python extension
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})

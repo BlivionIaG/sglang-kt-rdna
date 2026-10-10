@@ -121,6 +121,18 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
         )
+    # PyTorch ROCm reports HIP tensors as is_cuda. gfx1030 copies the recurrent
+    # state with the torch path so this scatter does not depend on Triton.
+    # The state remains on dst.device, next to attention.
+    from sglang.srt.utils import is_gfx1030
+
+    if is_gfx1030():
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_torch import (
+            torch_mamba_state_scatter_with_mask,
+        )
+
+        torch_mamba_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
+        return
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:

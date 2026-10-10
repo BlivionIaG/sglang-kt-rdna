@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_hip,
     is_musa,
+    is_rdna,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -377,7 +378,13 @@ class GroupCoordinator:
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
-            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
+            if is_rdna():
+                logger.info(
+                    "[AR] All-reduce call path: RCCL "
+                    "(PyTorch NCCL backend; custom all-reduce is gfx94/gfx95 only)"
+                )
+            else:
+                logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:

@@ -129,7 +129,7 @@ class HashTopK(nn.Module):
         if envs.SGLANG_HACK_FORCE_TID2EID_ZERO.get():
             self.tid2eid.zero_()
 
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get() and not is_hip():
             from sglang.jit_kernel.deepseek_v4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
@@ -141,6 +141,10 @@ class HashTopK(nn.Module):
                 scoring_func=self.score_func,
             )
         else:
+            if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get() and is_hip():
+                logger.warning(
+                    "deepseek_v4 hash_topk JIT is CUDA-only. Using the torch HashTopK path on ROCm."
+                )
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
 
         if is_hip():

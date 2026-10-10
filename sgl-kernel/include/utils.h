@@ -341,6 +341,10 @@ inline bool getEnvEnablePDL() {
 
 #ifndef USE_ROCM
 #define WARP_SIZE 32
+#elif defined(SGL_RDNA_WAVE32)
+// gfx1030 and gfx1100 are wave32. The macro is passed for both host and
+// device compilation so launch geometry matches the device warp.
+#define WARP_SIZE 32
 #else
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define WARP_SIZE 64
@@ -374,7 +378,11 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else  // USE_ROCM
-#if HIP_FP8_TYPE_FNUZ
+#if defined(SGL_RDNA_NO_FP8)
+// gfx1030 and gfx1100 have no FP8 units. FP8_TYPE is intentionally not
+// defined here: an RDNA translation unit that instantiates an FP8 kernel
+// fails instead of silently using a CDNA format.
+#elif HIP_FP8_TYPE_FNUZ
 #include <c10/util/Float8_e4m3fnuz.h>
 using FP8_TYPE = c10::Float8_e4m3fnuz;
 constexpr auto FP8_E4M3_MAX = 224.0f;

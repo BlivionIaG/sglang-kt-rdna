@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_rdna,
     is_xpu,
 )
 
@@ -43,6 +44,10 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_rdna = is_rdna()
+if _is_rdna:
+    # AITER and vLLM custom ops are CDNA kernels. RDNA uses the torch RMSNorm.
+    _use_aiter = False
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -72,7 +77,7 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
-elif _is_hip:
+elif _is_hip and not _is_rdna:
     try:
         from vllm._custom_ops import fused_add_rms_norm, rms_norm
 

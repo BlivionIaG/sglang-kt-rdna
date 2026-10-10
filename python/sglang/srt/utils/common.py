@@ -111,6 +111,71 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+@lru_cache(maxsize=1)
+def get_gcn_arch_name() -> str | None:
+    """gfx name of device 0, without the target-feature suffix.
+
+    PyTorch ROCm reports this on ``torch.cuda`` device properties. Returns
+    None on NVIDIA and when no device is visible.
+    """
+
+    if not is_hip() or not torch.cuda.is_available():
+        return None
+    try:
+        name = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return None
+    if not name:
+        return None
+    return name.split(":")[0]
+
+
+@lru_cache(maxsize=1)
+def is_gfx1030() -> bool:
+    """RDNA2 wave32 parts this port builds for (gfx103x, including gfx1030)."""
+
+    arch = get_gcn_arch_name()
+    return arch is not None and arch.startswith("gfx103")
+
+
+@lru_cache(maxsize=1)
+def is_gfx1100() -> bool:
+    """RDNA3 parts this port builds for (gfx110x, including gfx1100)."""
+
+    arch = get_gcn_arch_name()
+    return arch is not None and arch.startswith("gfx110")
+
+
+@lru_cache(maxsize=1)
+def is_rdna() -> bool:
+    return is_gfx1030() or is_gfx1100()
+
+
+def rdna_default_attention_backend() -> str | None:
+    """Phase-0 attention. gfx1030 stays on torch. gfx1100 can use Triton.
+
+    GDN and QSA Triton kernels are a separate path: they already run on
+    gfx1030 with the vllm-rdna Triton pin, and this default does not disable
+    them.
+    """
+
+    if is_gfx1030():
+        return "torch_native"
+    if is_gfx1100():
+        return "triton"
+    return None
+
+
+def _disable_aiter_on_rdna() -> None:
+    """AITER is a CDNA library. Do not let it load on gfx1030 or gfx1100."""
+
+    if is_rdna():
+        os.environ["SGLANG_USE_AITER"] = "0"
+
+
+_disable_aiter_on_rdna()
+
+
 if is_hip():
     HIP_FP8_E4M3_FNUZ_MAX = 224.0
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
