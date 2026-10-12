@@ -1,0 +1,81 @@
+services:
+  pennyroyal:
+    image: ${PENNYROYAL_IMAGE:-ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.1}
+    command: ["${PENNYROYAL_PROFILE:-next}"]
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    init: true
+    restart: "no"
+    ports:
+      - "${PENNYROYAL_PORT:-8001}:8001"
+    shm_size: 16gb
+    stop_grace_period: 120s
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    security_opt:
+      # NIXL's POSIX backend uses io_uring, which Docker's default seccomp
+      # profile commonly blocks. This is narrower than privileged mode.
+      - seccomp=unconfined
+    environment:
+      TARGET_MODEL: ${TARGET_MODEL:-/models/RadixArk-Qwen3.8-Flash-Next-NVFP4}
+      DRAFT_MODEL: ${DRAFT_MODEL:-/models/Qwen3.8-27B-DFlash2}
+      CACHE_BASE: /cache
+      NIXL_STORAGE_BASE: /nixl
+      SGLANG_HICACHE_NIXL_MAX_CACHE_GB: ${SGLANG_HICACHE_NIXL_MAX_CACHE_GB:-0}
+      PENNY_HICACHE_SIZE_GB: ${PENNY_HICACHE_SIZE_GB:-}
+      # WSL2 host-memory workaround: true allocates the HiCache host pool with
+      # torch's pinned-memory allocator instead of cudaHostRegister'd mmap.
+      # Off (the default) keeps the native-Linux allocator.
+      SGLANG_HICACHE_TORCH_PINNED_ALLOC: ${SGLANG_HICACHE_TORCH_PINNED_ALLOC:-false}
+      PENNY_PLE_BACKEND: ${PENNY_PLE_BACKEND:-ram}
+      PENNY_PLE_NVME_MODEL: ${PENNY_PLE_NVME_MODEL:-/models/flash-next-ple}
+      # Online-FP8 kernel path: empty/unset is automatic (eligible Flash-Next
+      # SM120 launches use the accepted rowwise-FP8 paths on their own); a
+      # saved explicit false/true propagates unchanged as the private escape
+      # hatch. The 27b profile is unaffected (Triton GDN, no Next conversion).
+      SGLANG_SM120_ONLINE_MXFP8: ${SGLANG_SM120_ONLINE_MXFP8:-}
+      SGLANG_MM_PREPROCESS_DEVICE: ${SGLANG_MM_PREPROCESS_DEVICE:-cpu}
+      SGLANG_FORWARD_UNKNOWN_TOOLS: ${SGLANG_FORWARD_UNKNOWN_TOOLS:-true}
+      # Optional launcher-level reasoning-effort default (unset keeps the
+      # recipe's qualified medium; per-request reasoning_effort still wins).
+      PENNY_REASONING_EFFORT: ${PENNY_REASONING_EFFORT:-}
+      # Optional two-GPU experimental topology (TP1 qualified default).
+      # TP_SIZE does not grant GPU access: the single-GPU device_ids
+      # reservation below must also name both ids for TP2 to launch (see
+      # docker/pennyroyal/README.md); the recipe fails actionably otherwise.
+      TP_SIZE: ${TP_SIZE:-1}
+      # Optional operator workaround exported through the launcher for TP>1
+      # NCCL P2P/ACS isolation; empty leaves NCCL defaults untouched.
+      NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE:-}
+      # Accepted private override of the patched FlashInfer SM12x GDN prefill
+      # kernels. Empty keeps the Next startup files' qualified default (1); 0
+      # opts out. The 27b profile uses Triton GDN and does not read it.
+      FLASHINFER_GDN_FP16_ACCUM_MMA: ${FLASHINFER_GDN_FP16_ACCUM_MMA:-}
+      MAX_RUNNING_REQUESTS: ${MAX_RUNNING_REQUESTS:-4}
+      MAX_MAMBA_CACHE_SIZE: ${MAX_MAMBA_CACHE_SIZE:-24}
+      MAX_TOTAL_TOKENS: ${MAX_TOTAL_TOKENS:-}
+    volumes:
+      - type: bind
+        source: ${HOST_MODELS_ROOT:-./models}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_CACHE_BASE:-./cache}
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_NIXL_STORAGE_BASE:-./nixl}
+        target: /nixl
+        bind:
+          create_host_path: false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${NVIDIA_GPU:-0}"]
+              capabilities: [gpu]

@@ -1,0 +1,88 @@
+{
+  "schema": "release-notes/3.0.1",
+  "version": "3.0.1",
+  "status": {
+    "is_draft": false,
+    "publication_approved": true,
+    "published": true,
+    "container": "published; exact registry image passed startup, generation and tool smoke checks"
+  },
+  "source": {
+    "base": "b9f01d067f6a271d4b5b2ddc41960eb0095e2a86",
+    "reviewed_runtime_revision": "ed00862b0dc408a9f32b526f01de8ba3ae5ad85d",
+    "published_tag": "pennyroyal-v3.0.1",
+    "published_revision": "6ade93c1a4c52b595ada318466bc41ae190b2709",
+    "release_url": "https://github.com/jpezzulli/sglang-rtxpro6000/releases/tag/pennyroyal-v3.0.1"
+  },
+  "container": {
+    "digest": "sha256:a4a375812d617ddb1ce31c3fd95a8f672f66b623f1c4627d162a8b16a704a944",
+    "image": "ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.1",
+    "compressed_layer_bytes": 7654911094,
+    "build_url": "https://github.com/jpezzulli/sglang-rtxpro6000/actions/runs/38147162863",
+    "promotion_url": "https://github.com/jpezzulli/sglang-rtxpro6000/actions/runs/38154011160"
+  },
+  "changes": [
+    {
+      "issue": 64,
+      "summary": "Resolve the registered PLE table's CUDA device address once per allocation and use it in both gathers; unregister memory if address resolution fails.",
+      "profiles": [
+        "Flash-Next RAM PLE"
+      ]
+    },
+    {
+      "issue": 65,
+      "summary": "Use CACHE_BASE/tilelang for compiled kernels across native and container launchers, preserving explicit TILELANG_CACHE_DIR overrides.",
+      "profiles": [
+        "Flash-Next",
+        "27B"
+      ]
+    },
+    {
+      "issue": 66,
+      "summary": "Refresh the NVMe reader's source guard for the reviewed QSA and PLE source, retaining all required hook checks.",
+      "profiles": [
+        "Flash-Next NVMe PLE"
+      ]
+    },
+    {
+      "summary": "Print the Penny Royal release, source commit and local-modification marker at startup.",
+      "profiles": [
+        "Flash-Next",
+        "27B"
+      ]
+    }
+  ],
+  "validation": {
+    "date": "2026-10-11",
+    "focused_cpu_checks_passed": 84,
+    "review": "Accepted after independent review and correction",
+    "tilelang": "Published image reproduces UID1001/HOME=/ failure; staged entrypoint passes actual TileLang import and mounted-cache persistence across two disposable containers.",
+    "nvme": "Exact uploaded image registers the installed reader and applies all six required hooks; all 11 guard hashes match the shipped source.",
+    "cuda_symbol": "Resolved cudaHostGetDevicePointer through the actual container PyTorch dependency handle, CUDA 13.0; no GPU used.",
+    "wsl2": "Contributor hardware reproduction and testing; local regression tests use distinct mocked host/device addresses.",
+    "reused_runtime_qualification": "3.0 qualification and performance in release-3.0.json and RESULTS.md; no changes to model defaults, sampling or adaptive policy.",
+    "pending": [],
+    "container_smoke": "Exact uploaded image: external-config Flash-Next startup as UID1001 with HOME=/; generation, real tool call, tool-result continuation and post-test health passed. Public defaults retained, with only the model path changed. No new GPU Xids."
+  },
+  "contributors": [
+    {
+      "name": "alphastorm",
+      "url": "https://github.com/alphastorm",
+      "contribution": "WSL2 reproduction, pointer fix and testing"
+    },
+    {
+      "name": "Matt Sapp",
+      "url": "https://github.com/MattSapp",
+      "contribution": "Custom-UID report and persistent TileLang cache fix"
+    },
+    {
+      "name": "desva",
+      "url": "https://github.com/desva",
+      "contribution": "NVMe PLE source-guard report"
+    },
+    {
+      "name": "Penny Royal",
+      "contribution": "Implementation"
+    }
+  ]
+}

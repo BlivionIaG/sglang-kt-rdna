@@ -1,28 +1,15 @@
-from collections.abc import Mapping
-
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 
 
-def _coerce_qwen3_5_sub_config(config, config_class):
-    if config is None:
-        return config_class()
-    if isinstance(config, config_class):
-        return config
-    if isinstance(config, Mapping):
-        return config_class(**dict(config))
-    if isinstance(config, PretrainedConfig):
-        return config
-    if hasattr(config, "to_dict"):
-        return config_class(**config.to_dict())
-    return config
-
-
 class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
 
 class Qwen3_5TextConfig(Qwen3NextConfig):
@@ -31,6 +18,9 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
 
     def __init__(
         self,
+        # Qwen3.5 is dense; only its MoE variant has routed experts. Without this
+        # the count would inherit Qwen3Next's 512 default.
+        num_experts=None,
         **kwargs,
     ):
         # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
@@ -39,13 +29,12 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         if kwargs.get("rope_scaling") is None and rope_parameters is not None:
             kwargs["rope_scaling"] = rope_parameters
 
-        super().__init__(**kwargs)
-        # Use __dict__ to avoid transformers property redirect (rope_scaling -> rope_parameters)
-        if self.__dict__.get('rope_scaling') is None:
+        super().__init__(num_experts=num_experts, **kwargs)
+        if self.rope_scaling is None:
             self.rope_scaling = rope_parameters or {}
 
         # Keep both names for compatibility with model code paths that read either.
-        self.rope_parameters = rope_parameters or self.__dict__.get('rope_scaling', {})
+        self.rope_parameters = rope_parameters or self.rope_scaling
 
 
 class Qwen3_5Config(PretrainedConfig):
@@ -106,26 +95,21 @@ class Qwen3_5Config(PretrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
-        self.vision_config = _coerce_qwen3_5_sub_config(
-            vision_config, self.sub_configs["vision_config"]
-        )
-        self.text_config = _coerce_qwen3_5_sub_config(
-            text_config, self.sub_configs["text_config"]
-        )
+        if isinstance(vision_config, dict):
+            self.vision_config = self.sub_configs["vision_config"](**vision_config)
+        elif vision_config is None:
+            self.vision_config = self.sub_configs["vision_config"]()
+
+        if isinstance(text_config, dict):
+            self.text_config = self.sub_configs["text_config"](**text_config)
+        elif text_config is None:
+            self.text_config = self.sub_configs["text_config"]()
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
-        self.vision_config = _coerce_qwen3_5_sub_config(
-            getattr(self, "vision_config", vision_config),
-            self.sub_configs["vision_config"],
-        )
-        self.text_config = _coerce_qwen3_5_sub_config(
-            getattr(self, "text_config", text_config),
-            self.sub_configs["text_config"],
-        )
 
 
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
@@ -138,10 +122,14 @@ class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
 class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, num_experts=512, **kwargs):
+        super().__init__(num_experts=num_experts, **kwargs)
 
 
+# All Moe variant classes need explicit __init__ because the kw_only=True
+# dataclass decorator in transformers v5.5.3+ auto-generates __init__ for
+# subclasses, bypassing parent __init__ methods that set up attributes
+# (e.g. norm_topk_prob, rope_scaling) and convert sub-config dicts to objects.
 class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"
     sub_configs = {

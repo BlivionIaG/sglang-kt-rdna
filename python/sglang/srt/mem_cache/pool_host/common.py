@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+from collections import defaultdict
+
+import torch
+
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+
+logger = logging.getLogger(__name__)
+
+
+class HostTensorAllocator:
+    def __init__(self):
+        """Initialize the HostTensorAllocator."""
+        self.dtype = None
+        self.dims = None
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert (
+            device == "cpu"
+        ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
+        self.dtype = dtype
+        self.dims = dims
+        return alloc_mmap(dims, dtype)
+
+
+class ShmHostTensorAllocator(HostTensorAllocator):
+    def __init__(self):
+        super().__init__()
+        self.fds = []
+        self.mms = []
+
+    @property
+    def fd(self):
+        return self.fds[0] if self.fds else None
+
+    @property
+    def mm(self):
+        return self.mms[0] if self.mms else None
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert (
+            device == "cpu"
+        ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        self.dtype = dtype
+        self.dims = dims
+        from sglang.srt.mem_cache.storage.mmap import alloc_shm
+
+        tensor, fd, mm = alloc_shm(dims, dtype)
+        self.fds.append(fd)
+        self.mms.append(mm)
+        return tensor
+
+    def __del__(self):
+        for fd in getattr(self, "fds", []):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fds = []
+
+
+def get_allocator_from_storage(allocator_type):
+    if allocator_type == "mooncake":
+        try:
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeHostTensorAllocator,
+            )
+
+            return MooncakeHostTensorAllocator()
+        except ImportError:
+            logger.warning(
+                "Mooncake's tensor allocator requires mooncake >= 0.3.8.post1. "
+                "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'. "
+                "Fallback to use default allocator."
+            )
+            return HostTensorAllocator()
+    elif allocator_type == "mori":
+        try:
+            from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                UMBPHostTensorAllocator,
+            )
+
+            return UMBPHostTensorAllocator()
+        except (ImportError, RuntimeError) as exc:
+            logger.warning(
+                "UMBPHostTensorAllocator unavailable (%s). "
+                "Falling back to torch.empty-based allocator.",
+                exc,
+            )
+            return HostTensorAllocator()
+    elif allocator_type == "shm":
+        return ShmHostTensorAllocator()
+    else:
+        return HostTensorAllocator()
+
+
+def get_allocator_type() -> str:
+    """The host-allocator kind the published HiCache configuration asks for."""
+    from sglang.srt.runtime_context import get_memory
+
+    backend = get_memory().hicache_storage_backend
+    if backend == "shm":
+        return "shm"
+    if backend == "dynamic":
+        extra_config_str = get_memory().hicache_storage_backend_extra_config
+        if extra_config_str:
+            try:
+                config = json.loads(extra_config_str)
+                if config.get("allocator") == "shm":
+                    return "shm"
+            except Exception:
+                pass
+    return backend or "default"
+
+
+def _cuda_host_register(buffer: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    n_bytes = buffer.numel() * buffer.element_size()
+    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    if int(rc) != 0:
+        raise RuntimeError(
+            f"cudaHostRegister failed (rc={int(rc)}, "
+            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+            f"size={n_bytes}; host buffer is not pinned and device transfers "
+            f"may silently return stale data."
+        )
+
+
+def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    if int(rc) != 0:
+        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
+        logger.warning(
+            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
+            int(rc),
+            cudart.cudaGetErrorString(rc),
+            buffer.data_ptr(),
+        )
+
+
+def use_torch_pinned_host_allocator() -> bool:
+    """Opt-in torch cudaHostAlloc-backed host pools (WSL2 alias workaround).
+
+    WSL2 gives cudaHostRegister'd mmap memory a CUDA device alias distinct
+    from Tensor.data_ptr(), which HiCache kernels consume directly.
+    cudaHostAlloc'd memory is device-visible at its own UVA pointer. Native
+    Linux keeps the default host-register path unless the env is set.
+    """
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_HICACHE_TORCH_PINNED_ALLOC.get()
+
+
+def alloc_with_host_register(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator,
+) -> torch.Tensor:
+    """
+    Allocate tensor and register host memory with cudaHostRegister.
+    CudaHostRegister only applies when pin_memory=True.
+    """
+    if use_torch_pinned_host_allocator():
+        # WSL2 escape hatch: only the plain mmap-backed default allocator is
+        # replaceable by torch's pinned-memory pool (no cudaHostRegister, no
+        # host unregister). Subclass allocators carry ownership/storage
+        # contracts a torch buffer cannot honour (shm memfd fds exposed via
+        # HostKVCache.fd, mooncake/mori remote registration); replacing them
+        # silently would discard that contract, so refuse instead.
+        if type(allocator) is not HostTensorAllocator:
+            raise RuntimeError(
+                "SGLANG_HICACHE_TORCH_PINNED_ALLOC cannot replace "
+                f"{type(allocator).__name__}; torch pinned host allocation is "
+                "only supported for the default mmap host allocator."
+            )
+        return torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    if pin_memory:
+        _cuda_host_register(buffer)
+    return buffer
+
+
+def alloc_with_pin_memory(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+) -> torch.Tensor:
+    """
+    Allocate tensor using PyTorch's built-in pin_memory flag.
+    """
+    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    return buffer
+
+
+ALLOC_MEMORY_FUNCS = defaultdict(
+    lambda: alloc_with_host_register,
+    {
+        "npu": alloc_with_pin_memory,
+        "musa": alloc_with_pin_memory,
+    },
+)

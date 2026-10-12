@@ -1,0 +1,16 @@
+{
+  "source": "Pennyroyal v3.0.1",
+  "modules": {
+    "sglang.srt.layers.attention.qsa.kernel": "4892126cf6dfbf1a528929764460b09ca18836362b7651b25423b444ebbb6e76",
+    "sglang.srt.layers.attention.qsa.sparse_attn": "c7052125569f3c0fa9a0a4d62d2f57433faec636ad82a1d99c3b39e267b7904c",
+    "sglang.srt.layers.attention.qwen_sparse_attn_backend": "39f2d22d23f75fa86c8fc178c6d0cb89ffc56c743343ff804c85008cd716d2e6",
+    "sglang.srt.models.qwen4_exp": "17c09f26a878f45e7f70a634a9befe8e9fc5c5acf01795bd4e659b6d9c009a0c",
+    "sglang.srt.models.qwen3_5": "b5ad4ee89d8a82248cab3d799b4181e938c042d28b8b7cabded4c8cd8ccc1d6f",
+    "sglang.srt.model_executor.runner.decode_cuda_graph_runner": "ed359b9f3a0ad36bf290c4e71237fa9103e2b6ba82b28f4ef07ad2fe23e61140",
+    "sglang.srt.server_args": "39a0472496b813bb8ac26eeb4e83fd894753de3f7264683531b01d8a9f7334ea",
+    "sglang.srt.utils.offloader": "e9b97f8a78d3d5786af92abbf735de8f293f28a4314364c1c3c6634b89578d5c",
+    "sglang.srt.utils.common": "5e6bb30f4cf74288b61f5d0432a02e21791d256044b26dd74bb9a9d55e40f03a",
+    "sglang.srt.plugins.hook_registry": "fe214acac324cb2f019aa1dffe1ddcb6e4691862fdd1b6a0ad5033d8167e31e9",
+    "sglang.srt.plugins": "3a975a73f1a7887e68c81ea7a2530250597ac8ae978efc0b0f70f038a99a3164"
+  }
+}

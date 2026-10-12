@@ -1,0 +1,306 @@
+# SGLang RTX PRO 6000 source provenance
+
+## Source identity
+
+| Item | Value |
+|---|---|
+| Upstream | `https://github.com/sgl-project/sglang.git` |
+| Public documentation and distribution branch | `pennyroyal-main-sm120-final`; continues above the runtime release tag |
+| Core runtime source | `69583da7c71b87ac36371333a19f2749bab72773` |
+| Complete release source | Exact commit selected by `pennyroyal-v2.5.3`, including release packaging updates |
+| Integration base | `e7e78940168f3ba65c762a6f82fd8bc5b6ee04e3` |
+| Latest runtime additions | NEXTN checkpoint selection, BF16 NVMe PLE staging, streaming tools, prompt encoding and cache persistence |
+| Dependency base | `sglang==0.5.19.dev492+g836206a0a` with the updated v2.5.3 Python/JIT source |
+| Release | v2.5.3 |
+| Release tag | `pennyroyal-v2.5.3` |
+| Container build source | Exact commit selected by the release tag; also recorded in the image's OCI revision label |
+| Container image | `ghcr.io/jpezzulli/sglang-rtxpro6000:v2.5.3`; published after a successful build, with its digest recorded by the [release workflow](https://github.com/jpezzulli/sglang-rtxpro6000/actions/workflows/pennyroyal-container.yml) |
+
+The release includes launch recipes, documentation, and measurement summaries.
+v2.5.3 keeps the v2.5.0 dependency stack, optional Flash-Next online FP8 and
+NVMe PLE, CPU image preprocessing, RAM PLE default, and pinned
+[Froggeric v22.5 template](configs/pennyroyal/templates/README.md). The earlier
+27B release remains available as `qwen38-dflash2-pro6000-20260824`, with its
+results and lineage preserved in the current documentation. The former
+`jpezzulli/qwen38-dflash2-pro6000` repository URL redirects to
+`jpezzulli/sglang-rtxpro6000` and shares this source history.
+
+For the v2.1.1 update, upstream `main` was inspected at
+`cdbfe90b4a31079859817c148ef4498240ec2580` on 2026-08-29. Core Flash-Next
+PR #36497 remained unmerged, so the runtime was not rebased. Version 2.1 adopts
+the merged #35821 Mamba correction and the exact-SM120 QSA gate from #36806.
+Version 2.1.1 adds the DFlash additive-penalty correction related to open PR
+#33869 and completes merged HiCache load fencing from #36738 for Penny's active
+TVM-FFI JIT transfer paths.
+
+Version 2.1.2 adds only the one-rank sampler guard adapted from #37962 and the
+Qwen3 Coder streaming separator correction adapted from #37408. The #37448
+graph-lifetime trial remains in history with its complete revert; it contributes
+no change to the released graph implementation. Dependencies and launch
+settings are unchanged. [CHANGES.md](CHANGES.md) records the focused
+two-profile regression scope; existing performance results are not refreshed.
+
+## FlashInfer SM120 accepted source
+
+Pennyroyal ships two already accepted FlashInfer source changes, plus one
+build-only compatibility guard, packaged into the installed FlashInfer of every
+native environment and into the release image by
+`scripts/pennyroyal/flashinfer/install.py`:
+
+| Item | Value |
+|---|---|
+| Pinned distribution | `flashinfer_python[cu13]==0.7.0.post1`, wheel SHA-256 `c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716` |
+| JIT-cache family | `flashinfer-jit-cache` and `flashinfer-jit-cache-sm120f` at `0.7.0.post1+cu130`; the image installs both with `--no-deps`, and the packaging step refuses a stale shim from the 0.6.17 line instead of failing inside the compile |
+| FlashInfer preimage | upstream base `946200de1ae94fc93fdd0926f0a13afd1fa7f0f1` |
+| Carried mailboxes | `scripts/pennyroyal/flashinfer/patches/moe-source.patch`, `patches/gdn-source.patch` (git-format-patch, production files only), `patches/asan-include-compat.patch` (build-only, one stock file) |
+| MoE commits | `5e86c489f5759cb4006d3b1b5e7bdd14f7a581df`, `b9fa8893102dc3bbcec92762230e7f1678644a4e`, `2a4d8d3a9501bf3b3fe3b78d7c6bad38bfc76064` — Penny `<Pennyroyal@agentmail.to>`, port of `aiueo52/flash-next-rtxpro6000` at `524af49abcca66fcb4377ba8297022804535fccf` and `e0fa9fa9fc3ccd710a8fb3d2639b85ce62188c23` |
+| GDN commit | `0b0ba4c2b18173303b46dd8ec381735e1615b313` — aa24aa `<2496788660@qq.com>`, cherry picked from `c0771c79b7e2f2bc0edf4fdcb7c43b986a56707a`, upstream FlashInfer #6227 |
+| Compatibility guard | `c84ae2ff261d08bb212f5d72867185876d9d71e7` — Penny `<Pennyroyal@agentmail.to>`, local to this packaging and not an upstream change: `nv_internal/cpp/common/memoryUtils.cu` asked for `<sanitizer/asan_interface.h>` unconditionally, which the image's gcc-15 package does not install, so the include now follows the file's own ASAN condition. Non-ASAN builds need nothing new; ASAN builds still require the header. Drop when the pin ships the guard or the build environment always carries the sanitizer headers |
+| Built module | `flashinfer/data/aot/fused_moe_120/fused_moe_120.so`, compiled with `FLASHINFER_CUDA_ARCH_LIST=12.0f` |
+| Build toolchain | job counts and `CXX` come from the caller; nvcc's host compiler is `CUDAHOSTCXX` when set, mapped onto the `CC` that FlashInfer's `build_cuda_cflags` reads for `-ccbin`, in the build subprocess only |
+| Profile default | the two Next recipes and the two Next startup files export `FLASHINFER_GDN_FP16_ACCUM_MMA=1`; an explicit opt-out is carried by the container settings propagation, the resolved mode is a NIXL namespace field (`gdn_fp16_accum_mma`), and FlashInfer's own default and the 27B profile are unchanged |
+
+`accepted-sources.json` records the SHA-256 of every affected file before and
+after the patch, which is what the step and the image check compare against; it
+is regenerated from a fresh extraction of the pinned wheel with `--record`. No
+kernel source is redesigned here, no stride fusion or active-expert packing is
+added, and no host binary or private overlay is shipped. Compilation, image and
+GPU qualification of the resulting module belong to the release host and are
+recorded with the release that carries them.
+
+## v2.5.3 source provenance
+
+Runtime source `69583da7c71b87ac36371333a19f2749bab72773` extends public source
+`da33534bf3e147725f49ffc07674ba2a7f34c98b` without a rebase or dependency
+refresh. That base already contains the BF16 NVMe PLE staging fix
+`e6319ae461d9e54d7d777878a4bf7fc503a69f0f`; v2.5.3 includes it in the normal
+release rather than requiring a container overlay.
+
+The additions correct the NEXTN checkpoint boundary from
+[issue #17](https://github.com/jpezzulli/sglang-rtxpro6000/issues/17), adapt
+streaming string arguments from [#41313](https://github.com/sgl-project/sglang/pull/41313),
+parallel prompt encoding from [#41259](https://github.com/sgl-project/sglang/pull/41259),
+and DFlash prefill copies from [#40091](https://github.com/sgl-project/sglang/pull/40091).
+Cache persistence combines the fresh-chunk backup and in-flight host-ownership
+corrections. NIXL component counting and opt-in host aliases adapt
+[PR #24](https://github.com/jpezzulli/sglang-rtxpro6000/pull/24).
+[CHANGES.md](CHANGES.md#v253--agentic-correctness-and-cache-maintenance)
+records user-facing behavior and contributor credit.
+
+Both TP1 profiles completed full reasoning and streaming-tool runs, with
+fresh 64K storage restoration and device replay on each. Native CUDA transfer
+and checkpoint tests also passed. Earlier long-context, media and full host-cache
+campaigns retain their original source and dates in RESULTS.md.
+
+Release packaging refreshes the NVMe adapter's exact source hashes and version
+references above the checked runtime core. The automatic container build checks
+installation and source identity. GPU container results are recorded with
+v2.5.0; the v2.5.3 runtime checks used native installation.
+
+## v2.5.2 source provenance
+
+Core runtime commits `5d68689198`, `ac8d02ad2a`, `2a94c3dd34`,
+`5997c2acd7` and `a670ea2bdd` add the PLE, QSA, cache-reclamation and TP2
+changes above the public v2.5.1 branch without a rebase. The release also
+includes the subsequent NIXL byte-budget and configurator/launcher changes.
+[CHANGES.md](CHANGES.md#v252--memory-cache-and-setup-maintenance) links the
+adapted upstream PRs and contributor credit.
+
+Both TP1 model profiles received live regression. TP2 verification is pending
+from [u/StockSpecialist1707](https://www.reddit.com/user/StockSpecialist1707/).
+The optional setup assistant is beta; configuration and packaging checks are
+separate from model-performance measurements.
+
+## v2.5.1 source provenance
+
+Commit `1a8f3e9d1f0b7ac847bfa2701bf0f6b69d54a16e` adds the maintenance changes
+to public source `d00aa74092d12eac289891e5eccec50e7206573a`. Documentation and
+release metadata sit above that executable-source commit.
+
+- Optional unfinished-request Mamba donation adapts SGLang
+  [#37619](https://github.com/sgl-project/sglang/pull/37619).
+- Host recurrent-checkpoint retention is a local correction for
+  [community issue #3](https://github.com/jpezzulli/sglang-rtxpro6000/issues/3).
+- Qwen reasoning/tool-marker handling and fenced-code preservation are local
+  parser corrections, including the thinking-mode defect in
+  [community issue #6](https://github.com/jpezzulli/sglang-rtxpro6000/issues/6).
+- Unaligned QSA EXTEND prefixes adapt SGLang
+  [#39575](https://github.com/sgl-project/sglang/pull/39575), with additional
+  per-layer key and shared rotary-coordinate lifetime handling.
+- Native/Compose capacity options and automatic container release builds are
+  local packaging changes. The NVMe reader's source manifest is refreshed for
+  the updated QSA module; its data format and loader implementation are unchanged.
+
+Both supported profiles received focused CPU/GPU and live regression. Existing
+performance tables retain their original release/date. See
+[CHANGES.md](CHANGES.md#v251--cache-and-parser-maintenance) for the checked paths
+and the host-cache reproduction result.
+
+## v2.5.0 source provenance
+
+Executable source: `23931293183417e750a8e41f715c52230c231c25`; release tag
+`pennyroyal-v2.5.0` at `2c675da096939cb01102f8f4871bda3db55f7f28`.
+The first container used source `b976bb329cfc1376b7d4589d55871f586d460ad4`
+and image digest
+`sha256:1d71b02dde64d3edb454fb6020b7b21bb32dee7ba0ddaacefbf9df6b266940d7`.
+
+This release builds on public source `1c7392a09b9938c2626c53d2524b3fb7dfac0cae`
+without an upstream rebase or dependency refresh.
+
+- Online FP8, structured-output startup warmup and loader-reference cleanup
+  are adapted from [mratsim/sglang-qwen38fn-sm120-turbo](https://github.com/mratsim/sglang-qwen38fn-sm120-turbo/tree/94a68214b77514bc26ef78cee4c01f128162d09b),
+  patches `0003`, `0007` and `0008`. [FP8.md](FP8.md) identifies the converted
+  modules, unchanged state formats, measured gains and qualification limits.
+- Optional NVMe PLE incorporates [Garner McCloud's SSD Stream v0.2.0](https://github.com/garnermccloud/sglang-ssd-stream/tree/176a522ef9d6dbb5056ae1f467fe49af0f1258a5),
+  with its Apache-2.0 license and NOTICE retained. Pennyroyal's adapter is
+  `0.2.0+pennyroyal2`: explicit opt-in, source/artifact checks, complete hook
+  application enforcement, an exact-byte overlay preparer and portable
+  launcher integration. [NVME-PLE.md](NVME-PLE.md) documents installation,
+  memory savings and the measured performance tradeoff.
+
+The default-off 27B path retains its prior behavior. The published runtime
+files are the qualified source; the dependency-base package listed above is
+not a prebuilt wheel containing this release. Install the selected release
+source using [BUILD.md](BUILD.md).
+
+## v2.4.1 source provenance
+
+Seven source commits above `4aaf531cafd8` preserve the PLE adaptation and add
+three narrow maintenance changes and selectable media preprocessing,
+without rebasing or refreshing dependencies:
+
+| Local commit | Upstream basis |
+|---|---|
+| `d9b856b2db34` | PLE hashing/gather adaptation from [#38701](https://github.com/sgl-project/sglang/pull/38701), with fallback stream-ordering corrections. |
+| `3e822155a538` | Local one-warp PLE selection for measured SM120 FP8 verification shapes. |
+| `50a260d297` | Grammar history trimming from [#38865](https://github.com/sgl-project/sglang/pull/38865), head `72cd382088fe3494eb52e6cdcee8ec2a4b97ce21`. |
+| `6de97f90fa` | Streaming top-logprob rows from [#38759](https://github.com/sgl-project/sglang/pull/38759), head `fb848cbb749a3121c306ec9c43587561339e13a8`. |
+| `1048ef671ff9` | Pinned metadata staging from [#38703](https://github.com/sgl-project/sglang/pull/38703), head `372bce7738605f15c6d71aaaba9a93873ea6c1a9`. |
+| `79ec899ddab9` | Local CPU or explicit CUDA-device selection for JPEG decode and media tensor preprocessing, with cache-identity separation and unsupported-transport guards. |
+| `cf811a8c5988` | Local CUDA-device validation and canonical spelling, so invalid selections fail clearly instead of falling through to JPEG fallback. |
+
+No net PLE serving-speed gain was established. Earlier dated performance
+measurements remain associated with their original source and workload.
+Build/install the selected source using [BUILD.md](BUILD.md); the dependency
+base package alone does not contain these changes.
+
+Flash-Next core subsequently merged upstream through
+[#37500](https://github.com/sgl-project/sglang/pull/37500) on September 8.
+This release deliberately retains the qualified integration base; the older
+PR-status entries below remain dated history, not current merge-status claims.
+
+## v2.4.0 source provenance
+
+The release adds eight reviewed source commits above `739aff3dc5`, ending at
+`4aaf531cafd8`. QSA prefill preparation and short-extend bounds, no-bias routing
+and GPU dependency ordering, dispatched-request cleanup, explicit Chat effort
+precedence, and tool-markup handling are described with upstream credits in
+[CHANGES.md](CHANGES.md#v240--maintenance-and-faster-flash-next-prefill).
+
+The published runtime/test files match the source used for both-profile
+checks. The package version in the table identifies the dependency environment,
+not a prebuilt wheel containing the new changes. Build/install the release
+source using [BUILD.md](BUILD.md). No new model weights, token map, compiler,
+CUDA, PyTorch, FlashInfer or NIXL version is required by this update.
+
+The prefill comparison uses source `739aff3dc5` before and `4aaf531cafd8` after,
+the same Flash-Next ModelOpt NVFP4 checkpoint, and the same TP1 context/pool
+configuration. It measures the combined update rather than attributing a
+percentage to any one commit. [RESULTS.md](RESULTS.md#pennyroyal-v240--prefill-and-maintenance)
+distinguishes server prefill from client time to first token.
+
+## v2.3.1 maintenance provenance
+
+That release's only runtime change was `739aff3dc5`, adapted from SGLang
+[#36014](https://github.com/sgl-project/sglang/pull/36014) by V-aerus
+(Hangshuai He), head `bf5d4227dde4e532b4668327a8d6dcc4d79d9c2b`.
+It aligns paired Triton GDN verification and recovery with packed decode's
+beta rounding. Flash-Next's selected FlashInfer/WY path is unchanged.
+
+The published six-file source/test change is byte-identical to the reviewed
+and tested change. Tests loaded these updated Python/Triton sources on the
+existing v2.3 environment; no new prebuilt wheel is distributed. Build/install
+the release source using [BUILD.md](BUILD.md). The base package version above
+describes that test environment, not a wheel containing the new correction.
+
+The reported failure was not reproduced live, but focused SM120 GPU tests
+reproduced the underlying mismatch. Focused tests and both-profile runtime/
+NIXL regressions passed; [CHANGES.md](CHANGES.md#v231--gdn-rounding-maintenance)
+records the scope. No new performance claim or model qualification is added.
+
+## v2.3 FR-Spec provenance
+
+Pennyroyal's Flash-Next FR-Spec configuration builds on the reduced
+draft-vocabulary work in Gabriel's
+[`sglang-flashnext-sm120`](https://github.com/gabrielolympie/sglang-flashnext-sm120),
+[source revision 67d2f9234fa45ae1339f0d53cd37cb695e9c6493](https://github.com/gabrielolympie/sglang-flashnext-sm120/tree/67d2f9234fa45ae1339f0d53cd37cb695e9c6493).
+It uses SGLang's existing native-MTP FR-Spec implementation and a
+Pennyroyal-generated token map.
+
+### Token map
+
+- Map SHA-256: `becfa41d394b86c26c632bea8f3c6ea64bbb76d7b238d8673c06afae21269f25`.
+- Tokenizer SHA-256: `0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3`.
+- 65,536 unique valid IDs, including all 21 special IDs and a 32,768-ID base.
+- Frequency corpus: 7,537,952 bytes / 1,780,923 tokens of runtime source.
+  Evaluation cases were excluded.
+- [Map manifest](configs/pennyroyal/frspec/flash-next-64k.manifest.json):
+  repository-relative source paths, source revision, and byte hashes.
+- [Map builder](scripts/pennyroyal/frspec/build_token_map.py):
+  deterministic token selection from a supplied tokenizer and corpus.
+
+Corpus coverage measures token coverage of the source corpus, not held-out
+model accuracy. The map changes only draft proposals; target vocabulary and
+acceptance policy are unchanged.
+
+The launcher checks map and tokenizer hashes and incorporates the map hash
+into the NIXL namespace. Use the generated namespace instead of assigning an
+existing cache directory manually. Model weights are not included.
+
+## Checkpoints
+
+Weights are not included. The qualified model identities were:
+
+- Flash-Next target: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at
+  `7b719225242aacd3dbd3f9407468c2ee9a9d2594`;
+- 27B target: a Qwen3.8-27B block-FP8 checkpoint in the
+  `orcarouter/Qwen3.8-27B-Uncensored-FP8` family at
+  `9228df5c6c9c509e1019f83b4e085cf643118bac`;
+- 27B draft: `incoai/Qwen3.8-27B-DFlash2` at
+  `adde41d8fde3a75dc905a7df0bd5088d2a44b5a1`.
+
+The v2.1.2 maintenance tests covered both 27B FP8/DFlash2 and Flash-Next
+NVFP4/native MTP. Full reasoning, tools, and vision were not repeated for
+that update. Historical measurements retain their original dates and source
+revisions; the v2.3 results are listed separately.
+
+The launch recipes require local checkpoint paths. The namespace helper records
+checkpoint metadata and Hugging Face revision/LFS content identity when
+available, falling back to full weight hashing. A changed checkpoint therefore
+selects a different persistent-cache namespace.
+
+## Runtime lineage
+
+Core Qwen3.8 DFlash2 support, including local convolution and candidate
+selection from merged SGLang PR #35371 and quantized target-head support from
+merged PR #35496, is already present in the upstream integration base. The
+selected target keeps `lm_head` in BF16. Local source adds fixed-width XQA mask
+handling, independent draft overrides, NIXL correctness fixes, three-axis
+mRoPE, and request-span observability.
+
+Flash-Next entered through the then-current net work of PR #36497 and was
+reconciled against the active upstream base. Bounded Qwen4, QSA, RecoverSSM,
+HiCache, PLE, and mRoPE corrections were layered on that same source. Exact
+relationships and PR status are in [CHANGES.md](CHANGES.md).
+
+PR #36497's QSA throughput statement originated while its resolver was
+SM100-only. Penny's SM120 wrapper dispatch resolves to XQA, so the SM100
+TRTLLM-Gen attribution is not part of this runtime's provenance.
+
+## Evidence handling
+
+This repository contains compact, non-private summaries only. Raw service
+journals, prompts, conversations, model files, cache payloads, local hostnames,
+tokens, and private endpoints are deliberately excluded. Detailed public test
+logs and the maintained validation harness live in
+[`jpezzulli/pennyroyal-validation`](https://github.com/jpezzulli/pennyroyal-validation).

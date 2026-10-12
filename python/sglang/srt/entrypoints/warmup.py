@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import numpy as np
 import tqdm
-
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -27,7 +27,7 @@ def warmup(name: str):
 
 async def execute_warmups(
     disaggregation_mode: str,
-    warmup_names: List[str],
+    warmup_names: list[str],
     tokenizer_manager: TokenizerManager,
 ):
     for warmup_name in warmup_names:
@@ -36,6 +36,72 @@ async def execute_warmups(
             continue
         logger.info(f"Running warmup {warmup_name}")
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
+
+
+@warmup("whisper_autodetect")
+async def whisper_autodetect(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Pre-compile the xgrammar FSM for both Whisper auto-detect regexes.
+
+    The first request that uses each structured-generation regex incurs a
+    ~15-20s compilation cost. xgrammar caches compiled grammars by the
+    exact regex string, so we warm both the notimestamps and timestamps
+    variants here — otherwise the first ``language=None +
+    timestamp_granularities`` request would still pay the full spike.
+    """
+    # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono) —
+    # soundfile produces the WAV header + PCM data from a list of floats.
+    import base64
+    import io
+
+    import soundfile as sf
+    from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+        FUSED_AUTODETECT_FLAG,
+        WHISPER_AUTODETECT_REGEX,
+        WHISPER_AUTODETECT_TS_REGEX,
+    )
+
+    sr, dur = 16000, 0.1
+    n = int(sr * dur)
+    buf = io.BytesIO()
+    sf.write(buf, [0.0] * n, sr, format="WAV")
+    audio_b64 = base64.b64encode(buf.getvalue()).decode()
+    audio_data_uri = f"data:audio/wav;base64,{audio_b64}"
+
+    for variant_name, regex in (
+        ("notimestamps", WHISPER_AUTODETECT_REGEX),
+        ("timestamps", WHISPER_AUTODETECT_TS_REGEX),
+    ):
+        logger.info(
+            "Compiling Whisper auto-detect regex FSM (%s, one-time, ~15-20s)...",
+            variant_name,
+        )
+        req = GenerateReqInput(
+            text="",
+            audio_data=audio_data_uri,
+            sampling_params={
+                "max_new_tokens": 4,
+                "temperature": 0,
+                "regex": regex,
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
+                FUSED_AUTODETECT_FLAG: True,
+            },
+            modalities=["audio"],
+        )
+        # PD prefill servers assert req.bootstrap_room is not None in the
+        # default follow_bootstrap_room scheduler; the fake values match
+        # what the voice_chat warmup uses for the same reason.
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        # Drain the generator so the FSM is fully installed and any
+        # downstream exception surfaces instead of being swallowed after
+        # the first yield.
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
+    logger.info("Whisper auto-detect regex FSMs compiled.")
 
 
 @warmup("voice_chat")
@@ -58,3 +124,104 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("prefill_shapes")
+async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
+
+    Uses power-of-2 sizes plus intermediate points to cover the shape space
+    that fused_moe, attention extend, and other Triton kernels may encounter.
+    """
+    page_size = 64
+    sizes = set()
+    base = 64
+    while base <= 32768:
+        sizes.add(base)
+        mid = base * 3 // 2
+        mid = (mid + page_size - 1) // page_size * page_size
+        if mid <= 32768:
+            sizes.add(mid)
+        base *= 2
+    sizes = sorted(sizes)
+
+    for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
+        generate_req_input = GenerateReqInput(
+            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            sampling_params={
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            },
+        )
+        if disaggregation_mode != "null":
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# xgrammar caches compiled grammars by their exact serialized text. Keep this
+# schema stable so the warmup and matching requests can share the cache entry.
+_STRUCTURED_OUTPUT_WARMUP_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["topic", "items"],
+    },
+    sort_keys=True,
+)
+
+
+def _raise_for_warmup_response_error(response) -> None:
+    if not isinstance(response, dict):
+        return
+
+    error = response.get("error")
+    if error:
+        message = error.get("message", error) if isinstance(error, dict) else error
+        raise RuntimeError(f"Structured-output warmup failed: {message}")
+
+    meta_info = response.get("meta_info")
+    finish_reason = (
+        meta_info.get("finish_reason") if isinstance(meta_info, dict) else None
+    )
+    if isinstance(finish_reason, dict) and finish_reason.get("type") in {
+        "abort",
+        "error",
+    }:
+        message = finish_reason.get("message", finish_reason)
+        raise RuntimeError(f"Structured-output warmup failed: {message}")
+
+
+@warmup("structured_output")
+async def structured_output(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Run one bounded JSON-schema request before serving client traffic.
+
+    This exercises the grammar compilation and token-mask path for one small,
+    exact schema. It does not precompile arbitrary schemas or warm long-prefill
+    or multi-request kernel shapes.
+    """
+    req = GenerateReqInput(
+        text="Name a topic and list one item in it.",
+        sampling_params={
+            "max_new_tokens": 32,
+            "temperature": 0.0,
+            "json_schema": _STRUCTURED_OUTPUT_WARMUP_SCHEMA,
+        },
+    )
+    if disaggregation_mode != "null":
+        req.bootstrap_room = 0
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+    # The generator owns request completion and error propagation. Drain every
+    # response, including a terminal structured error that a test double or a
+    # streaming implementation may yield instead of raising directly.
+    async for response in tokenizer_manager.generate_request(req, None):
+        _raise_for_warmup_response_error(response)
+
+    logger.info("Structured-output warmup completed for the built-in JSON schema.")

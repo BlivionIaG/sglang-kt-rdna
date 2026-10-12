@@ -1,0 +1,492 @@
+"""Background disk cleaner for the NIXL FILE HiCache backend."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import logging
+import math
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Optional
+
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.storage.nixl.nixl_routing import BUCKET_HEX_CHARS
+
+logger = logging.getLogger(__name__)
+
+# GiB units: the cache byte budget is configured in gibibytes.
+GIBIBYTE = 1024**3
+_DEFAULT_INTERVAL_SEC = 30.0
+_DEFAULT_RECHECK_GROUPS = 50
+_ALLOC_BLOCK_BYTES = 512
+_QUOTA_TARGET_FRACTION = 0.9
+_DEFAULT_HIGH_WATERMARK = 80.0
+_DEFAULT_LOW_WATERMARK = 70.0
+_RANK_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
+_KV_SUFFIXES = ("_k", "_v")
+_POOL_NAME_PATTERN = "|".join(
+    sorted((re.escape(pool.value) for pool in PoolName), key=len, reverse=True)
+)
+_HYBRID_COMPONENT_SUFFIX_RE = re.compile(
+    rf"_(?:{_POOL_NAME_PATTERN})(?:_(?:temporal|conv_\d+|[kv]|\d+))?$"
+)
+_BUCKET_NAME_RE = re.compile(rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
+
+
+@dataclass
+class _GroupInfo:
+    """Metadata for one logical cache key group in a cleaner tick."""
+
+    base_key: str
+    mtime: float = 0.0
+    size: int = 0
+    allocated: int = 0
+    # path -> scan-time allocated bytes, so bytes proven gone during unlink
+    # (even by another actor) can be credited against the quota estimate.
+    paths: dict[str, int] = field(default_factory=dict)
+    # Physical files in one logical group can hash to different base dirs
+    # because TP-rank and zero-copy K/V suffixes are part of the routed key.
+    base_dirs: set[str] = field(default_factory=set)
+
+
+def _parse_group_key(name: str) -> str:
+    """Return the logical cache-key group for one NIXL FILE object name.
+
+    The physical names are produced by ``HiCacheNixl._get_suffixed_key``,
+    ``HiCacheNixl._get_key_list_from_meta``, and
+    ``HiCacheNixl._get_hybrid_component_keys``.
+    """
+    stem = name
+    stem = _HYBRID_COMPONENT_SUFFIX_RE.sub("", stem)
+    for suffix in _KV_SUFFIXES:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+
+    match = _RANK_SUFFIX_RE.search(stem)
+    if match is not None:
+        stem = stem[: match.start()]
+    return stem
+
+
+def _allocated_bytes(stat_result: os.stat_result) -> int:
+    """Allocated on-disk bytes for quota accounting (not apparent file length).
+
+    Uses st_blocks * 512 so sparse files are counted by real disk usage; falls
+    back to apparent size on platforms without st_blocks.
+    """
+    blocks = getattr(stat_result, "st_blocks", None)
+    if blocks is None:
+        return stat_result.st_size
+    return blocks * _ALLOC_BLOCK_BYTES
+
+
+def _safe_unlink(path: str, estimated_bytes: int = 0) -> tuple[bool, int]:
+    """Best-effort unlink; returns (removed, gone_bytes).
+
+    ``removed`` says whether this call unlinked the file. ``gone_bytes`` is the
+    allocated size (st_blocks-based, never the apparent sparse length) of a
+    file that is gone afterwards -- deleted by this call or already removed by
+    another actor -- so stale scan-time quota estimates can still be credited
+    and the cleaner does not over-evict newer groups. A genuine unlink failure
+    where the file stays on disk is never credited.
+    """
+    try:
+        measured = _allocated_bytes(os.stat(path))
+    except FileNotFoundError:
+        logger.debug("NIXL L3 file already removed before cleanup: %s", path)
+        return False, estimated_bytes
+    except OSError:
+        logger.debug("Failed to stat NIXL L3 file %s", path, exc_info=True)
+        return False, 0
+    try:
+        os.unlink(path)
+        return True, measured
+    except FileNotFoundError:
+        logger.debug("NIXL L3 file vanished during cleanup: %s", path)
+        return False, measured
+    except OSError:
+        logger.debug("Failed to unlink NIXL L3 file %s", path, exc_info=True)
+        return False, 0
+
+
+def warn_on_cache_filesystem_pressure(
+    storage_dirs: list[str] | str,
+    high_watermark: float,
+) -> None:
+    """Log a startup warning when a configured NIXL FILE cache filesystem is
+    full or at/above the configured high watermark.
+
+    Retired-cache cleanup is owned by the user; this is a read-only inspection
+    that never scans, deletes, or touches cache contents, and it runs even
+    when the automatic HiCacheL3Cleaner is disabled. It uses one statvfs per
+    configured directory -- probing the nearest existing parent when a fresh
+    namespace has not been created yet -- logs at most once per distinct
+    filesystem, and swallows inspection failures so warning checks can never
+    crash serving.
+    """
+    if isinstance(storage_dirs, str):
+        storage_dirs = [storage_dirs]
+    seen_devices: set[int] = set()
+    for path in storage_dirs:
+        if not path:
+            continue
+        try:
+            # Only the probe is absolutized (relative user paths would walk
+            # to '' and statvfs('') fails); the message keeps the configured
+            # path verbatim.
+            probe = os.path.abspath(path)
+            while not os.path.exists(probe):
+                parent = os.path.dirname(probe)
+                if parent == probe:
+                    break
+                probe = parent
+            stat = os.statvfs(probe)
+            device = os.stat(probe).st_dev
+            if device in seen_devices:
+                continue
+            seen_devices.add(device)
+            frsize = stat.f_frsize or stat.f_bsize
+            total = stat.f_blocks * frsize
+            available = stat.f_bavail * frsize
+            used_pct = 100.0 * (total - available) / total if total > 0 else 0.0
+            inode_total = stat.f_files
+            free_inodes = stat.f_favail
+            inode_used_pct = (
+                100.0 * (inode_total - free_inodes) / inode_total
+                if inode_total > 0
+                else 0.0
+            )
+            exhausted = (total > 0 and available == 0) or (
+                inode_total > 0 and free_inodes == 0
+            )
+            at_threshold = (
+                used_pct >= high_watermark or inode_used_pct >= high_watermark
+            )
+            if not (exhausted or at_threshold):
+                continue
+            state = (
+                "FULL"
+                if exhausted
+                else f"at or above the configured {high_watermark:.1f}% pressure threshold"
+            )
+            inode_note = (
+                f", {free_inodes} of {inode_total} inodes free" if inode_total > 0 else ""
+            )
+            logger.warning(
+                "HiCacheNixl: the filesystem holding cache path %s is %s "
+                "(%.1f%% used, %.2f GiB free%s). Retired-cache cleanup is "
+                "owned by the user: free space if needed by removing only "
+                "old cache namespaces you know are no longer used, and leave "
+                "this active cache path and its contents untouched.",
+                path,
+                state,
+                used_pct,
+                available / GIBIBYTE,
+                inode_note,
+            )
+        except Exception:
+            # Warning inspection is best-effort; never fail serving over it.
+            logger.debug(
+                "Could not check cache filesystem pressure for %s",
+                path,
+                exc_info=True,
+            )
+
+
+class HiCacheL3Cleaner:
+    """Delete old NIXL FILE cache entries when disk usage exceeds watermarks.
+
+    An optional ``max_cache_bytes`` budget (0 disables it) adds cache-owned
+    quota pressure: cleanup also triggers when the allocated size of the
+    configured storage dirs exceeds the budget, evicting oldest groups first
+    down to 90% of the cap. The budget is a soft periodic target, not a hard
+    reservation or write admission limit; concurrent writers can transiently
+    exceed it.
+
+    Cleanup operates on physical file names only, so it is compatible with MHA,
+    MLA, and DSA naming as long as the keys are generated by ``HiCacheNixl``.
+    """
+
+    def __init__(
+        self,
+        storage_dirs: list[str] | str,
+        tp_rank: int,
+        *,
+        high_watermark: float = _DEFAULT_HIGH_WATERMARK,
+        low_watermark: float = _DEFAULT_LOW_WATERMARK,
+        interval_sec: float = _DEFAULT_INTERVAL_SEC,
+        recheck_groups: int = _DEFAULT_RECHECK_GROUPS,
+        unlink_workers: Optional[int] = None,
+        max_cache_bytes: float = 0,
+    ) -> None:
+        if isinstance(storage_dirs, str):
+            storage_dirs = [storage_dirs] if storage_dirs else []
+        self.storage_dirs = [path for path in storage_dirs if path]
+        self.tp_rank = tp_rank
+        self.high_watermark = high_watermark
+        self.low_watermark = low_watermark
+        self.interval_sec = interval_sec
+        self.recheck_groups = max(1, recheck_groups)
+        self.max_cache_bytes = float(max_cache_bytes or 0)
+        if not math.isfinite(self.max_cache_bytes) or self.max_cache_bytes < 0:
+            raise ValueError(
+                "L3 cleaner max_cache_bytes must be a finite number >= 0 "
+                "(0 disables the cache-owned quota), got "
+                f"{self.max_cache_bytes!r}"
+            )
+        self.quota_target_bytes = self.max_cache_bytes * _QUOTA_TARGET_FRACTION
+        self.unlink_workers = unlink_workers or max(
+            8, 8 * max(len(self.storage_dirs), 1)
+        )
+
+        if self.low_watermark >= self.high_watermark:
+            raise ValueError(
+                "L3 cleaner low_watermark must be lower than high_watermark "
+                f"(low_watermark={self.low_watermark}, "
+                f"high_watermark={self.high_watermark})"
+            )
+
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Start the cleaner thread on TP rank 0."""
+        if self.tp_rank != 0 or not self.storage_dirs:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="hicache-l3-cleaner", daemon=True
+        )
+        self._thread.start()
+        if self.max_cache_bytes > 0:
+            budget = (
+                f"{self.max_cache_bytes / (1024**3):.2f} GiB (evict to "
+                f"{self.quota_target_bytes / (1024**3):.2f} GiB)"
+            )
+        else:
+            budget = "disabled"
+        logger.info(
+            "HiCacheL3Cleaner started: dirs=%s high=%.1f%% low=%.1f%% "
+            "interval=%.1fs unlink_workers=%d budget=%s",
+            self.storage_dirs,
+            self.high_watermark,
+            self.low_watermark,
+            self.interval_sec,
+            self.unlink_workers,
+            budget,
+        )
+
+    def stop(self) -> None:
+        """Stop the cleaner thread if it was started."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def _disk_usage_pct(self, path: str) -> float:
+        try:
+            stat = os.statvfs(path)
+        except OSError:
+            return 0.0
+        total = stat.f_blocks * stat.f_frsize
+        if total == 0:
+            return 0.0
+        available = stat.f_bavail * stat.f_frsize
+        return 100.0 * (total - available) / total
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.warning("NIXL L3 cleaner tick failed", exc_info=True)
+            if self._stop.wait(self.interval_sec):
+                break
+
+    def _tick(self) -> bool:
+        initial_pcts = {path: self._disk_usage_pct(path) for path in self.storage_dirs}
+        hot_dirs = {
+            path for path, pct in initial_pcts.items() if pct >= self.high_watermark
+        }
+        quota_enabled = self.max_cache_bytes > 0
+        if not hot_dirs and not quota_enabled:
+            return False
+
+        scan_start = time.perf_counter()
+        groups: dict[str, _GroupInfo] = {}
+        for base_dir in self.storage_dirs:
+            self._scan_base_dir(base_dir, groups)
+
+        # Soft cache-owned budget across this cleaner's configured storage dirs
+        # (the active namespace). Concurrent writers can transiently exceed it.
+        cache_bytes = sum(group.allocated for group in groups.values())
+        quota_pressure = quota_enabled and cache_bytes > self.max_cache_bytes
+        ordered = sorted(groups.values(), key=lambda group: group.mtime)
+        if not any(quota_pressure or group.base_dirs & hot_dirs for group in ordered):
+            # No quota pressure and no group lives on a hot filesystem.
+            return False
+
+        deleted_groups = 0
+        deleted_files = 0
+        bytes_deleted = 0
+        # Soft quota budget: start from the scan-time estimate and decrement
+        # with bytes this tick proved gone (deleted here or already removed by
+        # another actor); the next tick re-scans and re-establishes usage.
+        # The running estimate also drives batch planning, so a large
+        # recheck_groups cannot wipe groups far past the quota target.
+        remaining_bytes = cache_bytes
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.unlink_workers,
+            thread_name_prefix="hicache-l3-unlink",
+        ) as pool:
+            idx = 0
+            while idx < len(ordered) and not self._stop.is_set():
+                if quota_pressure and remaining_bytes <= self.quota_target_bytes:
+                    quota_pressure = False
+                batch, consumed = self._next_batch(
+                    ordered, idx, hot_dirs, quota_pressure, remaining_bytes
+                )
+                idx += consumed
+                if not batch:
+                    break
+                items = list(self._iter_group_paths(batch))
+                paths = [path for path, _allocated in items]
+                estimates = [allocated for _path, allocated in items]
+                for removed, gone_bytes in pool.map(_safe_unlink, paths, estimates):
+                    # ``gone_bytes`` is 0 for genuine unlink failures where the
+                    # file remains, so those are never credited as freed.
+                    remaining_bytes -= gone_bytes
+                    if removed:
+                        deleted_files += 1
+                        bytes_deleted += gone_bytes
+                deleted_groups += len(batch)
+
+                filesystem_ok = all(
+                    self._disk_usage_pct(path) < self.low_watermark for path in hot_dirs
+                )
+                quota_ok = (
+                    not quota_pressure or remaining_bytes <= self.quota_target_bytes
+                )
+                if filesystem_ok and quota_ok:
+                    break
+
+        final_pcts = {path: self._disk_usage_pct(path) for path in self.storage_dirs}
+        quota_note = ""
+        if quota_enabled:
+            quota_note = ", cache_bytes=%.2f->%.2f GiB of %.2f GiB budget" % (
+                cache_bytes / (1024**3),
+                max(remaining_bytes, 0) / (1024**3),
+                self.max_cache_bytes / (1024**3),
+            )
+        logger.info(
+            "NIXL L3 cleanup: deleted %d groups / %d files (%.2f GiB) in %.1fs, "
+            "initial_hot=%s final=%s%s",
+            deleted_groups,
+            deleted_files,
+            bytes_deleted / (1024**3),
+            time.perf_counter() - scan_start,
+            {path: f"{initial_pcts[path]:.1f}%" for path in hot_dirs},
+            {path: f"{pct:.1f}%" for path, pct in final_pcts.items()},
+            quota_note,
+        )
+        return True
+
+    def _next_batch(
+        self,
+        ordered: list[_GroupInfo],
+        start: int,
+        hot_dirs: set[str],
+        quota_pressure: bool,
+        remaining_bytes: float,
+    ) -> tuple[list[_GroupInfo], int]:
+        """Take the next oldest-first batch of groups worth deleting now.
+
+        While the quota is over its target every group is a candidate, but
+        the batch stops as soon as its planned allocated bytes would bring
+        the running estimate to the quota target (whole-group granularity),
+        so even a large recheck_groups deletes only about as many groups as
+        the budget requires instead of a full batch. Once the quota target
+        is reached (or without quota pressure), only groups on hot
+        filesystems remain, so filesystem pressure cannot evict unrelated
+        cold groups after quota pressure was already relieved.
+        """
+        batch: list[_GroupInfo] = []
+        planned_bytes = 0
+        index = start
+        while index < len(ordered) and len(batch) < self.recheck_groups:
+            group = ordered[index]
+            index += 1
+            if not (quota_pressure or group.base_dirs & hot_dirs):
+                continue
+            batch.append(group)
+            if quota_pressure:
+                planned_bytes += group.allocated
+                if remaining_bytes - planned_bytes <= self.quota_target_bytes:
+                    break
+        return batch, index - start
+
+    def _scan_base_dir(self, base_dir: str, groups: dict[str, _GroupInfo]) -> None:
+        if not os.path.isdir(base_dir):
+            return
+        try:
+            bucket_entries = list(os.scandir(base_dir))
+        except OSError:
+            logger.warning("NIXL L3 cleaner failed to scan %s", base_dir, exc_info=True)
+            return
+
+        for bucket_entry in bucket_entries:
+            try:
+                is_bucket_dir = bucket_entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if (
+                not is_bucket_dir
+                or _BUCKET_NAME_RE.fullmatch(bucket_entry.name) is None
+            ):
+                continue
+            self._scan_bucket(base_dir, bucket_entry.path, groups)
+
+    def _scan_bucket(
+        self, base_dir: str, bucket_path: str, groups: dict[str, _GroupInfo]
+    ) -> None:
+        try:
+            entries = list(os.scandir(bucket_path))
+        except OSError:
+            logger.debug(
+                "NIXL L3 cleaner skipped bucket %s", bucket_path, exc_info=True
+            )
+            return
+
+        for entry in entries:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+
+            group_key = _parse_group_key(entry.name)
+            group = groups.setdefault(group_key, _GroupInfo(group_key))
+            group.paths[entry.path] = _allocated_bytes(stat)
+            group.base_dirs.add(base_dir)
+            group.size += stat.st_size
+            group.allocated += _allocated_bytes(stat)
+            group.mtime = max(group.mtime, stat.st_mtime)
+
+    def _iter_group_paths(
+        self, groups: Iterable[_GroupInfo]
+    ) -> Iterable[tuple[str, int]]:
+        """Yield (path, scan-time allocated bytes) for every file in ``groups``."""
+        seen: set[str] = set()
+        for group in groups:
+            for path, allocated in sorted(group.paths.items()):
+                if path in seen:
+                    continue
+                seen.add(path)
+                yield path, allocated

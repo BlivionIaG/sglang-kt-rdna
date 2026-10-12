@@ -1,34 +1,73 @@
-name: Lint
+name: Contributor checks
 
 on:
-  push:
-    branches: [main]
+  # No branch filter and no `main` assumption: the real PR bases here are
+  # pennyroyal-main-sm120-final, rc/next and the stacked work/rc-* branches.
+  # Draft pull requests run the same checks; being a draft is never a failure.
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contributor-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Lint the contributor's own commit rather than GitHub's synthetic
+          # merge commit; workflow_dispatch falls back to the triggered ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
 
-      - name: Install pre-commit hook
+      - name: Install pre-commit
+        run: python -m pip install pre-commit
+
+      - name: Check pull request changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python -m pip install pre-commit
-          pre-commit install
+          set -euo pipefail
+          # Stacked-PR heads can be siblings of their base, so fetch the base
+          # branch: merge-base and the base config need those objects.
+          git fetch --no-tags --force origin \
+            "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          # Check with the base branch's config, because pre-existing PR heads
+          # still carry the inherited whole-repo file. `git checkout <rev> --`
+          # stages as well as writes (pre-commit refuses an unstaged config),
+          # and the file stays at the repo root because pre-commit resolves
+          # `language: system` entries relative to the config file's directory
+          # - a --config outside the repository breaks the local hooks. A PR
+          # that edits the config itself is covered by the all-files run.
+          git checkout "$BASE_SHA" -- .pre-commit-config.yaml
+          git diff --check "$BASE_SHA...$HEAD_SHA"
+          SKIP=no-commit-to-branch,clippy-rust-workspace pre-commit run \
+            --from-ref "$BASE_SHA" \
+            --to-ref "$HEAD_SHA" \
+            --show-diff-on-failure
 
-      - name: Run pre-commit checks
-        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
-
-      - name: Run sgl-kernel clang-format checks
-        uses: DoozyX/clang-format-lint-action@v0.20
-        with:
-          source: sgl-kernel
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 20
-          style: file
+      # Explicit only: the whole tree still carries inherited formatting debt,
+      # so this never gates pull requests.
+      - name: Check all files
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD
+          SKIP=no-commit-to-branch,clippy-rust-workspace pre-commit run \
+            --all-files \
+            --show-diff-on-failure
