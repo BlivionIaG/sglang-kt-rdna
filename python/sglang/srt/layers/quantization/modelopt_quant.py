@@ -108,6 +108,188 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# GB206 (RTX 5060 Ti, SM 12.0) has 100 KB of shared memory. CUTLASS SM120
+# FP4 tiles return "Error Internal" for every shape, eager and captured.
+# This path reconstructs BF16 weights (W4A16): unpacked E2M1 times the
+# unswizzled fp8 block scale times the small weight_scale_2. Activations
+# stay BF16, so input_scale is not applied. Low nibble is element 0.
+_NVFP4_REFERENCE = None
+_E2M1_LUT = None
+
+
+def nvfp4_reference_gemm() -> bool:
+    global _NVFP4_REFERENCE
+    if _NVFP4_REFERENCE is None:
+        _NVFP4_REFERENCE = not _nvfp4_tensorcore_ok()
+        if _NVFP4_REFERENCE:
+            logger.warning(
+                "NVFP4 tensor-core GEMM is unavailable on this GPU "
+                "(CUTLASS sm120 returned Error Internal). Dense NVFP4 "
+                "linears and the placed GPU experts will run as BF16 "
+                "dequant GEMMs. CPU experts stay on the AVX2 kernel."
+            )
+    return _NVFP4_REFERENCE
+
+
+def _nvfp4_tensorcore_ok() -> bool:
+    try:
+        from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        activation = torch.ones(64, 64, device=device, dtype=torch.bfloat16)
+        global_scale = torch.ones(1, device=device, dtype=torch.float32)
+        quantized, block_scale = scaled_fp4_quant(activation, global_scale)
+        alpha = torch.ones(1, device=device, dtype=torch.float32)
+        cutlass_scaled_fp4_mm(
+            quantized,
+            quantized,
+            block_scale,
+            block_scale,
+            alpha,
+            torch.bfloat16,
+        )
+        torch.cuda.synchronize(device)
+        return True
+    except Exception as exc:
+        logger.info("NVFP4 tensor-core probe failed: %s", exc)
+        return False
+
+
+def _e2m1_lut(device: torch.device) -> torch.Tensor:
+    global _E2M1_LUT
+    if _E2M1_LUT is None or _E2M1_LUT.device != device:
+        _E2M1_LUT = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+    return _E2M1_LUT
+
+
+def dequant_nvfp4(
+    packed: torch.Tensor, scale: torch.Tensor, tensor_scale: torch.Tensor
+) -> torch.Tensor:
+    """Unpack ModelOpt NVFP4 into BF16. scale must be the unswizzled block scale."""
+
+    lut = _e2m1_lut(packed.device)
+    nibbles = packed.to(torch.int32)
+    values = torch.stack(
+        (lut[nibbles & 0xF], lut[(nibbles >> 4) & 0xF]), dim=-1
+    ).flatten(-2)
+    block_scale = scale.to(torch.float32)
+    width = min(values.shape[-1], block_scale.shape[-1] * 16)
+    values = values[..., :width]
+    block_scale = block_scale[..., : width // 16].repeat_interleave(16, dim=-1)
+    global_scale = tensor_scale.to(device=packed.device, dtype=torch.float32).reshape(
+        -1
+    )[:1]
+    while global_scale.ndim < values.ndim:
+        global_scale = global_scale.unsqueeze(-1)
+    return (values * block_scale * global_scale).to(torch.bfloat16)
+
+
+def _apply_nvfp4_reference_linear(layer, x, bias):
+    if isinstance(x, (tuple, list)):
+        x = x[0]
+    weight = layer.nvfp4_weight_bf16
+    in_features = x.shape[-1]
+    if weight.shape[-1] != in_features:
+        weight = weight[..., :in_features]
+    out_features = getattr(layer, "output_size_per_partition", weight.shape[0])
+    weight = weight[:out_features]
+    output = torch.nn.functional.linear(x, weight)
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def _apply_nvfp4_reference_moe(method, layer, x, topk_weights, topk_ids):
+    """W4A16 GEMM over the compact GPU expert slots.
+
+    Ids outside [0, num_gpu_experts) are the CPU experts (the KT wrapper
+    writes -1) and contribute nothing. Router weights scale the output.
+    routed_scaling_factor is applied later by the model forward. The gate
+    clamp is one-sided so these two experts match the AVX2 CPU kernel.
+    """
+
+    if isinstance(x, (tuple, list)):
+        x = x[0]
+    rows = x.shape[0]
+    hidden = x.shape[-1]
+    output = torch.zeros((rows, hidden), dtype=x.dtype, device=x.device)
+    if rows == 0:
+        return output
+    if not getattr(_apply_nvfp4_reference_moe, "_logged", False):
+        _apply_nvfp4_reference_moe._logged = True
+        logger.warning(
+            "NVFP4 placed GPU experts are using the BF16 dequant reference "
+            "(%d experts).",
+            int(layer.w13_weight.shape[0]),
+        )
+    config = getattr(method, "moe_runner_config", None)
+    limit = None
+    if config is not None and getattr(config, "apply_router_weight_on_input", False):
+        raise RuntimeError(
+            "NVFP4 reference MoE only applies router weights on the output"
+        )
+    if config is not None:
+        raw_limit = getattr(config, "swiglu_limit", None)
+        if raw_limit:
+            limit = float(raw_limit)
+    ids = topk_ids.to(dtype=torch.long)
+    n_experts = int(layer.w13_weight.shape[0])
+    flat_ids = ids.reshape(-1)
+    for expert in range(n_experts):
+        if not bool((flat_ids == expert).any()):
+            continue
+        selected = ids == expert
+        token_weight = torch.where(
+            selected, topk_weights, torch.zeros_like(topk_weights)
+        ).sum(dim=-1)
+        tokens = token_weight != 0
+        if not bool(tokens.any()):
+            continue
+        hidden_states = x[tokens]
+        w13 = dequant_nvfp4(
+            layer.w13_weight[expert],
+            layer.w13_weight_scale_linear[expert],
+            layer.w13_weight_scale_2[expert],
+        )
+        gate_up = torch.nn.functional.linear(hidden_states, w13)
+        half = gate_up.shape[-1] // 2
+        gate = gate_up[..., :half]
+        if limit is not None:
+            gate = gate.clamp(max=limit)
+        mid = torch.nn.functional.silu(gate) * gate_up[..., half:]
+        w2 = dequant_nvfp4(
+            layer.w2_weight[expert],
+            layer.w2_weight_scale_linear[expert],
+            layer.w2_weight_scale_2[expert],
+        )
+        expert_out = torch.nn.functional.linear(mid, w2)
+        slot_weight = token_weight[tokens].to(dtype=expert_out.dtype).unsqueeze(-1)
+        output[tokens] = output[tokens] + expert_out * slot_weight
+    return output
+
+
+
 def _sglang_fp4_gemm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -915,6 +1097,26 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
+def _with_sglang_language_model_prefixes(
+    exclude_modules: Optional[List[str]],
+) -> List[str]:
+    """Also match SGLang's ``model.layers`` prefix.
+
+    ModelOpt multimodal checkpoints ignore ``model.language_model.layers.*``.
+    GLM-5-Next registers those modules as ``model.layers.*``. ``is_layer_excluded``
+    full-matches the pattern, so the ``language_model`` segment makes every
+    ignored BF16 attention / shared-expert / router weight look quantized.
+    """
+
+    expanded: List[str] = []
+    for name in exclude_modules or []:
+        expanded.append(name)
+        rewritten = name.replace("model.language_model.", "model.", 1)
+        if rewritten != name:
+            expanded.append(rewritten)
+    return list(dict.fromkeys(expanded))
+
+
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Config class for FP4."""
 
@@ -926,7 +1128,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
-        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+        super().__init__(
+            kv_cache_quant_algo,
+            _with_sglang_language_model_prefixes(exclude_modules),
+            packed_modules_mapping,
+        )
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
@@ -1191,6 +1397,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
+        if nvfp4_reference_gemm() and not hasattr(layer, "nvfp4_weight_bf16"):
+            layer.nvfp4_weight_bf16 = Parameter(
+                dequant_nvfp4(
+                    layer.weight.data,
+                    layer.weight_scale.data,
+                    layer.weight_scale_2.data,
+                ),
+                requires_grad=False,
+            )
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -1278,6 +1493,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "nvfp4_weight_bf16", None) is not None:
+            return _apply_nvfp4_reference_linear(layer, x, bias)
         output_dtype = x.dtype
         x_m, _ = x.shape
 
@@ -1384,7 +1601,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_experts,
                 num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
@@ -1399,7 +1616,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 2
         w2_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
@@ -1413,7 +1630,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_experts,
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -1431,7 +1648,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -1453,9 +1670,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w13_weight_scale_shape = (
-            (layer.num_local_experts, 2)
+            (num_experts, 2)
             if layer.moe_runner_config.is_gated
-            else (layer.num_local_experts,)
+            else (num_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
@@ -1464,7 +1681,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -1548,6 +1765,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        # Input scales stay global (one row per logical expert). KT GPU
+        # weight scales are compact, so gather the placed experts before
+        # the per-expert alpha multiply.
+        n_slots = int(w13_weight_scale_2.shape[0])
+        if w13_input_scale.ndim > 0 and w13_input_scale.shape[0] != n_slots:
+            kt = getattr(layer, "quant_method", None)
+            index = (
+                getattr(kt, "gpu_index_to_logical", None) if kt is not None else None
+            )
+            if index is None or int(index.numel()) != n_slots:
+                index = torch.arange(n_slots, device=w13_input_scale.device)
+            else:
+                index = index.to(device=w13_input_scale.device, dtype=torch.long)
+            if not getattr(self, "_logged_nvfp4_gpu_scale_gather", False):
+                logger.info(
+                    "NVFP4 MoE input scales gathered to %d GPU experts (from %d).",
+                    n_slots,
+                    int(w13_input_scale.shape[0]),
+                )
+                self._logged_nvfp4_gpu_scale_gather = True
+            w13_input_scale = w13_input_scale.index_select(0, index)
+            if w2_input_scale.ndim > 0 and w2_input_scale.shape[0] != n_slots:
+                w2_input_scale = w2_input_scale.index_select(0, index)
+
         # Create shared parameters
         layer.g1_alphas = Parameter(
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
@@ -1618,6 +1859,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
+            # Keep the unswizzled scales. The reference GEMM cannot use
+            # the swizzled copies, and the lines below delete the originals.
+            if not hasattr(layer, "w13_weight_scale_linear"):
+                layer.register_buffer(
+                    "w13_weight_scale_linear",
+                    layer.w13_weight_scale.detach().clone(),
+                    persistent=False,
+                )
+                layer.register_buffer(
+                    "w2_weight_scale_linear",
+                    layer.w2_weight_scale.detach().clone(),
+                    persistent=False,
+                )
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
@@ -1667,10 +1921,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
+            # KT placement stores only the GPU expert slots in w13_weight.
+            # cutlass_moe_fp4 requires params.num_experts == that leading dim,
+            # and the wrapper remaps topk ids into the compact range.
             layer.cutlass_moe_params = CutlassMoEParams(
                 CutlassMoEType.BlockscaledFP4,
                 device,
-                num_experts=layer.num_experts,  # global num experts
+                num_experts=layer.w13_weight.shape[0],
                 intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
@@ -1796,6 +2053,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+            return StandardCombineInput(hidden_states=output)
+
+        if (
+            nvfp4_reference_gemm()
+            and x_sf is None
+            and hasattr(layer, "w13_weight_scale_linear")
+        ):
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            output = _apply_nvfp4_reference_moe(
+                self, layer, x, topk_weights, topk_ids
+            )
             return StandardCombineInput(hidden_states=output)
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4

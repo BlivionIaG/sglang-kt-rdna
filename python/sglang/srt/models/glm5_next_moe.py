@@ -175,14 +175,17 @@ class Glm5NextMoE(DeepseekV2MoE):
             if all_experts_on_gpu:
                 return
 
-        if method == "FP8":
+        # FP8 uses the block-E4M3 kernel. NVFP4 uses the AVX2 MXFP4 kernel
+        # (group 16); both read moe_config.swiglu_limit in act_fn and apply
+        # GLM's one-sided gate clamp when swiglu_alpha is 0.
+        if method in ("FP8", "NVFP4"):
             return
 
         raise NotImplementedError(
-            "GLM-5-Next KT CPU experts require --kt-method FP8 for the "
-            "checkpoint's block-E4M3 weights and FP32 [128, 128] scales; "
-            f"the current {method or 'unspecified'} KT kernel discards "
-            "swiglu_limit and would produce incorrect activations"
+            "GLM-5-Next KT CPU experts require --kt-method FP8 "
+            "(block-E4M3) or NVFP4 (ModelOpt E2M1 group-16 via the AVX2 "
+            "MXFP4 kernel). Other methods discard swiglu_limit and would "
+            f"produce incorrect activations; got {method or 'unspecified'}."
         )
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:

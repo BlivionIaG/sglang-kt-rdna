@@ -400,7 +400,8 @@ def _kt_supports_swiglu_parameters(method: Optional[str], is_glm5_next: bool) ->
     """Keep block-FP8 clamp propagation isolated to the exact GLM runtime."""
 
     normalized = (method or "").upper()
-    return normalized in ("MXFP4", "MXFP8") or (
+    # NVFP4 rides the AVX2 MXFP4 act_fn, which applies swiglu_limit.
+    return normalized in ("MXFP4", "MXFP8", "NVFP4") or (
         normalized == "FP8" and is_glm5_next
     )
 

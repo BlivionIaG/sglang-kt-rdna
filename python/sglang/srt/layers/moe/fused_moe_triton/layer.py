@@ -588,6 +588,26 @@ class FusedMoE(torch.nn.Module):
         else:
             return -1
 
+    def _remap_kt_gpu_expert(self, expert_id: int) -> int:
+        """Map a logical expert id onto the compact KT GPU weight row.
+
+        Weight tensors are sized to num_gpu_experts. CPU experts return -1
+        so the caller skips them; the KT CPU loader owns those weights.
+        """
+        kt_method = None
+        if is_wrapped_method(self.quant_method, "kt_ep"):
+            kt_method = self.quant_method
+        elif hasattr(self, "scheme") and is_wrapped_method(
+            getattr(self, "scheme", None), "kt_ep"
+        ):
+            kt_method = self.scheme
+        if kt_method is None or getattr(kt_method, "num_gpu_experts", -1) == -1:
+            return expert_id
+        mask = kt_method.gpu_experts_mask
+        if expert_id < 0 or expert_id >= len(mask) or not bool(mask[expert_id].item()):
+            return -1
+        return int(kt_method.logical_to_gpu_index[expert_id].item())
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -618,6 +638,9 @@ class FusedMoE(torch.nn.Module):
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
+                    return
+                expert_id = self._remap_kt_gpu_expert(expert_id)
+                if expert_id < 0:
                     return
 
             self._weight_loader_impl(

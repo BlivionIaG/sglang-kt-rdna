@@ -71,7 +71,16 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    try:
+        from sgl_kernel.flash_attn import (
+            flash_attn_varlen_func,
+            flash_attn_with_kvcache,
+        )
+    except ImportError:
+        # FA3 is Hopper-only. GLM-5-Next on SM120 uses the native Triton
+        # sparse MLA path and must still be able to import this module.
+        flash_attn_varlen_func = None
+        flash_attn_with_kvcache = None
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -1838,6 +1847,11 @@ class NativeSparseAttnBackend(
         logit_cap: float,
         page_size: int,
     ) -> torch.Tensor:
+        if flash_attn_with_kvcache is None:
+            raise RuntimeError(
+                "NSA fa3 backend requires FlashAttention-3, which is not "
+                "built for this GPU."
+            )
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
@@ -2009,6 +2023,11 @@ class NativeSparseAttnBackend(
         # Use FA3 for SM90 (Hopper/H200)
         fa_version = 3
 
+        if flash_attn_varlen_func is None:
+            raise RuntimeError(
+                "NSA MHA prefill requires FlashAttention-3, which is not "
+                "built for this GPU."
+            )
         return flash_attn_varlen_func(
             q=q,
             k=k,

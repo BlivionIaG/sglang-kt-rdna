@@ -123,6 +123,11 @@ def _glm5_next_checkpoint_source_contract(
             prefix = expert_match.group("prefix")
             kind = expert_match.group("kind")
             leaf = expert_match.group("leaf")
+            if leaf == "blockscale_swizzled":
+                # NVFP4 blockscale swizzle is produced after load. The
+                # NVIDIA checkpoint stores the unswizzled weight scales.
+                runtime_defaults.add(parameter_name)
+                continue
             checkpoint_projections = (
                 ("gate_proj", "up_proj") if kind == "w13" else ("down_proj",)
             )

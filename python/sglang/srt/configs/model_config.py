@@ -205,6 +205,10 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                # GLM-5-Next Session AB is text-only. The checkpoint still
+                # advertises a vision tower; do not require an MM processor
+                # unless the operator passes --enable-multimodal.
+                "Glm5NextForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False

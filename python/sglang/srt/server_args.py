@@ -1534,10 +1534,24 @@ class ServerArgs:
                 "request-lifecycle boundary; --dllm-algorithm and its config "
                 "must remain unset."
             )
-        if self.quantization != "fp8":
+        kt_method_upper = (self.kt_method or "").upper()
+        nvfp4_kt_offload = (
+            self.kt_weight_path is not None and kt_method_upper == "NVFP4"
+        )
+        if self.quantization == "fp8":
+            pass
+        elif nvfp4_kt_offload and self.quantization == "modelopt_fp4":
+            # nvidia/GLM-5.3-Flash-NVFP4. Attention and shared experts stay
+            # BF16 (quant ignore list). Routed experts are NVFP4 and run on
+            # the AVX2 MXFP4 CPU kernel, which applies swiglu_limit.
+            pass
+        else:
             raise ValueError(
-                "GLM-5-Next Session AB accepts only the checkpoint-native "
-                f"FP8 weight format; got quantization={self.quantization!r}."
+                "GLM-5-Next Session AB accepts the checkpoint-native FP8 "
+                "weight format, or modelopt_fp4 when routed experts are "
+                "offloaded with --kt-method NVFP4; got "
+                f"quantization={self.quantization!r}, "
+                f"kt_method={self.kt_method!r}."
             )
 
         # Keep the released GLM topology narrow while accepting every TP width
@@ -1619,12 +1633,13 @@ class ServerArgs:
 
         if self.kt_weight_path is not None:
             kt_method = (self.kt_method or "").upper()
-            if kt_method != "FP8":
+            if kt_method not in ("FP8", "NVFP4"):
                 raise ValueError(
                     "GLM-5-Next Session AB KT expert offload requires "
-                    "--kt-method FP8 so the block-E4M3 checkpoint layout is "
-                    "preserved and swiglu_limit reaches the "
-                    f"CPU expert kernel; got {self.kt_method!r}."
+                    "--kt-method FP8 (block-E4M3 checkpoint) or NVFP4 "
+                    "(ModelOpt group-16 checkpoint; the AVX2 MXFP4 kernel "
+                    "applies swiglu_limit); "
+                    f"got {self.kt_method!r}."
                 )
 
             # The positive threshold enables GLM's layerwise full-GPU prefill
