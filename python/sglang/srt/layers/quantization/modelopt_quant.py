@@ -254,10 +254,15 @@ def _apply_nvfp4_reference_moe(method, layer, x, topk_weights, topk_ids):
         if raw_limit:
             limit = float(raw_limit)
     ids = topk_ids.to(dtype=torch.long)
-    n_experts = int(layer.w13_weight.shape[0])
+    cached_w13 = getattr(layer, "w13_weight_bf16", None)
+    n_experts = int(
+        cached_w13.shape[0] if cached_w13 is not None else layer.w13_weight.shape[0]
+    )
     flat_ids = ids.reshape(-1)
-    for expert in range(n_experts):
-        if not bool((flat_ids == expert).any()):
+    # One host sync per layer. Scanning every resident GPU expert syncs once
+    # per slot and makes a larger frequency placement slower before any GEMM.
+    for expert in torch.unique(flat_ids).tolist():
+        if expert < 0 or expert >= n_experts:
             continue
         selected = ids == expert
         token_weight = torch.where(
@@ -267,22 +272,26 @@ def _apply_nvfp4_reference_moe(method, layer, x, topk_weights, topk_ids):
         if not bool(tokens.any()):
             continue
         hidden_states = x[tokens]
-        w13 = dequant_nvfp4(
-            layer.w13_weight[expert],
-            layer.w13_weight_scale_linear[expert],
-            layer.w13_weight_scale_2[expert],
-        )
+        if cached_w13 is not None:
+            w13 = cached_w13[expert]
+            w2 = layer.w2_weight_bf16[expert]
+        else:
+            w13 = dequant_nvfp4(
+                layer.w13_weight[expert],
+                layer.w13_weight_scale_linear[expert],
+                layer.w13_weight_scale_2[expert],
+            )
+            w2 = dequant_nvfp4(
+                layer.w2_weight[expert],
+                layer.w2_weight_scale_linear[expert],
+                layer.w2_weight_scale_2[expert],
+            )
         gate_up = torch.nn.functional.linear(hidden_states, w13)
         half = gate_up.shape[-1] // 2
         gate = gate_up[..., :half]
         if limit is not None:
             gate = gate.clamp(max=limit)
         mid = torch.nn.functional.silu(gate) * gate_up[..., half:]
-        w2 = dequant_nvfp4(
-            layer.w2_weight[expert],
-            layer.w2_weight_scale_linear[expert],
-            layer.w2_weight_scale_2[expert],
-        )
         expert_out = torch.nn.functional.linear(mid, w2)
         slot_weight = token_weight[tokens].to(dtype=expert_out.dtype).unsqueeze(-1)
         output[tokens] = output[tokens] + expert_out * slot_weight
@@ -1872,6 +1881,58 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale.detach().clone(),
                     persistent=False,
                 )
+
+            # SM120 has no working FP4 tensor-core GEMM. Unpacking on every
+            # token costs ~2.3 ms per expert; the BF16 GEMM itself is ~0.09 ms.
+            # Cache the placed experts once. CPU experts stay packed.
+            n_gpu = int(layer.w13_weight.shape[0])
+            if (
+                n_gpu > 0
+                and nvfp4_reference_gemm()
+                and not hasattr(layer, "w13_weight_bf16")
+            ):
+                sample_w13 = dequant_nvfp4(
+                    layer.w13_weight[0],
+                    layer.w13_weight_scale_linear[0],
+                    layer.w13_weight_scale_2[0],
+                )
+                sample_w2 = dequant_nvfp4(
+                    layer.w2_weight[0],
+                    layer.w2_weight_scale_linear[0],
+                    layer.w2_weight_scale_2[0],
+                )
+                w13_cache = torch.empty(
+                    (n_gpu, *sample_w13.shape),
+                    dtype=sample_w13.dtype,
+                    device=sample_w13.device,
+                )
+                w2_cache = torch.empty(
+                    (n_gpu, *sample_w2.shape),
+                    dtype=sample_w2.dtype,
+                    device=sample_w2.device,
+                )
+                w13_cache[0] = sample_w13
+                w2_cache[0] = sample_w2
+                for expert_id in range(1, n_gpu):
+                    w13_cache[expert_id] = dequant_nvfp4(
+                        layer.w13_weight[expert_id],
+                        layer.w13_weight_scale_linear[expert_id],
+                        layer.w13_weight_scale_2[expert_id],
+                    )
+                    w2_cache[expert_id] = dequant_nvfp4(
+                        layer.w2_weight[expert_id],
+                        layer.w2_weight_scale_linear[expert_id],
+                        layer.w2_weight_scale_2[expert_id],
+                    )
+                layer.register_buffer("w13_weight_bf16", w13_cache, persistent=False)
+                layer.register_buffer("w2_weight_bf16", w2_cache, persistent=False)
+                if not getattr(dequant_nvfp4, "_moe_cache_logged", False):
+                    dequant_nvfp4._moe_cache_logged = True
+                    logger.warning(
+                        "NVFP4 placed GPU experts are cached as BF16 "
+                        "(%d experts on the first MoE layer).",
+                        n_gpu,
+                    )
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)

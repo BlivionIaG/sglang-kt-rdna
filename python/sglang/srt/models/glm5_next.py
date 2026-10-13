@@ -29,6 +29,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
@@ -847,6 +848,23 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
     fall_back_to_pt_during_load = False
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        """Let the expert-distribution recorder size [layers, routed experts].
+
+        The checkpoint config is the multimodal wrapper. Routed-expert counts
+        live on text_config. Layer 45 (MTP) is outside num_hidden_layers.
+        """
+        text_config = getattr(config, "text_config", None) or config
+        num_experts = getattr(text_config, "n_routed_experts", None)
+        if num_experts is None:
+            num_experts = text_config.num_experts
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=num_experts,
+            num_groups=getattr(text_config, "n_group", None),
+        )
 
     def __init__(
         self,

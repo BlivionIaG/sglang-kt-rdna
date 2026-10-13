@@ -4680,6 +4680,32 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             for layer_idx in range(num_layers):
                 if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
                     masks[layer_idx, :] = True
+            # Global top-k can leave a MoE layer with no GPU expert. Empty
+            # NVFP4 slots fail weight finalization. Steal the coldest placed
+            # expert from the fullest layer until every MoE layer has one.
+            moe_layers = [
+                i
+                for i in range(num_layers)
+                if i >= first_k_dense_replace and i % moe_layer_freq == 0
+            ]
+            for _ in moe_layers:
+                empty = [i for i in moe_layers if int(masks[i].sum()) == 0]
+                donors = [i for i in moe_layers if int(masks[i].sum()) > 1]
+                if not empty or not donors:
+                    break
+                donor = max(donors, key=lambda i: int(masks[i].sum()))
+                donor_ids = torch.where(masks[donor])[0]
+                cold = donor_ids[int(activation_freq[donor, donor_ids].argmin())]
+                dest = empty[0]
+                masks[donor, cold] = False
+                masks[dest, int(activation_freq[dest].argmax())] = True
+            if moe_layers:
+                placed = [int(masks[i].sum()) for i in moe_layers]
+                logger.info(
+                    "Frequency mask floor: MoE GPU counts min=%d max=%d",
+                    min(placed),
+                    max(placed),
+                )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
